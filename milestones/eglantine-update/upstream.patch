@@ -1,0 +1,641 @@
+diff --git a/src/core/device_memory_manager.h b/src/core/device_memory_manager.h
+--- a/src/core/device_memory_manager.h
++++ b/src/core/device_memory_manager.h
+@@ -187,6 +187,8 @@ class DeviceMemoryManager {
+     void WalkBlock(const DAddr addr, const std::size_t size, auto on_unmapped, auto on_memory,
+                    auto increment);
+ 
++    void CutContinuityAt(size_t page);
++
+     void InnerGatherDeviceAddresses(Common::ScratchBuffer<u32>& buffer, PAddr address);
+ 
+     std::unique_ptr<DeviceMemoryManagerAllocator<Traits>> impl;
+diff --git a/src/core/device_memory_manager.inc b/src/core/device_memory_manager.inc
+--- a/src/core/device_memory_manager.inc
++++ b/src/core/device_memory_manager.inc
+@@ -211,9 +211,13 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
+     std::scoped_lock lk(mapping_guard);
+ 
+     tracked_entries.CommitRegion(start_page_d, start_page_d + num_pages);
++    CutContinuityAt(start_page_d);
+     for (size_t i = 0; i < num_pages; i++) {
+         const VAddr new_vaddress = virtual_address + i * Memory::YUZU_PAGESIZE;
+         auto* ptr = process_memory->GetPointerSilent(Common::ProcessAddress(new_vaddress));
++        // One page per run unless tracked below: a run left from an earlier mapping of these
++        // device pages would make WalkBlock copy the host memory that followed that mapping.
++        tracked_entries.GetUnchecked(start_page_d + i).continuity_tracker = 0;
+         if (ptr == nullptr) [[unlikely]] {
+             tracked_entries.GetUnchecked(start_page_d + i).compressed_physical_ptr = 0;
+             continue;
+@@ -248,11 +252,13 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
+     std::scoped_lock lk(mapping_guard);
+ 
+     tracked_entries.CommitRegion(start_page_d, start_page_d + num_pages); // should already be committed, but just in case
++    CutContinuityAt(start_page_d);
+     for (size_t i = 0; i < num_pages; i++) {
+         auto& entry = tracked_entries.GetUnchecked(start_page_d + i);
+         auto phys_addr = entry.compressed_physical_ptr;
+         entry.compressed_physical_ptr = 0;
+         entry.cpu_backing_address = 0;
++        entry.continuity_tracker = 0;
+         if (phys_addr != 0) [[likely]] {
+             u32& base_dev = compressed_device_addr.GetAndFault(phys_addr - 1U);
+             if ((base_dev >> MULTI_FLAG_BITS) == 0) [[likely]] {
+@@ -270,6 +276,21 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
+     }
+     translation_generation.fetch_add(1, std::memory_order_release);
+ }
++
++template <typename Traits>
++void DeviceMemoryManager<Traits>::CutContinuityAt(size_t page) {
++    // Runs counted from the pages before `page` end there: the pages from `page` on are being
++    // mapped again or unmapped. A run is counted down page by page (TrackContinuityImpl), so the
++    // first page whose run already ends before `page` ends the walk.
++    for (size_t index = page; index-- > 0;) {
++        const size_t last_count = page - 1 - index;
++        if (tracked_entries[index].continuity_tracker <= last_count) {
++            break;
++        }
++        tracked_entries.GetUnchecked(index).continuity_tracker = static_cast<u32>(last_count);
++    }
++}
++
+ template <typename Traits>
+ void DeviceMemoryManager<Traits>::TrackContinuityImpl(DAddr address, VAddr virtual_address,
+                                                       size_t size, Asid asid) {
+diff --git a/src/core/hle/service/am/applet_manager.cpp b/src/core/hle/service/am/applet_manager.cpp
+--- a/src/core/hle/service/am/applet_manager.cpp
++++ b/src/core/hle/service/am/applet_manager.cpp
+@@ -248,11 +248,16 @@ void AppletManager::RequestExit() {
+     }
+ }
+ 
++// Frontends call this after any settings change, so only an actual docked/handheld switch is
++// passed on.
+ void AppletManager::OperationModeChanged() {
+     std::scoped_lock lk{m_lock};
+-    if (m_window_system) {
+-        m_window_system->OnOperationModeChanged();
++    const bool docked = Settings::IsDockedMode();
++    if (!m_window_system || docked == m_docked) {
++        return;
+     }
++    m_docked = docked;
++    m_window_system->OnOperationModeChanged();
+ }
+ 
+ void AppletManager::SetWindowSystem(WindowSystem* window_system) {
+@@ -262,6 +267,7 @@ void AppletManager::SetWindowSystem(WindowSystem* window_system) {
+     if (!m_window_system) {
+         return;
+     }
++    m_docked = Settings::IsDockedMode();
+ 
+     m_cv.wait(lk, [&] { return m_pending_process != nullptr; });
+ 
+diff --git a/src/core/hle/service/am/applet_manager.h b/src/core/hle/service/am/applet_manager.h
+--- a/src/core/hle/service/am/applet_manager.h
++++ b/src/core/hle/service/am/applet_manager.h
+@@ -58,6 +58,7 @@ class AppletManager {
+     std::condition_variable m_cv;
+ 
+     WindowSystem* m_window_system{};
++    bool m_docked{}; // console mode the applets were last told about
+ 
+     FrontendAppletParameters m_pending_parameters{};
+     std::unique_ptr<Process> m_pending_process{};
+diff --git a/src/core/hle/service/am/lifecycle_manager.cpp b/src/core/hle/service/am/lifecycle_manager.cpp
+--- a/src/core/hle/service/am/lifecycle_manager.cpp
++++ b/src/core/hle/service/am/lifecycle_manager.cpp
+@@ -12,7 +12,8 @@ namespace Service::AM {
+ LifecycleManager::LifecycleManager(Core::System& system, KernelHelpers::ServiceContext& context,
+                                    bool is_application)
+     : m_system_event(context), m_operation_mode_changed_system_event(context),
+-      m_hdcp_state_changed_event(context), m_is_application(is_application) {}
++      m_operation_mode_refresh_event(context), m_hdcp_state_changed_event(context),
++      m_is_application(is_application) {}
+ 
+ LifecycleManager::~LifecycleManager() = default;
+ 
+@@ -24,6 +25,10 @@ Event& LifecycleManager::GetOperationModeChangedSystemEvent() {
+     return m_operation_mode_changed_system_event;
+ }
+ 
++Event& LifecycleManager::GetOperationModeRefreshEvent() {
++    return m_operation_mode_refresh_event;
++}
++
+ Event& LifecycleManager::GetHDCPStateChangedEvent() {
+     return m_hdcp_state_changed_event;
+ }
+@@ -152,6 +157,7 @@ void LifecycleManager::OnOperationAndPerformanceModeChanged(Kernel::KernelCore&
+         m_has_performance_mode_changed = true;
+     }
+     m_operation_mode_changed_system_event.Signal(kernel);
++    m_operation_mode_refresh_event.Signal(kernel);
+     this->SignalSystemEventIfNeeded(kernel);
+ }
+ 
+diff --git a/src/core/hle/service/am/lifecycle_manager.h b/src/core/hle/service/am/lifecycle_manager.h
+--- a/src/core/hle/service/am/lifecycle_manager.h
++++ b/src/core/hle/service/am/lifecycle_manager.h
+@@ -45,6 +45,7 @@ class LifecycleManager {
+ public:
+     Event& GetSystemEvent();
+     Event& GetOperationModeChangedSystemEvent();
++    Event& GetOperationModeRefreshEvent();
+     Event& GetHDCPStateChangedEvent();
+ 
+ public:
+@@ -158,6 +159,7 @@ class LifecycleManager {
+ private:
+     Event m_system_event;
+     Event m_operation_mode_changed_system_event;
++    Event m_operation_mode_refresh_event;
+     Event m_hdcp_state_changed_event;
+ 
+     std::list<AppletMessage> m_unordered_messages{};
+diff --git a/src/core/hle/service/am/service/application_functions.cpp b/src/core/hle/service/am/service/application_functions.cpp
+--- a/src/core/hle/service/am/service/application_functions.cpp
++++ b/src/core/hle/service/am/service/application_functions.cpp
+@@ -9,11 +9,13 @@
+ #include "common/hex_util.h"
+ #include "common/settings.h"
+ #include "common/uuid.h"
++#include "core/core.h"
+ #include "core/file_sys/common_funcs.h"
+ #include "core/file_sys/control_metadata.h"
+ #include "core/file_sys/patch_manager.h"
+ #include "core/file_sys/registered_cache.h"
+ #include "core/file_sys/savedata_factory.h"
++#include "core/hle/kernel/k_process.h"
+ #include "core/hle/kernel/k_transfer_memory.h"
+ #include "core/hle/result.h"
+ #include "core/hle/service/am/am_results.h"
+@@ -27,6 +29,7 @@
+ #include "core/hle/service/ns/application_manager_interface.h"
+ #include "core/hle/service/ns/service_getter_interface.h"
+ #include "core/hle/service/sm/sm.h"
++#include "core/loader/loader.h"
+ 
+ namespace Service::AM {
+ 
+@@ -114,7 +117,7 @@ IApplicationFunctions::IApplicationFunctions(Core::System& system_, std::shared_
+         {181, nullptr, "UpgradeLaunchRequiredVersion"},
+         {190, nullptr, "SendServerMaintenanceOverlayNotification"},
+         {200, nullptr, "GetLastApplicationExitReason"},
+-        {210, D<&IApplicationFunctions::GetUnknownEvent210>, "Unknown210"},
++        {210, D<&IApplicationFunctions::GetOperationModeRefreshEvent>, "GetOperationModeRefreshEvent (guessed)"},
+         {220, nullptr, "Unknown220"}, // [20.0.0+]
+         {300, nullptr, "CreateMovieWriter"}, // [19.0.0+]
+         {310, nullptr, "Unknown310"}, // [20.0.0+]
+@@ -215,18 +218,32 @@ Result IApplicationFunctions::SetTerminateResult(Result terminate_result) {
+     R_SUCCEED();
+ }
+ 
++// A loose ExeFS/RomFS dump has no installed control data: its loader's (a control.nacp next to the
++// dump, else the RomFS's version tag). Only for the program it loaded, not for library applets.
++bool IApplicationFunctions::LooseDumpDisplayVersion(std::string& version) {
++    auto& loader = system.GetAppLoader();
++    u64 program_id{};
++    if (loader.ReadProgramId(program_id) != Loader::ResultStatus::Success ||
++        FileSys::GetBaseTitleID(program_id) != FileSys::GetBaseTitleID(m_applet->program_id) ||
++        loader.ReadDisplayVersion(version) != Loader::ResultStatus::Success || version.empty()) {
++        return false;
++    }
++    LOG_INFO(Service_AM, "Display version {} from the dump's files", version);
++    return true;
++}
++
+ Result IApplicationFunctions::GetDisplayVersion(Out<DisplayVersion> out_display_version) {
+     LOG_DEBUG(Service_AM, "called");
+ 
+     const auto res = GetApplicationMetadata(system, m_applet->program_id);
++    std::string version;
+     if (res.first != nullptr) {
+-        const auto& version = res.first->GetVersionString();
+-        std::memcpy(out_display_version->string.data(), version.data(),
+-                    (std::min)(version.size(), out_display_version->string.size()));
+-    } else {
+-        static constexpr char default_version[]{"1.0.0"};
+-        std::memcpy(out_display_version->string.data(), default_version, sizeof(default_version));
++        version = res.first->GetVersionString();
++    } else if (!LooseDumpDisplayVersion(version)) {
++        version = "1.0.0";
+     }
++    std::memcpy(out_display_version->string.data(), version.data(),
++                (std::min)(version.size(), out_display_version->string.size()));
+ 
+     out_display_version->string[out_display_version->string.size() - 1] = '\0';
+     R_SUCCEED();
+@@ -539,10 +556,18 @@ Result IApplicationFunctions::GetHealthWarningDisappearedSystemEvent(
+     R_SUCCEED();
+ }
+ 
+-Result IApplicationFunctions::GetUnknownEvent210(
++// The Switch 2 nn::oe::GetOperationMode caches the mode and only asks ICommonStateGetter again
++// once this event is signaled, so it has to fire on every docked/handheld change. Switch 1 titles
++// keep the event that never fires, as its use there is unknown.
++Result IApplicationFunctions::GetOperationModeRefreshEvent(
+     OutCopyHandle<Kernel::KReadableEvent> out_event) {
+     LOG_DEBUG(Service_AM, "called");
+-    *out_event = m_applet->unknown_event.GetHandle();
++    const auto* process = m_applet->process ? m_applet->process->GetHandle() : nullptr;
++    if (process != nullptr && process->IsSwitch2()) {
++        *out_event = m_applet->lifecycle_manager.GetOperationModeRefreshEvent().GetHandle();
++    } else {
++        *out_event = m_applet->unknown_event.GetHandle();
++    }
+     R_SUCCEED();
+ }
+ 
+diff --git a/src/core/hle/service/am/service/application_functions.h b/src/core/hle/service/am/service/application_functions.h
+--- a/src/core/hle/service/am/service/application_functions.h
++++ b/src/core/hle/service/am/service/application_functions.h
+@@ -36,6 +36,7 @@ class IApplicationFunctions final : public ServiceFramework<IApplicationFunction
+     Result GetDesiredLanguage(Out<u64> out_language_code);
+     Result SetTerminateResult(Result terminate_result);
+     Result GetDisplayVersion(Out<DisplayVersion> out_display_version);
++    bool LooseDumpDisplayVersion(std::string& version);
+     Result ExtendSaveData(Out<u64> out_required_size, FileSys::SaveDataType type,
+                           Common::UUID user_id, u64 normal_size, u64 journal_size);
+     Result GetSaveDataSize(Out<u64> out_normal_size, Out<u64> out_journal_size,
+@@ -81,7 +82,7 @@ class IApplicationFunctions final : public ServiceFramework<IApplicationFunction
+     Result GetNotificationStorageChannelEvent(OutCopyHandle<Kernel::KReadableEvent> out_event);
+     Result GetHealthWarningDisappearedSystemEvent(OutCopyHandle<Kernel::KReadableEvent> out_event);
+     Result CreateApplicationAndRequestToStart(u64 application_id);
+-    Result GetUnknownEvent210(OutCopyHandle<Kernel::KReadableEvent> out_event);
++    Result GetOperationModeRefreshEvent(OutCopyHandle<Kernel::KReadableEvent> out_event);
+     Result Unknown320();
+     Result Unknown321();
+     Result Unknown330(Out<u8> out);
+diff --git a/src/core/loader/deconstructed_rom_directory.cpp b/src/core/loader/deconstructed_rom_directory.cpp
+--- a/src/core/loader/deconstructed_rom_directory.cpp
++++ b/src/core/loader/deconstructed_rom_directory.cpp
+@@ -4,7 +4,9 @@
+ // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
+ #include <cstring>
++#include <string_view>
+ #include "common/logging.h"
+ #include "common/random.h"
+ #include "common/settings.h"
+@@ -94,13 +96,71 @@ FileSys::VirtualFile FindLooseRomFS(const FileSys::VirtualDir& exefs_dir) {
+     return nullptr;
+ }
+ 
++// The display version of a dump without control data, from its RomFS: Nintendo EPD titles name
++// their resource size tables after it (System/Resource/ResourceSizeTable.Product.180.* in Mario
++// Kart World 1.8.0). A hotfix can keep its minor version's tables (Product.110 in a 1.1.1).
++std::string RomFSProductVersion(const FileSys::VirtualDir& romfs_dir) {
++    if (romfs_dir == nullptr) {
++        return {};
++    }
++    const auto system_dir = romfs_dir->GetSubdirectory("System");
++    const auto resource_dir = system_dir != nullptr ? system_dir->GetSubdirectory("Resource") : nullptr;
++    if (resource_dir == nullptr) {
++        return {};
++    }
++    constexpr std::string_view Prefix = "ResourceSizeTable.Product.";
++    std::string best;
++    for (const auto& file : resource_dir->GetFiles()) {
++        const std::string file_name = file->GetName();
++        if (!file_name.starts_with(Prefix) || file_name.size() < Prefix.size() + 4) {
++            continue;
++        }
++        const std::string_view digits = std::string_view{file_name}.substr(Prefix.size(), 3);
++        if (file_name[Prefix.size() + 3] != '.' ||
++            !std::all_of(digits.begin(), digits.end(), [](char c) { return c >= '0' && c <= '9'; })) {
++            continue;
++        }
++        if (std::string version{digits}; version > best) {
++            best = version;
++        }
++    }
++    if (best.empty()) {
++        return {};
++    }
++    return fmt::format("{}.{}.{}", best[0], best[1], best[2]);
++}
++
++// Loose ExeFS dumps carry no control data, but icon/nacp sidecars can be dropped next to the
++// ExeFS or in the game folder above it (<game>/exefs/main and
++// <game>/updates/<title id>/exefs/main layouts).
++std::vector<FileSys::VirtualDir> FindSidecarDirs(const FileSys::VirtualDir& exefs_dir) {
++    std::vector<FileSys::VirtualDir> dirs{exefs_dir};
++    for (auto dir = exefs_dir; dirs.size() < 4;) {
++        const auto parent = dir->GetParentDirectory();
++        if (parent == nullptr) {
++            break;
++        }
++        const auto& name = parent->GetName();
++        dirs.push_back(parent);
++        const bool title_id_like =
++            name == "updates" ||
++            (!name.empty() && name.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos);
++        if (!title_id_like) {
++            break;
++        }
++        dir = parent;
++    }
++    return dirs;
++}
++
+ } // namespace
+ 
+ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys::VirtualFile file_, bool override_update_)
+     : AppLoader(std::move(file_))
+     , override_update(override_update_)
+ {
+     const auto file_dir = file->GetContainingDirectory();
++    const auto sidecar_dirs = FindSidecarDirs(file_dir);
+ 
+     // Title ID
+     const auto npdm = file_dir->GetFile("main.npdm");
+@@ -112,8 +172,13 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
+ 
+     // Icon
+     FileSys::VirtualFile icon_file = nullptr;
+-    for (const auto& language : FileSys::LANGUAGE_NAMES) {
+-        icon_file = file_dir->GetFile("icon_" + std::string(language) + ".dat");
++    for (const auto& sidecar_dir : sidecar_dirs) {
++        for (const auto& language : FileSys::LANGUAGE_NAMES) {
++            icon_file = sidecar_dir->GetFile("icon_" + std::string(language) + ".dat");
++            if (icon_file != nullptr) {
++                break;
++            }
++        }
+         if (icon_file != nullptr) {
+             icon_data = icon_file->ReadAllBytes();
+             break;
+@@ -122,33 +187,46 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
+ 
+     if (icon_data.empty()) {
+         // Any png, jpeg, or bmp file
+-        const auto& files = file_dir->GetFiles();
+-        const auto icon_iter =
+-            std::find_if(files.begin(), files.end(), [](const FileSys::VirtualFile& f) {
+-                return f->GetExtension() == "png" || f->GetExtension() == "jpg" ||
+-                       f->GetExtension() == "bmp" || f->GetExtension() == "jpeg";
+-            });
+-        if (icon_iter != files.end())
+-            icon_data = (*icon_iter)->ReadAllBytes();
++        for (const auto& sidecar_dir : sidecar_dirs) {
++            const auto& files = sidecar_dir->GetFiles();
++            const auto icon_iter =
++                std::find_if(files.begin(), files.end(), [](const FileSys::VirtualFile& f) {
++                    return f->GetExtension() == "png" || f->GetExtension() == "jpg" ||
++                           f->GetExtension() == "bmp" || f->GetExtension() == "jpeg";
++                });
++            if (icon_iter != files.end()) {
++                icon_data = (*icon_iter)->ReadAllBytes();
++                break;
++            }
++        }
+     }
+ 
+     // Metadata
+-    FileSys::VirtualFile nacp_file = file_dir->GetFile("control.nacp");
+-    if (nacp_file == nullptr) {
+-        const auto& files = file_dir->GetFiles();
++    FileSys::VirtualFile nacp_file = nullptr;
++    for (const auto& sidecar_dir : sidecar_dirs) {
++        nacp_file = sidecar_dir->GetFile("control.nacp");
++        if (nacp_file != nullptr) {
++            break;
++        }
++        const auto& files = sidecar_dir->GetFiles();
+         const auto nacp_iter =
+             std::find_if(files.begin(), files.end(),
+                          [](const FileSys::VirtualFile& f) { return f->GetExtension() == "nacp"; });
+-        if (nacp_iter != files.end())
++        if (nacp_iter != files.end()) {
+             nacp_file = *nacp_iter;
++            break;
++        }
+     }
+ 
+     if (nacp_file != nullptr) {
+-        FileSys::NACP nacp(nacp_file);
+-        name = nacp.GetApplicationName();
++        control.emplace(nacp_file);
++        name = control->GetApplicationName();
+     }
+ 
+     romfs = FindLooseRomFS(file_dir);
++    if (const auto title_dir = file_dir->GetParentDirectory()) {
++        romfs_version = RomFSProductVersion(title_dir->GetSubdirectory("romfs"));
++    }
+ }
+ 
+ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(
+@@ -357,6 +435,26 @@ ResultStatus AppLoader_DeconstructedRomDirectory::ReadTitle(std::string& out_tit
+     return ResultStatus::Success;
+ }
+ 
++ResultStatus AppLoader_DeconstructedRomDirectory::ReadControlData(FileSys::NACP& out_control) {
++    if (!control) {
++        return ResultStatus::ErrorNoControl;
++    }
++    out_control = *control;
++    return ResultStatus::Success;
++}
++
++ResultStatus AppLoader_DeconstructedRomDirectory::ReadDisplayVersion(std::string& version) {
++    if (control && !control->GetVersionString().empty()) {
++        version = control->GetVersionString();
++        return ResultStatus::Success;
++    }
++    if (!romfs_version.empty()) {
++        version = romfs_version;
++        return ResultStatus::Success;
++    }
++    return ResultStatus::ErrorNoControl;
++}
++
+ bool AppLoader_DeconstructedRomDirectory::IsRomFSUpdatable() const {
+     return false;
+ }
+diff --git a/src/core/loader/deconstructed_rom_directory.h b/src/core/loader/deconstructed_rom_directory.h
+--- a/src/core/loader/deconstructed_rom_directory.h
++++ b/src/core/loader/deconstructed_rom_directory.h
+@@ -6,8 +6,10 @@
+ 
+ #pragma once
+ 
++#include <optional>
+ #include <string>
+ #include "common/common_types.h"
++#include "core/file_sys/control_metadata.h"
+ #include "core/file_sys/program_metadata.h"
+ #include "core/loader/loader.h"
+ 
+@@ -49,6 +51,8 @@ class AppLoader_DeconstructedRomDirectory final : public AppLoader {
+     ResultStatus ReadIcon(std::vector<u8>& out_buffer) override;
+     ResultStatus ReadProgramId(u64& out_program_id) override;
+     ResultStatus ReadTitle(std::string& title) override;
++    ResultStatus ReadControlData(FileSys::NACP& control) override;
++    ResultStatus ReadDisplayVersion(std::string& version) override;
+     bool IsRomFSUpdatable() const override;
+ 
+     ResultStatus ReadNSOModules(Modules& out_modules) override;
+@@ -60,6 +64,8 @@ class AppLoader_DeconstructedRomDirectory final : public AppLoader {
+ 
+     std::vector<u8> icon_data;
+     std::string name;
++    std::optional<FileSys::NACP> control; ///< control.nacp next to the dump, if it has one
++    std::string romfs_version;            ///< "1.8.0" from the RomFS's Product.180 tables, if any
+     u64 title_id{};
+     bool override_update;
+ 
+diff --git a/src/core/loader/loader.cpp b/src/core/loader/loader.cpp
+--- a/src/core/loader/loader.cpp
++++ b/src/core/loader/loader.cpp
+@@ -16,6 +16,7 @@
+ #include "common/string_util.h"
+ #include "core/core.h"
+ #include "core/file_sys/card_image.h"
++#include "core/file_sys/control_metadata.h"
+ #include "core/file_sys/common_funcs.h"
+ #include "core/file_sys/content_archive.h"
+ #include "core/file_sys/registered_cache.h"
+@@ -309,6 +310,15 @@ std::ostream& operator<<(std::ostream& os, ResultStatus status) {
+ AppLoader::AppLoader(FileSys::VirtualFile file_) : file(std::move(file_)) {}
+ AppLoader::~AppLoader() = default;
+ 
++ResultStatus AppLoader::ReadDisplayVersion(std::string& version) {
++    FileSys::NACP control;
++    if (const ResultStatus result = ReadControlData(control); result != ResultStatus::Success) {
++        return result;
++    }
++    version = control.GetVersionString();
++    return ResultStatus::Success;
++}
++
+ /**
+  * Get a loader for a file with a specific type
+  * @param system The system context to use.
+diff --git a/src/core/loader/loader.h b/src/core/loader/loader.h
+--- a/src/core/loader/loader.h
++++ b/src/core/loader/loader.h
+@@ -327,6 +327,15 @@ class AppLoader {
+         return ResultStatus::ErrorNotImplemented;
+     }
+ 
++    /**
++     * Get the application's display version ("1.8.0"), from its control data by default
++     *
++     * @param[out] version Reference to store the display version into
++     *
++     * @return ResultStatus result of function
++     */
++    virtual ResultStatus ReadDisplayVersion(std::string& version);
++
+     /**
+      * Get the RomFS of the manual of the application
+      *
+diff --git a/src/tests/video_core/ampere_returns.cpp b/src/tests/video_core/ampere_returns.cpp
+--- /dev/null
++++ b/src/tests/video_core/ampere_returns.cpp
+@@ -0,0 +1,51 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include <array>
++#include <catch2/catch_test_macros.hpp>
++
++#include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
++
++namespace {
++using Shader::Ampere::Instruction;
++using Shader::Ampere::LowerToMaxwell;
++
++TEST_CASE("Ampere returns do not write the link register", "[video_core][ampere]") {
++    for (const u32 link : {0U, 55U}) {
++        const std::array<Instruction, 4> code{{
++            {{0x00007802U | (link << 16), 0x20, 0x00000f00, 0}},
++            {{0x00007944, 0x10, 0x03c00000, 0}},
++            {{0x0000794d, 0, 0x03800000, 0}},
++            {{0x00007950U | (link << 24), 0xffffffc0, 0x03c3ffff, 0}},
++        }};
++        const auto lowered = LowerToMaxwell(code);
++        REQUIRE(static_cast<bool>(lowered));
++        REQUIRE(lowered.source_size == sizeof(code));
++        REQUIRE(lowered.instructions.back() == 0xe32000000007000fULL);
++    }
++}
++
++TEST_CASE("Ampere returns can read a copy of the R0 link", "[video_core][ampere]") {
++    const std::array<Instruction, 5> code{{
++        {{0x00007802, 0x20, 0x00000f00, 0}},
++        {{0x00007944, 0x10, 0x03c00000, 0}},
++        {{0x0000794d, 0, 0x03800000, 0}},
++        {{0x00017202, 0, 0x00000f00, 0}},
++        {{0x01007950, 0xffffffb0, 0x03c3ffff, 0}},
++    }};
++    REQUIRE(static_cast<bool>(LowerToMaxwell(code)));
++}
++
++TEST_CASE("Ampere callees still reject writes to the link", "[video_core][ampere]") {
++    const std::array<Instruction, 5> code{{
++        {{0x00007802, 0x20, 0x00000f00, 0}},
++        {{0x00007944, 0x10, 0x03c00000, 0}},
++        {{0x0000794d, 0, 0x03800000, 0}},
++        {{0x00007802, 0, 0x00000f00, 0}},
++        {{0x00007950, 0xffffffb0, 0x03c3ffff, 0}},
++    }};
++    const auto lowered = LowerToMaxwell(code);
++    REQUIRE(!static_cast<bool>(lowered));
++    REQUIRE(lowered.error == "native callee overwrites link register");
++    REQUIRE(lowered.error_offset == 0x30);
++}
++} // namespace
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -1138,7 +1138,11 @@ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& filename,
+                                                  const vk::PipelineCache& pipeline_cache,
+                                                  u32 cache_version) try {
+-    std::ofstream file(filename, std::ios::binary);
++    // Written beside the cache and renamed over it: the emulator stopped mid-write left the cache
++    // empty, and every later boot failed to read it.
++    auto temporary = filename;
++    temporary += ".tmp";
++    std::ofstream file(temporary, std::ios::binary);
+     file.exceptions(std::ifstream::failbit);
+     if (!file.is_open()) {
+         LOG_ERROR(Common_Filesystem, "Failed to open Vulkan driver pipeline cache file {}",
+@@ -1156,6 +1160,15 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
+         pipeline_cache.Read(&cache_size, cache_data.data());
+     }
+     file.write(cache_data.data(), cache_size);
++    file.close();
++    std::error_code error;
++    std::filesystem::rename(temporary, filename, error);
++    if (error) {
++        LOG_ERROR(Common_Filesystem, "Failed to replace Vulkan driver pipeline cache file {}: {}",
++                  Common::FS::PathToUTF8String(filename), error.message());
++        std::filesystem::remove(temporary, error);
++        return;
++    }
+ 
+     LOG_INFO(Render_Vulkan, "Vulkan driver pipelines cached at: {}",
+              Common::FS::PathToUTF8String(filename));
+@@ -1190,6 +1203,14 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
+ 
+         std::array<char, 8> magic_number;
+         u32 cache_version;
++        // A file cut short (the emulator stopped while writing it) would throw from the reads
++        // below, and macOS's libc++ throws an ios_base::failure the handler doesn't match.
++        if (static_cast<size_t>(end) < magic_number.size() + sizeof(cache_version)) {
++            file.close();
++            LOG_ERROR(Common_Filesystem, "Truncated Vulkan driver pipeline cache file, deleting it");
++            Common::FS::RemoveFile(filename);
++            return create_pipeline_cache(0, nullptr);
++        }
+         file.read(magic_number.data(), magic_number.size())
+             .read(reinterpret_cast<char*>(&cache_version), sizeof(cache_version));
+         if (magic_number != VULKAN_CACHE_MAGIC_NUMBER || cache_version != expected_cache_version) {
+

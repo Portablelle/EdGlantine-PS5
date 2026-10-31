@@ -1,0 +1,410 @@
+diff --git a/src/common/scratch_buffer.h b/src/common/scratch_buffer.h
+--- a/src/common/scratch_buffer.h
++++ b/src/common/scratch_buffer.h
+@@ -122,6 +122,13 @@ class ScratchBuffer {
+         return buffer_capacity;
+     }
+ 
++    /// Frees the buffer; the next resize allocates it again.
++    void release() noexcept {
++        buffer.reset();
++        buffer_capacity = 0;
++        last_requested_size = 0;
++    }
++
+     void swap(ScratchBuffer& other) noexcept {
+         std::swap(last_requested_size, other.last_requested_size);
+         std::swap(buffer_capacity, other.buffer_capacity);
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pass.cpp b/src/video_core/renderer_vulkan/vk_compute_pass.cpp
+--- a/src/video_core/renderer_vulkan/vk_compute_pass.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pass.cpp
+@@ -583,6 +583,24 @@ void ASTCDecoderPass::Assemble(Image& image, const StagingBufferRef& map,
+                  swizzles);
+ }
+ 
++void ASTCDecoderPass::AssembleLayers(Image& image, const StagingBufferRef& map,
++                                     std::span<const VideoCommon::SwizzleParameters> swizzles,
++                                     std::span<const u32> layers) {
++    const Target target{
++        .image = image.Handle(),
++        .aspect_mask = image.AspectMask(),
++        .initialized = image.ExchangeInitialization(),
++        .level_view = [&image](s32 host_level) { return image.StorageImageView(host_level); },
++        .wait = true,
++        .layers = layers,
++        .layer_view = [&image](s32 host_level, u32 layer) {
++            return image.StorageImageLayerView(host_level, layer);
++        },
++    };
++    AssembleInto(image.info, image.host_level_offset, image.guest_size_bytes, target, map,
++                 swizzles);
++}
++
+ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
+                                    size_t guest_size_bytes, const Target& target,
+                                    const StagingBufferRef& map,
+@@ -631,7 +649,42 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
+                   : info.layer_stride;
+     const size_t input_size = skip != 0 ? size_t{input_layer_stride} * info.resources.layers
+                                         : guest_size_bytes;
+-    for (const VideoCommon::SwizzleParameters& swizzle : swizzles) {
++    // Only some layers: one dispatch per layer and level, into that layer's own view.
++    for (size_t i = 0; i < target.layers.size(); ++i) {
++        for (const VideoCommon::SwizzleParameters& swizzle : swizzles) {
++            const size_t layer_offset = i * input_layer_stride;
++            compute_pass_descriptor_queue.Acquire(scheduler, 2);
++            compute_pass_descriptor_queue.AddBuffer(map.buffer,
++                                                    map.offset + layer_offset + swizzle.buffer_offset,
++                                                    input_layer_stride - swizzle.buffer_offset);
++            compute_pass_descriptor_queue.AddImage(
++                target.layer_view(swizzle.level - static_cast<s32>(skip), target.layers[i]));
++            const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
++            auto params = MakeBlockLinearSwizzle2DParams(swizzle, info);
++            params.layer_stride = input_layer_stride;
++            const u32 num_dispatches_x = Common::DivCeil(swizzle.num_tiles.width, 8U);
++            const u32 num_dispatches_y = Common::DivCeil(swizzle.num_tiles.height, 8U);
++            scheduler.Record([this, num_dispatches_x, num_dispatches_y, block_dims, params,
++                              descriptor_data](vk::CommandBuffer cmdbuf) {
++                const AstcPushConstants uniforms{
++                    .blocks_dims = block_dims,
++                    .layer_stride = params.layer_stride,
++                    .block_size = params.block_size,
++                    .x_shift = params.x_shift,
++                    .block_height = params.block_height,
++                    .block_height_mask = params.block_height_mask,
++                    .native_tiling = params.native_tiling,
++                };
++                const VkDescriptorSet set = descriptor_allocator.Commit();
++                device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
++                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
++                cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, uniforms);
++                cmdbuf.Dispatch(num_dispatches_x, num_dispatches_y, 1);
++            });
++        }
++    }
++    for (const VideoCommon::SwizzleParameters& swizzle : target.layers.empty() ? swizzles
++                                                        : std::span<const VideoCommon::SwizzleParameters>{}) {
+         const size_t input_offset = swizzle.buffer_offset + map.offset;
+         const u32 num_dispatches_x = Common::DivCeil(swizzle.num_tiles.width, 8U);
+         const u32 num_dispatches_y = Common::DivCeil(swizzle.num_tiles.height, 8U);
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pass.h b/src/video_core/renderer_vulkan/vk_compute_pass.h
+--- a/src/video_core/renderer_vulkan/vk_compute_pass.h
++++ b/src/video_core/renderer_vulkan/vk_compute_pass.h
+@@ -131,13 +131,22 @@ class ASTCDecoderPass final : public ComputePass {
+     void Assemble(Image& image, const StagingBufferRef& map,
+                   std::span<const VideoCommon::SwizzleParameters> swizzles);
+ 
++    /// Decodes only `layers` of `image` (an initialized array); `map` holds them in order.
++    void AssembleLayers(Image& image, const StagingBufferRef& map,
++                        std::span<const VideoCommon::SwizzleParameters> swizzles,
++                        std::span<const u32> layers);
++
+     /// Where a decode writes: an RGBA8 image with a storage view per (host) level.
+     struct Target {
+         VkImage image;
+         VkImageAspectFlags aspect_mask;
+         bool initialized;
+         std::function<VkImageView(s32 host_level)> level_view;
+         bool wait; ///< Wait for the GPU afterwards (the decoded image itself is sampled).
++        /// When set, the input holds only these layers (in order), each decoded into
++        /// layer_view(host level, layer).
++        std::span<const u32> layers{};
++        std::function<VkImageView(s32 host_level, u32 layer)> layer_view{};
+     };
+ 
+     /// Decodes `info`'s ASTC data in `map` into `target`. `skip` leading levels are absent on the
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -342,7 +342,8 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
+ }
+ 
+ [[nodiscard]] vk::ImageView MakeStorageView(const vk::Device& device, u32 level, VkImage image,
+-                                            VkFormat format) {
++                                            VkFormat format, u32 base_layer = 0,
++                                            u32 layer_count = VK_REMAINING_ARRAY_LAYERS) {
+     static constexpr VkImageViewUsageCreateInfo storage_image_view_usage_create_info{
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+         .pNext = nullptr,
+@@ -365,8 +366,8 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
+             .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+             .baseMipLevel = level,
+             .levelCount = 1,
+-            .baseArrayLayer = 0,
+-            .layerCount = VK_REMAINING_ARRAY_LAYERS,
++            .baseArrayLayer = base_layer,
++            .layerCount = layer_count,
+         },
+     });
+ }
+@@ -2493,6 +2494,19 @@ VkImageView Image::StorageImageView(s32 level) noexcept {
+     return *view;
+ }
+ 
++VkImageView Image::StorageImageLayerView(s32 level, u32 layer) {
++    const u32 layers = static_cast<u32>(info.resources.layers);
++    if (storage_layer_views.empty()) {
++        storage_layer_views.resize(storage_image_views.size() * layers);
++    }
++    auto& view = storage_layer_views[static_cast<size_t>(level) * layers + layer];
++    if (!view) {
++        view = MakeStorageView(runtime->device.GetLogical(), level, *(this->*current_image),
++                               VK_FORMAT_A8B8G8R8_UNORM_PACK32, layer, 1);
++    }
++    return *view;
++}
++
+ bool Image::IsRescaled() const noexcept {
+     return True(flags & ImageFlagBits::Rescaled);
+ }
+@@ -3326,6 +3340,12 @@ void TextureCacheRuntime::AccelerateImageUpload(
+     ASSERT(false);
+ }
+ 
++void TextureCacheRuntime::AccelerateImageUploadLayers(
++    Image& image, const StagingBufferRef& map,
++    std::span<const VideoCommon::SwizzleParameters> swizzles, std::span<const u32> layers) {
++    astc_decoder_pass->AssembleLayers(image, map, swizzles, layers);
++}
++
+ void TextureCacheRuntime::TranscodeAstcToBcn(
+     Image& image, const StagingBufferRef& map,
+     std::span<const VideoCommon::SwizzleParameters> swizzles) {
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -109,6 +109,11 @@ class TextureCacheRuntime {
+                                std::span<const VideoCommon::SwizzleParameters>,
+                                u32 z_start, u32 z_count);
+ 
++    /// Decodes only `layers` of an ASTC array; the staging buffer holds those layers in order.
++    void AccelerateImageUploadLayers(Image&, const StagingBufferRef&,
++                                     std::span<const VideoCommon::SwizzleParameters>,
++                                     std::span<const u32> layers);
++
+     void InsertUploadMemoryBarrier() {}
+ 
+     void TransitionImageLayout(Image& image);
+@@ -377,6 +382,9 @@ class Image : public VideoCommon::ImageBase {
+ 
+     VkImageView StorageImageView(s32 level) noexcept;
+ 
++    /// A storage view of one layer of a host level (decoding only some layers of an array).
++    VkImageView StorageImageLayerView(s32 level, u32 layer);
++
+     bool IsRescaled() const noexcept;
+ 
+     bool ScaleUp(bool ignore = false);
+@@ -409,6 +417,7 @@ class Image : public VideoCommon::ImageBase {
+     vk::Image Image::*current_image{};
+ 
+     std::vector<vk::ImageView> storage_image_views;
++    std::vector<vk::ImageView> storage_layer_views; ///< By host level * layers + layer
+     VkImageAspectFlags aspect_mask = 0;
+     bool initialized = false;
+ 
+diff --git a/src/video_core/texture_cache/image_base.h b/src/video_core/texture_cache/image_base.h
+--- a/src/video_core/texture_cache/image_base.h
++++ b/src/video_core/texture_cache/image_base.h
+@@ -99,6 +99,9 @@ struct ImageBase {
+     u32 converted_size_bytes = 0;
+     u32 scale_rating = 0;
+     u32 host_level_offset = 0; ///< Guest mip level held by host mip 0 (see TrimmedLevels).
++    /// Large layered images uploaded by layer: one bit per layer written since the last upload
++    /// while CpuModified. Empty while CpuModified means the whole image.
++    std::vector<u64> dirty_layers;
+     u64 scale_tick = 0;
+     bool has_scaled = false;
+ 
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -198,6 +198,13 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
+ 
+ template <class P>
+ void TextureCache<P>::TickFrame() {
++    // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
++    // rather than kept for the rest of the session.
++    for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
++        if (scratch->capacity() > LargeScratchCapacity) {
++            scratch->release();
++        }
++    }
+     if constexpr (HAS_DEVICE_MEMORY_INFO) {
+         // Switch 2 titles (native tiling) stream far more texture data than Eden's thresholds
+         // were tuned for: title 1's attract loop alone keeps ~5.3 GB resident, so the collector
+@@ -280,6 +287,9 @@ void TextureCache<P>::TickFrame() {
+                  images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
+                  gc_download_deletes,
+                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
++        LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
++                 images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
++        images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
+         astc_opaque_images = astc_alpha_images = 0;
+         std::vector<std::pair<u32, u64>> shapes;
+         for (const auto& [key, value] : created_shapes) shapes.emplace_back(value.first, key);
+@@ -706,7 +716,11 @@ FramebufferId TextureCache<P>::GetFramebufferId(const RenderTargets& key) {
+ 
+ template <class P>
+ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
+-    ForEachImageInRegion(cpu_addr, size, [this](ImageId image_id, Image& image) {
++    ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size](ImageId image_id, Image& image) {
++        if (UploadsByLayer(image)) {
++            MarkLayersWritten(image, cpu_addr, size);
++            return;
++        }
+         if (True(image.flags & ImageFlagBits::CpuModified)) {
+             return;
+         }
+@@ -812,6 +826,7 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
+                 UntrackImage(image, id);
+             }
+         }
++        image.dirty_layers.clear(); // all of it
+         if (True(image.flags & ImageFlagBits::Remapped)) {
+             continue;
+         }
+@@ -1280,7 +1295,16 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+ 
+     image.flags &= ~ImageFlagBits::CpuModified;
+ 
+-    TrackImage(image, image_id);
++    // Images uploaded by layer stay tracked while some of their layers are dirty.
++    if (False(image.flags & ImageFlagBits::Tracked)) {
++        TrackImage(image, image_id);
++    }
++
++    if (!image.dirty_layers.empty() && UploadWrittenLayers(image)) {
++        runtime.InsertUploadMemoryBarrier();
++        return;
++    }
++    image.dirty_layers.clear();
+ 
+     if (True(image.flags & ImageFlagBits::Unbacked)) {
+         // Nothing to upload into (and staging it could take tens of GB).
+@@ -1311,11 +1335,91 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+         QueueAsyncUnswizzle(image, image_id);
+         return;
+     }
++    ++images_uploaded;
++    uploaded_bytes += image.guest_size_bytes;
++    largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
+     auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
+     UploadImageContents(image, staging);
+     runtime.InsertUploadMemoryBarrier();
+ }
+ 
++template <class P>
++bool TextureCache<P>::UploadsByLayer(const ImageBase& image) const noexcept {
++    // Title 1's terrain arrays (8192x8192x68 ASTC, 1.45 GB each) get a few layers streamed in at a
++    // time; re-decoding all of them for each took a 2 GiB staging buffer and stalled the GPU.
++    if constexpr (requires { &Runtime::AccelerateImageUploadLayers; }) {
++        return True(image.flags & ImageFlagBits::AcceleratedUpload) &&
++               image.info.type == ImageType::e2D && image.info.resources.layers > 1 &&
++               image.guest_size_bytes >= LayerUploadMinSize &&
++               False(image.flags & (ImageFlagBits::Unbacked | ImageFlagBits::Sparse |
++                                    ImageFlagBits::Remapped));
++    } else {
++        return false;
++    }
++}
++
++template <class P>
++void TextureCache<P>::MarkLayersWritten(Image& image, DAddr cpu_addr, size_t size) {
++    if (True(image.flags & ImageFlagBits::CpuModified) && image.dirty_layers.empty()) {
++        return; // all of it is dirty already
++    }
++    const u32 layers = static_cast<u32>(image.info.resources.layers);
++    if (False(image.flags & ImageFlagBits::CpuModified)) {
++        image.flags |= ImageFlagBits::CpuModified;
++        image.dirty_layers.assign(Common::DivCeil(layers, 64U), 0);
++    }
++    const DAddr begin = (std::max<DAddr>)(cpu_addr, image.cpu_addr) - image.cpu_addr;
++    const DAddr end = (std::min<DAddr>)(cpu_addr + size, image.cpu_addr + image.guest_size_bytes) -
++                      image.cpu_addr;
++    const u32 stride = image.info.layer_stride;
++    if (end <= begin || stride == 0) {
++        return;
++    }
++    const u32 last = (std::min)(static_cast<u32>((end - 1) / stride), layers - 1);
++    for (u32 layer = static_cast<u32>(begin / stride); layer <= last; ++layer) {
++        image.dirty_layers[layer / 64] |= u64{1} << (layer % 64);
++    }
++}
++
++template <class P>
++bool TextureCache<P>::UploadWrittenLayers(Image& image) {
++    if constexpr (requires { &Runtime::AccelerateImageUploadLayers; }) {
++        const u32 num_layers = static_cast<u32>(image.info.resources.layers);
++        std::vector<u32> layers;
++        for (u32 layer = 0; layer < num_layers; ++layer) {
++            if ((image.dirty_layers[layer / 64] >> (layer % 64)) & 1) {
++                layers.push_back(layer);
++            }
++        }
++        image.dirty_layers.clear();
++        if (layers.empty() || layers.size() == num_layers) {
++            return false;
++        }
++        // Each layer's mip chain from the first level the host keeps on (as UploadImageContents).
++        auto uploads = FullUploadSwizzles(image.info);
++        const size_t level_offset = uploads[image.host_level_offset].buffer_offset;
++        const size_t tail = image.info.layer_stride - level_offset;
++        auto staging = runtime.UploadStagingBuffer(tail * layers.size());
++        for (size_t i = 0; i < layers.size(); ++i) {
++            gpu_memory->ReadBlock(image.gpu_addr + u64{layers[i]} * image.info.layer_stride +
++                                      level_offset,
++                                  staging.mapped_span.data() + i * tail, tail,
++                                  VideoCommon::CacheType::NoTextureCache);
++        }
++        uploads.erase(uploads.begin(), uploads.begin() + image.host_level_offset);
++        for (auto& upload : uploads) {
++            upload.buffer_offset -= level_offset;
++        }
++        runtime.AccelerateImageUploadLayers(image, staging, uploads, layers);
++        ++images_uploaded;
++        uploaded_bytes += tail * layers.size();
++        ++layer_uploads;
++        return true;
++    } else {
++        return false;
++    }
++}
++
+ template <class P>
+ template <typename StagingBuffer>
+ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) {
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -128,6 +128,10 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
+     u64 gc_download_deletes{}; ///< Evictions that downloaded the image first (a full GPU wait)
+     u64 async_decodes_queued{};
+     u64 images_created{};
++    u64 images_uploaded{};   ///< Image contents uploaded from guest memory (last 600 frames)
++    u64 uploaded_bytes{};    ///< Guest bytes those uploads read
++    u64 largest_upload{};    ///< Largest of them
++    u64 layer_uploads{};     ///< Of them, uploads of only the written layers
+     bool native_thresholds_applied{};
+     u64 native_critical_memory{};
+     u64 native_expected_memory{};
+@@ -151,6 +155,18 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
+     using AsyncBuffer = typename P::AsyncBuffer;
+     using BufferType = typename P::BufferType;
+ 
++    static constexpr u32 LayerUploadMinSize = 64U << 20;
++    static constexpr size_t LargeScratchCapacity = 64U << 20;
++
++    /// Large layered images whose refresh can decode only the layers written since the last one.
++    [[nodiscard]] bool UploadsByLayer(const ImageBase& image) const noexcept;
++
++    /// Records the layers a write of [cpu_addr, +size) touches.
++    void MarkLayersWritten(Image& image, DAddr cpu_addr, size_t size);
++
++    /// Uploads the image's dirty layers. False when it needs a full upload instead.
++    bool UploadWrittenLayers(Image& image);
++
+     struct PendingUnswizzle {
+         ImageId image_id;
+         VideoCommon::ImageInfo info;
+

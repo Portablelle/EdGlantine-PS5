@@ -1,0 +1,52 @@
+diff --git a/references/eden-ns2/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/core/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+index f3c4458..0666332 100644
+--- a/references/eden-ns2/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/core/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -3392,7 +3392,8 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
+             }
+             // A predicated NOINC forward transfer can terminate a loop at its
+             // reconvergence point without a return-link setup or matching RET.
+-            // The same transfer also skips an unconditional backward branch that closes a loop.
++            // Outside a scope it also skips an unconditional backward branch that closes a loop.
++            // Inside a scope the cleanup proof below must exclude re-entry and bypassed joins.
+             bool skips_loop_branch = false;
+             if (index + 2 < code.size() && code[index + 1].words[0] == 0x00007947 &&
+                 code[index + 1].words[2] == 0x0383ffff) {
+@@ -3403,7 +3404,8 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
+             }
+             if (native_predicate != 7 && insn.words[1] == 16 && insn.words[2] == 0x03c00000 &&
+                 index + 2 < code.size() && code[index + 1].Bits(0, 12) == 0x947 &&
+-                (code[index + 2].Bits(0, 12) == 0x941 || skips_loop_branch)) {
++                (code[index + 2].Bits(0, 12) == 0x941 ||
++                 (barrier_tokens.empty() && skips_loop_branch))) {
+                 relocations.push_back({static_cast<u32>(result.instructions.size()), index + 2});
+                 emit(0xe24000000000000fULL | predicate);
+                 break;
+@@ -3616,6 +3618,8 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
+             if (!full_mask_sync || index == 0 ||
+                 code[index - 1].words[0] != ((last_outer_sync_token << 16) | 0x7941) || !barrier_tokens.empty() ||
+                 last_outer_sync_target != s64{index} * 16) {
++                if (index > 0 && code[index - 1].Bits(0, 12) == 0x941)
++                    return fail(index, "native warp synchronization mismatched join");
+                 // A full-mask WARPSYNC outside every reconvergence scope that no
+                 // branch or call reaches has nothing to join; lanes are emulated together.
+                 bool reached = full_mask_sync ? !barrier_tokens.empty() : true;
+@@ -3651,15 +3655,10 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
+             break;
+         }
+         case 0x942: { // Cancel every inner scope before an exit that reaches the outer sync.
++            // Do not drop a token merely because an enclosing SYNC exists. Prove the
++            // selected exit path first, and validate a consecutive cancellation chain
++            // together so the next BREAK is not mistaken for a fresh inner cancellation.
+             if (std::ranges::find(validated_barrier_cancellations, index) != validated_barrier_cancellations.end()) break;
+-            // A BREAK (optionally conditional) out of the innermost PBK scope only drops that scope's
+-            // token; the threads then branch past its BSYNC, and an enclosing SYNC scope pops the
+-            // leftover PBK token together with everything above it, so nothing is emitted.
+-            if (!barrier_tokens.empty() && insn.Bits(16, 4) == barrier_tokens.back() &&
+-                !barrier_sync_scopes.back() && insn.words[1] == 0 && (insn.words[2] & ~0x07800000U) == 0 &&
+-                std::any_of(barrier_sync_scopes.begin(), barrier_sync_scopes.end() - 1,
+-                            [](bool sync) { return sync; }))
+-                break;
+             if (barrier_tokens.size() < 2) return fail(index, "native barrier cancellation mode");
+             if (!barrier_sync_scopes.back() && barrier_sync_scopes[barrier_sync_scopes.size() - 2] &&
+                 index + 1 < code.size() && insn.words[0] ==

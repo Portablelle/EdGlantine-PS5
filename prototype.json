@@ -1,0 +1,221 @@
+{
+  "schema": 1,
+  "name": "EdGlantine-PS5",
+  "titleId": "PPSA99862",
+  "contentVersion": "00.012.000",
+  "dataRoot": "/data/eden-nx2",
+  "entry": "/data/eden-nx2/game/exefs/main",
+  "wrapperCommit": "a26ba788222465ec7fb94dc813958fc749734e07",
+  "edenCoreCommit": "67bada77f8a43a90da2e94e89b8e7da73c256989",
+  "nx2Release": "b7ff03036c0eca49ed99d40973a6b94a410b88ae",
+  "nx2Commit": "50fa86bbbc403ad565eb44fcc281f16f77c69e15",
+  "nx2Source": "https://git.eden-emu.dev/Takoroka/eden-nx2",
+  "buildHost": "build-server",
+  "remoteRoot": "/tmp/ps5-nx2-prototype-20261030",
+  "macroJit": true,
+  "gpuSplit": false,
+  "selfUpdate": false,
+  "consoleDeployed": true,
+  "hardwareValidated": false,
+  "buildCompleted": true,
+  "packageValidated": true,
+  "macroJitEngines": [
+    "graphics",
+    "compute"
+  ],
+  "macroJitAllocator": "PS5 direct memory RW/NX + RX aliases",
+  "macroJitBufferLimitMiB": 16,
+  "macroJitTotalBufferLimitMiB": 64,
+  "macroJitFallback": "Before execution only; failed generation stays on non-JIT path",
+  "armJitMiB": [
+    256,
+    96,
+    96,
+    96,
+    96,
+    96
+  ],
+  "armJitTotalMiB": 736,
+  "hostJitMiB": 16,
+  "nullJitMiB": 8,
+  "threadPlacement": "Six distinct guest physical cores + separate GPU; validated CPUID only, OS fallback",
+  "auxiliaryPlacement": "Spare physical cores, otherwise guest SMT siblings; excludes GPU sibling",
+  "cpuPolicySha256": "03cf28ce1a9fb5d9956e164dd1adbf58eb4282831b18434f34cd07a9de48eff9",
+  "threadPolicySha256": "69461137224c754a6b458af24e8436e40e06ee5c66b50aa16ac3e5ecd35d087a",
+  "ns2Source": "https://github.com/0x2593/Eden-NS2",
+  "ns2Commit": "e2f285ab1ecd3a2475c2ccad66f23b06b94ead5c",
+  "eglantineSource": "https://github.com/Djihads80/Eglantine",
+  "eglantineCommit": "b40ad217ab829226841cb71f6e4c5cb05977a225",
+  "eglantineAdaptations": [
+    "Empty performance stats before initialization",
+    "Batch large-page cache invalidation by contiguous ranges",
+    "Reset device page continuity on map/unmap and cut preceding runs",
+    "Reject truncated Vulkan pipeline cache headers; preserve PS5 atomic writer and old valid cache on failure",
+    "NX2 operation-mode refresh event and actual settings-change propagation",
+    "Loose dump NACP/icon sidecars and display version with documented RomFS heuristic",
+    "ASTC written-layer uploads from existing dirty-page tracking; bounded batches and BC/rescaled exclusions",
+    "Release CPU upload scratch above 64 MiB; upload volume counters",
+    "RET R0/R55 regression tests adapted to existing strict return linkage validation"
+  ],
+  "hostSuiteValidated": false,
+  "nx2PatchSha256": "3b51500d2f6ba91b104f6eb50b90554602203f2bf2011aedc7f5a3df276a2269",
+  "rejectedAdaptations": [
+    "QMD history eviction: replays completed descriptors on action 2; regression caught by native_semaphore test"
+  ],
+  "archive": "Eden-NX2-PS5-prototype-00.012.000.tar.gz",
+  "archiveBytes": 43760839,
+  "archiveSha256": "69bd38afcc47441f9fb1350fdbed825267289374ad1a902965f45f15eef83939",
+  "buildPatchSha256": "3b51500d2f6ba91b104f6eb50b90554602203f2bf2011aedc7f5a3df276a2269",
+  "postBuildSourceChanges": [],
+  "genericHostSuite": "Not validated: desktop fastmem assumptions and Catch2 abort; log retained",
+  "ebootSha256": "658f5ca678276b88b578c4c125e2211c06c1b8f85a22dab02715647d296d3380",
+  "shaderFixes": [
+    "Validate barrier cancellation paths and chains",
+    "Validate active-scope loop cleanup",
+    "Reject WARPSYNC with a mismatched reconvergence target",
+    "Semantic tests for vector RZ stores, cube-array LOD zero, and unsigned atomic MIN"
+  ],
+  "sparseLayers": {
+    "defaultEnabled": false,
+    "optIn": "EDEN_NX2_SPARSE_LAYERS=1",
+    "mode": "All visible layers resident before publication; per-layer allocations plus shared mip tail when required",
+    "imageBudgetMiB": 64,
+    "globalBudgetMiB": 128,
+    "liveLayerEviction": false,
+    "selectiveResidency": false,
+    "hostManagerTests": true,
+    "hostImageOwnershipTests": true,
+    "nativeBackendLinked": true,
+    "hardwareValidated": false,
+    "quarantine": "Retain mappings, allocations, fence and budget; reject further sparse admission on uncertain GPU completion",
+    "fallback": "Ordinary image; old unbacked-image fallback disallowed while experiment is requested"
+  },
+  "retab": {
+    "rootCause": "PS5 shared-JIT replacement omitted PAuth and address-width translation options",
+    "hostCases": 7,
+    "hostAssertions": 904,
+    "nativeGeneratedOptionsVerified": true,
+    "hardwareValidated": true,
+    "hardwareValidationScope": "Welcome Tour 00.007.000 passed previous rtld RETAB failure; later native shader rejection and guest panic 0x4201 remain"
+  },
+  "previousDeployment": {
+    "date": "2026-10-31",
+    "path": "/data/homebrew/PPSA99862",
+    "rollback": "/data/ps5-diag/nx2-rollback-010-20261031",
+    "filesVerified": 70,
+    "launched": true,
+    "installedSourceVersion": "00.011.000",
+    "launchOutcome": ".011 boot confirmed; same 480 video outputs 7.0367 -> 14.9572 fps; user reports correct video image, but menu black flashes and severe artifacts after confirmation; native texture shader rejections captured."
+  },
+  "vulkanPortGeneratorSha256": "9216ccf934191abf46c721501bbdc1c0cab05412fdf5890f5b5dc5c4f1702023",
+  "eglantineAstcCommit": "97ce27ab35153884d2fd05c278433928e429cd91",
+  "gather": {
+    "hostCases": 3,
+    "hostAssertions": 5541,
+    "hardwareValidated": false,
+    "mode": "Native TLD4 PerPx signed 8-bit offsets; legacy Maxwell remains 6-bit",
+    "translatorSalt": "0x4f554e4345a00002",
+    "hardwareObservation": "Previous rejection absent in 44.9-second .008 log; visual correctness not validated."
+  },
+  "videoCodecLimitation": "H264 initialization hardware-confirmed successful on Welcome Tour .009; low frame rate remains, full playback/game compatibility not established.",
+  "deploymentHandoff": ".012 installed and tested: partial visual improvement; remaining native texture lowering gaps captured.",
+  "deployment": {
+    "date": "2026-10-31",
+    "path": "/data/homebrew/PPSA99862",
+    "rollback": "/data/ps5-diag/nx2-rollback-011-20261031",
+    "filesVerified": 70,
+    "launched": true,
+    "installedSourceVersion": "00.012.000",
+    "launchOutcome": ".012 boot/console run confirmed; user reports fewer but persistent visual defects. Previous split-RGB and mixed-bank array-depth refusals absent; next bindless array-depth, mixed-bank explicit-LOD, half texel fetch forms rejected."
+  },
+  "previousTargetedTests": {
+    "cases": 395,
+    "passed": 395,
+    "failed": 0,
+    "assertions": 1877310,
+    "assertionsPassed": 1877310,
+    "assertionsFailed": 0,
+    "exitCode": 0,
+    "remainingFailures": null
+  },
+  "targetedTests": {
+    "scope": "Two focused production-lowering/Maxwell IR semantic tests on build-server; existing host libraries reused, no complete desktop suite or repeated generic native checks",
+    "cases": 2,
+    "assertions": 82,
+    "failed": 0
+  },
+  "videoPerformance": {
+    "instrumentation": "Bounded cumulative video stages and existing Vulkan API/wait counters; see milestones/video-performance/ANALYSIS.md",
+    "optimizationApplied": "SSE2 BT709 row conversion, exact scalar rounding retained",
+    "baselineConversionMsPerFrame": 96.17646244583334,
+    "hardwareMeasurement": {
+      "baseline010": {
+        "firstFrame": 90,
+        "lastFrame": 570,
+        "frames": 480,
+        "dimensions": "3840x2160",
+        "nv12": "false",
+        "seconds": 68.21398300000001,
+        "outputFps": 7.03668044131069,
+        "millisecondsPerFrame": {
+          "packet_ns": 0.031496485416666664,
+          "decode_ns": 25.723514060416665,
+          "receive_ns": 0.016671385416666667,
+          "planes_ns": 1.91464945625,
+          "allocate_ns": 1.78518240625,
+          "convert_ns": 96.17646244583334,
+          "swizzle_ns": 6.77214795,
+          "invalidate_ns": 1.321908225,
+          "write_ns": 4.27073750625
+        }
+      },
+      "optimized011": {
+        "firstFrame": 90,
+        "lastFrame": 570,
+        "frames": 480,
+        "dimensions": "3840x2160",
+        "nv12": "false",
+        "seconds": 32.09162499999999,
+        "outputFps": 14.95717340583408,
+        "millisecondsPerFrame": {
+          "packet_ns": 0.030880741666666666,
+          "decode_ns": 25.607487608333333,
+          "receive_ns": 0.01605255833333333,
+          "planes_ns": 1.8921683,
+          "allocate_ns": 1.7880242729166667,
+          "convert_ns": 21.14781038541667,
+          "swizzle_ns": 6.741368720833333,
+          "invalidate_ns": 1.3132330520833333,
+          "write_ns": 4.160921725
+        }
+      },
+      "conversionSpeedup": 4.5478212965327005,
+      "outputFpsSpeedup": 2.1256007759033713
+    },
+    "hardwareMeasured": true,
+    "visualValidation": "Video image correct per user; menu and following screen NOT validated, flashes/black areas/misplaced sprites reported."
+  },
+  "consoleCleanup": {
+    "date": "2026-10-31",
+    "status": "complete",
+    "bytesFreed": 645741871,
+    "removedRoots": [
+      "/data/ps5-diag/nx2-install-20261031",
+      "/data/ps5-diag/nx2-rollback-006-20261031",
+      "/data/ps5-diag/nx2-rollback-007-20261031",
+      "/data/ps5-diag/nx2-rollback-008-20261031",
+      "/data/ps5-diag/nx2-rollback-009-20261031"
+    ],
+    "retainedRollback": "/data/ps5-diag/nx2-rollback-010-20261031"
+  },
+  "menuRendering": {
+    "fixedForms": [
+      "Split bindless scalar 2D RGB/RGBA outputs with aliases",
+      "Array2D depth comparison using a second descriptor bank"
+    ],
+    "translatorSalt": "0x4f554e4345a00003",
+    "hardwareValidated": false,
+    "details": "milestones/menu-render/ANALYSIS.md",
+    "hardwareObservation": "Partial improvement per user; additional native texture forms remain rejected."
+  }
+}
