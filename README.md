@@ -3,7 +3,8 @@
 Ce projet dérive de ProsperoEden 1.005.000 et du fork expérimental Eden NX2.
 Il ne remplace pas Botty et ne modifie pas son moteur Switch 1.
 
-**État : 00.012.000 installée et testée sur PS5, rendu encore partiellement incorrect.**
+**État : 00.013.000 installée sur PS5 après corrections Cubic.**
+Le rendu reste partiellement incorrect selon le dernier essai .012.
 La conversion vidéo 4K est passée de 96,18 à 21,15 ms/image ; sur le même intervalle
 vidéo, la cadence est passée de 7,04 à 14,96 images/s. Le menu atteint 59,94 FPS,
 mais la .011 présentait des défauts graphiques après validation. La .012 corrige
@@ -224,4 +225,4 @@ et ses compteurs internes ont été adaptés à six cœurs.
 Les fichiers du paquet ne doivent pas être copiés sur le titre de Botty ou de
 ProsperoEden. L'identité séparée PPSA99862 a été enregistrée sur la console. La mise à jour
 00.007.000 conserve cette inscription ; la fiche système peut encore indiquer
-00.006.000. Le paquet actif est désormais 00.012.000 ; consulter `prototype.json` pour le rollback conservé.
+00.006.000. Le paquet actif est désormais 00.013.000 ; consulter `prototype.json` pour le rollback conservé.

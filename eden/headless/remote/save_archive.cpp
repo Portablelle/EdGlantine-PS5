@@ -280,7 +280,17 @@ bool Unpack(const std::string& path, const std::string& folder, const std::strin
     }
     // A zip without a file is not save data: unpacked, it would put an empty folder in the place
     // of the console's own.
-    if (std::none_of(items.begin(), items.end(), [](const Item& item) { return !item.folder; })) {
+    const auto output_place = [&](const Item& item) {
+        std::string place = item.place;
+        if (one_top) {
+            if (place == top) return std::string{};
+            place = place.substr(top.size() + 1);
+        }
+        return place == ".nx_save_meta.bin" ? std::string{} : place;
+    };
+    if (std::none_of(items.begin(), items.end(), [&](const Item& item) {
+            return !item.folder && !output_place(item).empty();
+        })) {
         *error = "The save data's zip has no files";
         return false;
     }
@@ -295,13 +305,8 @@ bool Unpack(const std::string& path, const std::string& folder, const std::strin
         return false;
     }
     for (const Item& item : items) {
-        std::string place = item.place;
-        if (one_top) {
-            if (place == top) continue;
-            place = place.substr(top.size() + 1);
-        } else if (place == ".nx_save_meta.bin") {
-            continue; // JKSV's own, not the game's
-        }
+        const std::string place = output_place(item);
+        if (place.empty()) continue; // Wrapper directory or JKSV metadata, not game data.
         const std::string target = folder + "/" + place;
         if (item.folder) {
             std::filesystem::create_directories(target, ignored);

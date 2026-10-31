@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "EdGlantine-PS5",
   "titleId": "PPSA99862",
-  "contentVersion": "00.012.000",
+  "contentVersion": "00.013.000",
   "dataRoot": "/data/eden-nx2",
   "entry": "/data/eden-nx2/game/exefs/main",
   "wrapperCommit": "a26ba788222465ec7fb94dc813958fc749734e07",
@@ -58,17 +58,17 @@
     "RET R0/R55 regression tests adapted to existing strict return linkage validation"
   ],
   "hostSuiteValidated": false,
-  "nx2PatchSha256": "3b51500d2f6ba91b104f6eb50b90554602203f2bf2011aedc7f5a3df276a2269",
+  "nx2PatchSha256": "74f89c2f8365816317ee677d19ce4d3d9b39514120b8078ebf8ac63e95eafb22",
   "rejectedAdaptations": [
     "QMD history eviction: replays completed descriptors on action 2; regression caught by native_semaphore test"
   ],
-  "archive": "Eden-NX2-PS5-prototype-00.012.000.tar.gz",
-  "archiveBytes": 43760839,
-  "archiveSha256": "69bd38afcc47441f9fb1350fdbed825267289374ad1a902965f45f15eef83939",
-  "buildPatchSha256": "3b51500d2f6ba91b104f6eb50b90554602203f2bf2011aedc7f5a3df276a2269",
+  "archive": "Eden-NX2-PS5-prototype-00.013.000.tar.gz",
+  "archiveBytes": 43758777,
+  "archiveSha256": "101c993270a7af79826073c7934621b2757cb7121a70476bd821e71f0c22ea59",
+  "buildPatchSha256": "74f89c2f8365816317ee677d19ce4d3d9b39514120b8078ebf8ac63e95eafb22",
   "postBuildSourceChanges": [],
   "genericHostSuite": "Not validated: desktop fastmem assumptions and Catch2 abort; log retained",
-  "ebootSha256": "658f5ca678276b88b578c4c125e2211c06c1b8f85a22dab02715647d296d3380",
+  "ebootSha256": "e36bfb35fc370f0ec7f929a8874216634d3c024e0938eb0f912a8ca1802fe4ef",
   "shaderFixes": [
     "Validate barrier cancellation paths and chains",
     "Validate active-scope loop cleanup",
@@ -101,11 +101,11 @@
   "previousDeployment": {
     "date": "2026-10-31",
     "path": "/data/homebrew/PPSA99862",
-    "rollback": "/data/ps5-diag/nx2-rollback-010-20261031",
+    "rollback": "/data/ps5-diag/nx2-rollback-011-20261031",
     "filesVerified": 70,
     "launched": true,
-    "installedSourceVersion": "00.011.000",
-    "launchOutcome": ".011 boot confirmed; same 480 video outputs 7.0367 -> 14.9572 fps; user reports correct video image, but menu black flashes and severe artifacts after confirmation; native texture shader rejections captured."
+    "installedSourceVersion": "00.012.000",
+    "launchOutcome": ".012 boot/console run confirmed; user reports fewer but persistent visual defects. Previous split-RGB and mixed-bank array-depth refusals absent; next bindless array-depth, mixed-bank explicit-LOD, half texel fetch forms rejected."
   },
   "vulkanPortGeneratorSha256": "9216ccf934191abf46c721501bbdc1c0cab05412fdf5890f5b5dc5c4f1702023",
   "eglantineAstcCommit": "97ce27ab35153884d2fd05c278433928e429cd91",
@@ -118,15 +118,15 @@
     "hardwareObservation": "Previous rejection absent in 44.9-second .008 log; visual correctness not validated."
   },
   "videoCodecLimitation": "H264 initialization hardware-confirmed successful on Welcome Tour .009; low frame rate remains, full playback/game compatibility not established.",
-  "deploymentHandoff": ".012 installed and tested: partial visual improvement; remaining native texture lowering gaps captured.",
+  "deploymentHandoff": ".013 installed directly after user-confirmed closure; rollback .012 retained. No full visual acceptance claimed.",
   "deployment": {
     "date": "2026-10-31",
     "path": "/data/homebrew/PPSA99862",
-    "rollback": "/data/ps5-diag/nx2-rollback-011-20261031",
+    "rollback": "/data/ps5-diag/nx2-rollback-012-20261031",
     "filesVerified": 70,
-    "launched": true,
-    "installedSourceVersion": "00.012.000",
-    "launchOutcome": ".012 boot/console run confirmed; user reports fewer but persistent visual defects. Previous split-RGB and mixed-bank array-depth refusals absent; next bindless array-depth, mixed-bank explicit-LOD, half texel fetch forms rejected."
+    "launched": false,
+    "installedSourceVersion": "00.013.000",
+    "launchOutcome": "Installed four Cubic follow-up fixes; .012 rendering improvement/remaining defects carry forward, .013 gameplay not yet retested."
   },
   "previousTargetedTests": {
     "cases": 395,
@@ -139,10 +139,8 @@
     "remainingFailures": null
   },
   "targetedTests": {
-    "scope": "Two focused production-lowering/Maxwell IR semantic tests on build-server; existing host libraries reused, no complete desktop suite or repeated generic native checks",
-    "cases": 2,
-    "assertions": 82,
-    "failed": 0
+    "scope": "Incremental native compilation and built-in packaging checks; no extra host suite for these focused Cubic fixes",
+    "fullDesktopSuiteRebuilt": false
   },
   "videoPerformance": {
     "instrumentation": "Bounded cumulative video stages and existing Vulkan API/wait counters; see milestones/video-performance/ANALYSIS.md",
@@ -198,15 +196,17 @@
   "consoleCleanup": {
     "date": "2026-10-31",
     "status": "complete",
-    "bytesFreed": 645741871,
+    "bytesFreed": 904059157,
     "removedRoots": [
       "/data/ps5-diag/nx2-install-20261031",
       "/data/ps5-diag/nx2-rollback-006-20261031",
       "/data/ps5-diag/nx2-rollback-007-20261031",
       "/data/ps5-diag/nx2-rollback-008-20261031",
-      "/data/ps5-diag/nx2-rollback-009-20261031"
+      "/data/ps5-diag/nx2-rollback-009-20261031",
+      "/data/ps5-diag/nx2-rollback-010-20261031",
+      "/data/ps5-diag/nx2-rollback-011-20261031"
     ],
-    "retainedRollback": "/data/ps5-diag/nx2-rollback-010-20261031"
+    "retainedRollback": "/data/ps5-diag/nx2-rollback-012-20261031"
   },
   "menuRendering": {
     "fixedForms": [
@@ -217,5 +217,11 @@
     "hardwareValidated": false,
     "details": "milestones/menu-render/ANALYSIS.md",
     "hardwareObservation": "Partial improvement per user; additional native texture forms remain rejected."
-  }
+  },
+  "cubicCorrections": [
+    "Reject metadata-only save imports",
+    "Do not redirect HTTP uploads or modifying requests",
+    "Unique device translation generations across instances",
+    "Preserve signalled FFmpeg color matrix"
+  ]
 }

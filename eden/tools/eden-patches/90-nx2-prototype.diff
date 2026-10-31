@@ -1027,10 +1027,10 @@ index b4b3b46..5703ebc 100644
      using CounterAtomicType = std::atomic_uint8_t;
      static constexpr size_t subentries = 8 / sizeof(CounterType);
 diff --git a/src/core/device_memory_manager.inc b/src/core/device_memory_manager.inc
-index 97c2706..0bcf496 100644
+index 97c2706..69b37f5 100644
 --- a/src/core/device_memory_manager.inc
 +++ b/src/core/device_memory_manager.inc
-@@ -21,7 +21,9 @@
+@@ -21,11 +21,17 @@
  #include "common/scope_exit.h"
  #include "common/settings.h"
  #include "core/device_memory.h"
@@ -1040,7 +1040,15 @@ index 97c2706..0bcf496 100644
  #include "core/memory.h"
  
  namespace Core {
-@@ -172,7 +174,7 @@ template <typename Traits>
+ 
++// Unique across manager instances and mutations, including reuse of an object's
++// address on a surviving worker. Header layout and the thread-local cache stay unchanged.
++inline std::atomic<u64> device_translation_generation{1};
++
+ namespace {
+ 
+ class MultiAddressContainer {
+@@ -172,9 +178,11 @@ template <typename Traits>
  DeviceMemoryManager<Traits>::DeviceMemoryManager(const DeviceMemory& device_memory_)
      : physical_base{uintptr_t(device_memory_.buffer.BackingBasePointer())}
      , device_inter{nullptr}
@@ -1048,8 +1056,12 @@ index 97c2706..0bcf496 100644
 +    , compressed_device_addr(Kernel::Board::Nintendo::Nx::KSystemControl::Init::GetIntendedMemorySize() >> Memory::YUZU_PAGEBITS)
      , tracked_entries(device_as_size >> Memory::YUZU_PAGEBITS)
  {
++    translation_generation.store(device_translation_generation.fetch_add(1, std::memory_order_relaxed),
++                                 std::memory_order_relaxed);
      impl = std::make_unique<DeviceMemoryManagerAllocator<Traits>>();
-@@ -211,11 +213,14 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
+     cached_pages = std::make_unique<CachedPages>();
+ }
+@@ -211,11 +219,14 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
      std::scoped_lock lk(mapping_guard);
  
      tracked_entries.CommitRegion(start_page_d, start_page_d + num_pages);
@@ -1064,12 +1076,13 @@ index 97c2706..0bcf496 100644
              continue;
          }
          auto phys_addr = static_cast<u32>(GetRawPhysicalAddr(ptr) >> Memory::YUZU_PAGEBITS) + 1U;
-@@ -234,12 +239,24 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
+@@ -234,12 +245,25 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
          }
          impl->multi_dev_address.Register(new_dev, start_id);
      }
 -    t_slot = {};
-+    translation_generation.fetch_add(1, std::memory_order_release);
++    translation_generation.store(device_translation_generation.fetch_add(1, std::memory_order_relaxed),
++                                 std::memory_order_release);
      if (track) {
          TrackContinuityImpl(address, virtual_address, size, asid);
      }
@@ -1090,7 +1103,7 @@ index 97c2706..0bcf496 100644
  template <typename Traits>
  void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
      size_t start_page_d = address >> Memory::YUZU_PAGEBITS;
-@@ -248,11 +265,13 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
+@@ -248,11 +272,13 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
      std::scoped_lock lk(mapping_guard);
  
      tracked_entries.CommitRegion(start_page_d, start_page_d + num_pages); // should already be committed, but just in case
@@ -1104,13 +1117,14 @@ index 97c2706..0bcf496 100644
          if (phys_addr != 0) [[likely]] {
              u32& base_dev = compressed_device_addr.GetAndFault(phys_addr - 1U);
              if ((base_dev >> MULTI_FLAG_BITS) == 0) [[likely]] {
-@@ -268,8 +287,23 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
+@@ -268,8 +294,24 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
              base_dev = new_start | MULTI_FLAG;
          }
      }
 -    t_slot = {};
-+    translation_generation.fetch_add(1, std::memory_order_release);
- }
++    translation_generation.store(device_translation_generation.fetch_add(1, std::memory_order_relaxed),
++                                 std::memory_order_release);
++}
 +
 +template <typename Traits>
 +void DeviceMemoryManager<Traits>::CutContinuityAt(size_t page) {
@@ -1124,12 +1138,12 @@ index 97c2706..0bcf496 100644
 +        }
 +        tracked_entries.GetUnchecked(index).continuity_tracker = static_cast<u32>(last_count);
 +    }
-+}
+ }
 +
  template <typename Traits>
  void DeviceMemoryManager<Traits>::TrackContinuityImpl(DAddr address, VAddr virtual_address,
                                                        size_t size, Asid asid) {
-@@ -357,6 +391,7 @@ void DeviceMemoryManager<Traits>::Write(DAddr address, T value) {
+@@ -357,6 +399,7 @@ void DeviceMemoryManager<Traits>::Write(DAddr address, T value) {
      if (!ptr) [[unlikely]] {
          return;
      }
@@ -1137,7 +1151,7 @@ index 97c2706..0bcf496 100644
      std::memcpy(ptr, &value, sizeof(T));
  }
  
-@@ -404,9 +439,10 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
+@@ -404,9 +447,10 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
      const std::size_t page_offset = address & Memory::YUZU_PAGEMASK;
      if (size <= Memory::YUZU_PAGESIZE - page_offset) {
          const DAddr guest_page = address & ~static_cast<DAddr>(Memory::YUZU_PAGEMASK);
@@ -1151,7 +1165,7 @@ index 97c2706..0bcf496 100644
                  return;
              }
          }
-@@ -415,8 +451,8 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
+@@ -415,8 +459,8 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
          const auto phys_addr = tracked_entries[page_index].compressed_physical_ptr;
          if (phys_addr != 0) {
              auto* const mem_ptr = GetPointerFromRaw<u8>((PAddr(phys_addr - 1) << Memory::YUZU_PAGEBITS));
@@ -1162,7 +1176,7 @@ index 97c2706..0bcf496 100644
              std::memcpy(dest_pointer, mem_ptr + page_offset, size);
              return;
          }
-@@ -449,6 +485,7 @@ void DeviceMemoryManager<Traits>::WriteBlock(DAddr address, const void* src_poin
+@@ -449,6 +493,7 @@ void DeviceMemoryManager<Traits>::WriteBlock(DAddr address, const void* src_poin
                  current_vaddr, address, size);
          },
          [&](size_t copy_amount, u8* const dst_ptr) {
@@ -1170,7 +1184,7 @@ index 97c2706..0bcf496 100644
              std::memcpy(dst_ptr, src_pointer, copy_amount);
          },
          [&](const std::size_t copy_amount) {
-@@ -462,9 +499,10 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
+@@ -462,9 +507,10 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
      const std::size_t page_offset = address & Memory::YUZU_PAGEMASK;
      if (size <= Memory::YUZU_PAGESIZE - page_offset) {
          const DAddr guest_page = address & ~static_cast<DAddr>(Memory::YUZU_PAGEMASK);
@@ -1184,7 +1198,7 @@ index 97c2706..0bcf496 100644
                  return;
              }
          }
-@@ -473,8 +511,8 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
+@@ -473,8 +519,8 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
          const auto phys_addr = tracked_entries[page_index].compressed_physical_ptr;
          if (phys_addr != 0) {
              auto* const mem_ptr = GetPointerFromRaw<u8>((PAddr(phys_addr - 1) << Memory::YUZU_PAGEBITS));
@@ -1195,7 +1209,7 @@ index 97c2706..0bcf496 100644
              std::memcpy(dest_pointer, mem_ptr + page_offset, size);
              return;
          }
-@@ -508,6 +546,7 @@ void DeviceMemoryManager<Traits>::WriteBlockUnsafe(DAddr address, const void* sr
+@@ -508,6 +554,7 @@ void DeviceMemoryManager<Traits>::WriteBlockUnsafe(DAddr address, const void* sr
                  current_vaddr, address, size);
          },
          [&](size_t copy_amount, u8* const dst_ptr) {
@@ -8012,10 +8026,10 @@ index 0000000..38cd022
 +} // namespace Service::AM
 diff --git a/src/core/hle/service/am/service/native_video_decoder.cpp b/src/core/hle/service/am/service/native_video_decoder.cpp
 new file mode 100644
-index 0000000..d99e997
+index 0000000..854dc7a
 --- /dev/null
 +++ b/src/core/hle/service/am/service/native_video_decoder.cpp
-@@ -0,0 +1,999 @@
+@@ -0,0 +1,1001 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
 +#include "core/core.h"
@@ -8257,7 +8271,9 @@ index 0000000..d99e997
 +            DecodedFrame frame{};
 +            frame.bitdepth = 8;
 +            frame.format = 0;
-+            frame.matrix = 1;
++            // Keep signalled matrix coefficients. Only unspecified input retains the
++            // historical BT.709 default; the RGBA admission below rejects other matrices.
++            frame.matrix = av->colorspace == AVCOL_SPC_UNSPECIFIED ? 1U : static_cast<u32>(av->colorspace);
 +            frame.full_range = av->format == AV_PIX_FMT_YUVJ420P || av->color_range == AVCOL_RANGE_JPEG;
 +            for (u32 plane = 0; plane < 3; ++plane) {
 +                frame.widths[plane] = plane ? (av->width + 1) / 2 : av->width;

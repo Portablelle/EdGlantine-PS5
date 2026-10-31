@@ -120,9 +120,12 @@ int remote_http_run(const remote_http_request *request, remote_http_result *resu
     (void)curl_easy_setopt(t.easy, CURLOPT_USERAGENT, "ProsperoEden/1");
     (void)curl_easy_setopt(t.easy, CURLOPT_PROTOCOLS_STR, request->https_only ? "https" : "http,https");
     (void)curl_easy_setopt(t.easy, CURLOPT_REDIR_PROTOCOLS_STR, request->https_only ? "https" : "http,https");
-    /* A reverse proxy in front of a server may redirect; curl keeps the Authorization header to the
-     * first host only (CURLOPT_UNRESTRICTED_AUTH stays off). */
-    (void)curl_easy_setopt(t.easy, CURLOPT_FOLLOWLOCATION, 1L);
+    /* Follow redirects only for reads. Redirecting an upload can disclose its body
+     * even when curl strips Authorization; 307/308 also preserve the body by default. */
+    (void)curl_easy_setopt(t.easy, CURLOPT_FOLLOWLOCATION,
+        request->body == NULL && request->file_path == NULL &&
+        (request->method == NULL || strcmp(request->method, "GET") == 0 ||
+         strcmp(request->method, "HEAD") == 0) ? 1L : 0L);
     (void)curl_easy_setopt(t.easy, CURLOPT_MAXREDIRS, (long)remote_http_redirects);
     (void)curl_easy_setopt(t.easy, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_1_1);
     (void)curl_easy_setopt(t.easy, CURLOPT_CONNECTTIMEOUT_MS, (long)remote_http_connect_ms);
@@ -173,9 +176,7 @@ int remote_http_run(const remote_http_request *request, remote_http_result *resu
         (void)curl_easy_setopt(t.easy, CURLOPT_MIMEPOST, form);
         headers = curl_slist_append(headers, "Expect:"); /* no 100-continue round trip first */
     }
-    /* A body or a form makes it a POST already, and a redirect (a proxy's to https) then sends it
-     * again as a POST with its body; a verb set by hand would go without the body. Only another
-     * verb (PUT, DELETE) is set so. */
+    /* A body or form already selects POST. Set only other verbs explicitly. */
     if (request->method != NULL && strcmp(request->method, "POST") == 0 && request->body == NULL &&
         request->file_path == NULL)
     {
@@ -183,9 +184,6 @@ int remote_http_run(const remote_http_request *request, remote_http_result *resu
         (void)curl_easy_setopt(t.easy, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)0);
         (void)curl_easy_setopt(t.easy, CURLOPT_COPYPOSTFIELDS, "");
     }
-    if (request->body != NULL || request->file_path != NULL ||
-        (request->method != NULL && strcmp(request->method, "POST") == 0))
-        (void)curl_easy_setopt(t.easy, CURLOPT_POSTREDIR, (long)CURL_REDIR_POST_ALL);
     if (request->method != NULL && strcmp(request->method, "POST") != 0)
         (void)curl_easy_setopt(t.easy, CURLOPT_CUSTOMREQUEST, request->method);
     (void)curl_easy_setopt(t.easy, CURLOPT_HTTPHEADER, headers);

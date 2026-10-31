@@ -1,3 +1,22 @@
+# 00.013.000 — corrections après revue Cubic
+
+Compilation native incrémentale sur `build-server` (18 objets), packaging puis installation
+directe après fermeture confirmée. Aucun nouveau test hôte ni suite générale.
+Les quatre corrections concrètes de la revue initiale sont détaillées dans
+[CUBIC-REVIEW.md](CUBIC-REVIEW.md) : import de sauvegarde non vide après filtrage,
+absence de redirection d’uploads, génération unique du cache mémoire entre instances,
+et préservation de la matrice couleur signalée par FFmpeg.
+
+70 fichiers vérifiés au staging, activation réussie. Un seul rollback console est
+conservé : .012 dans `/data/ps5-diag/nx2-rollback-012-20261031`. Anciennes copies
+supprimées sur demande, environ 862 Mio libérés ; jeux et sauvegardes préservés.
+
+Les performances vidéo et l’amélioration graphique partielle ont été mesurées sur
+.011/.012 ci-dessous. Pas de validation graphique complète de .013 : les trois
+formes restantes de textures identifiées sur .012 restent à implémenter.
+
+---
+
 # 00.012.000 — textures du menu / écran suivant
 
 Compilation PS5 incrémentale sur `build-server`, puis packaging et installation directe.
