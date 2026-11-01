@@ -5,9 +5,8 @@ engine, with adaptations from the Eglantine forks. It reaches gameplay in tested
 scenarios, but performance, rendering correctness and stability still need work.
 
 **Contributors welcome.** The latest reported gameplay result is **21 FPS** on
-version **00.063.000**. A stable **30 FPS has not been achieved** in that test.
-The newer **00.064.000** build has also been tested on PS5, with a profiling capture
-retrieved; its FPS has not been separately confirmed in the recorded results.
+version **00.064.000**, confirmed by the user on PS5. A stable **30 FPS has not
+been achieved** in that test. A profiling capture is also available.
 Help with profiling, CPU/GPU optimization, memory synchronization and PS5 testing
 would make a real difference. See [Contributing](#contributing) below.
 
@@ -18,12 +17,12 @@ would make a real difference. See [Contributing](#contributing) below.
   and texture-stride fixes. The build and targeted tests passed on the build server;
   the user also confirmed testing on PS5. The 20.093-second console capture records
   8.492 seconds of CPU draw configuration and 54,383,256 sampled-descriptor cache
-  hits out of 54,861,363 requests. Texture-table counters remained at zero. A
-  separately confirmed FPS result and full rendering validation are not recorded.
-- **Performance reference: .063 at 21 FPS** during gameplay with GPU splitting
-  disabled. This is one observed result, not a compatibility benchmark or a
-  guarantee for other games or scenes. Rendering quality was not specified for
-  that run; earlier versions had visual defects.
+  hits out of 54,861,363 requests. Texture-table counters remained at zero.
+  The user confirmed 21 FPS; full rendering validation is not recorded.
+- **Latest gameplay result: .064 at 21 FPS**, matching the reported .063 frame
+  rate, with GPU splitting disabled. No FPS improvement is observed in this user
+  feedback. These results are not a compatibility benchmark or a guarantee for
+  other games or scenes; full rendering correctness remains unvalidated.
 - **Measured bottlenecks:** a 20.112-second .063 solo capture recorded 8.650 seconds
   of CPU draw preparation/configuration, including 3.731 seconds of descriptor
   work and 2.812 seconds of resource reads. These phases are nested and must not

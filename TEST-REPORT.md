@@ -15,8 +15,8 @@ Console capture: 20.093 s, CPU draw configuration 8.492 s, including cfg_desc
 3.413 s and cfg_read 2.965 s; push_images 0.723 s. These wall-time counters are
 nested and must not be added. Sampled-descriptor memo: 54,861,363 requests,
 54,383,256 hits; texture-table counters: zero requests/hits.
-The capture records 21 FPS as an assumption, not a separately confirmed user result.
-The .063 reference remains 21 FPS. Different scene activity limits the comparison;
+The user subsequently confirmed 21 FPS on .064, matching the .063 reference.
+No FPS improvement is observed in this feedback. Different scene activity limits the comparison;
 no isolated FPS gain or complete rendering validation is established.
 Frontend frame dimensions are 1920x1080, with queued output and driver videoout at
 3840x2160. The 1080p intermediate is also present in .063 logs and is a plausible
