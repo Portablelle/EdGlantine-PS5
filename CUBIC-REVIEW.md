@@ -11,7 +11,10 @@ Four findings were addressed:
 - Remote build and packaging scripts create the destination directory before rsync.
 - Source patch and Vulkan generator fingerprints match the committed files.
 - Session commands and diagnostic deadlines run in an explicit session control
-  loop; GPU-utilization sampling no longer consumes commands or changes runtime state.
+  loop with a session-owned `RuntimeControl` and explicit nonce/poll state. The
+  controller invokes session-supplied actions; profiling only exposes diagnostic
+  operations. GPU-utilization sampling no longer consumes commands or changes
+  runtime state.
 
 Focused tests on the build server passed under ASan/UBSan: profiling-ring behavior,
 pool release across two device lifetimes, failure-state reset, command consumption,

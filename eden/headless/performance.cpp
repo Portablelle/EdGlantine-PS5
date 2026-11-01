@@ -583,52 +583,31 @@ void GuestCoreLoads(unsigned loads[4]) {
     for (unsigned i = 0; i < 4; ++i) loads[i] = cores[i].shown;
 }
 
-void TickRuntimeControl() {
-    // Diagnostic prototype: bounded aggregate sampling, no PC sampling or GPU waits added.
-    static thread_local long long next_report = 0;
-    static thread_local unsigned reports = 0;
+namespace {
+struct ProfilingState {
+    long long next_report{};
+    unsigned reports{};
+};
+thread_local ProfilingState profiling_state;
+} // namespace
+
+void RestartProfiling() {
+    profiling_state = {};
 #ifdef EDEN_NX2_PS5_PROTO
-    static thread_local long long next_request_check = 0;
-    static thread_local std::string last_request;
-    const auto request_now = MonotonicNs();
-    if (request_now >= next_request_check) {
-        next_request_check = request_now + 1'000'000'000LL;
-        constexpr const char* enable_path = "/data/eden-nx2/split-enable.request";
-        static thread_local std::string last_enable_request;
-        if (auto* enable_file = std::fopen(enable_path, "rb")) {
-            char nonce[64];
-            const auto bytes = std::fread(nonce, 1, sizeof(nonce), enable_file);
-            std::fclose(enable_file);
-            const std::string request(nonce, bytes);
-            if (!request.empty() && request != last_enable_request) {
-                last_enable_request = request;
-                VideoCommon::GpuSplit::Get().RequestEnable();
-                std::fprintf(stderr, "NX2_SPLIT_ENABLE_REQUEST mono_ns=%lld\n", request_now);
-            }
-            std::remove(enable_path);
-        }
-        constexpr const char* path = "/data/eden-nx2/profile-refresh.request";
-        if (auto* file = std::fopen(path, "rb")) {
-            char nonce[64];
-            const auto size = std::fread(nonce, 1, sizeof(nonce), file);
-            std::fclose(file);
-            const std::string request(nonce, size);
-            if (!request.empty() && request != last_request) {
-                last_request = request;
-                reports = 0;
-                next_report = 0;
-                const auto epoch = VideoCommon::NativeWaitProfile::Restart();
-                detailed_until_ns.store(NowNs() + 20'000'000'000LL, std::memory_order_relaxed);
-                dev_marks.store(true, std::memory_order_relaxed);
-                Vulkan::NativeGpuProfile::epoch.fetch_add(1, std::memory_order_relaxed);
-                Vulkan::NativeGpuProfile::enabled.store(true, std::memory_order_relaxed);
-                std::fprintf(stderr, "NX2_PROFILE_REFRESH epoch=%llu mono_ns=%lld\n",
-                             static_cast<unsigned long long>(epoch), request_now);
-            }
-            std::remove(path);
-        }
-    }
+    const auto epoch = VideoCommon::NativeWaitProfile::Restart();
+    std::fprintf(stderr, "NX2_PROFILE_REFRESH epoch=%llu mono_ns=%lld\n",
+                 static_cast<unsigned long long>(epoch), NowNs());
 #endif
+    detailed_until_ns.store(NowNs() + 20'000'000'000LL, std::memory_order_relaxed);
+    dev_marks.store(true, std::memory_order_relaxed);
+    Vulkan::NativeGpuProfile::epoch.fetch_add(1, std::memory_order_relaxed);
+    Vulkan::NativeGpuProfile::enabled.store(true, std::memory_order_relaxed);
+}
+
+void TickProfiling() {
+    // Diagnostic prototype: bounded aggregate sampling, no PC sampling or GPU waits added.
+    auto& next_report = profiling_state.next_report;
+    auto& reports = profiling_state.reports;
     const auto detailed_deadline = detailed_until_ns.load(std::memory_order_relaxed);
     if (detailed_deadline && NowNs() >= detailed_deadline) {
         dev_marks.store(false, std::memory_order_relaxed);
