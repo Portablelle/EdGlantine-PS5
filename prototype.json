@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "EdGlantine-PS5",
   "titleId": "PPSA99862",
-  "contentVersion": "00.063.000",
+  "contentVersion": "00.064.000",
   "dataRoot": "/data/eden-nx2",
   "entry": "/data/eden-nx2/game/exefs/main",
   "wrapperCommit": "a26ba788222465ec7fb94dc813958fc749734e07",
@@ -344,11 +344,11 @@
     "hostRegression": "PASS on build-server: pool ownership and both AMD policy/cache modes under ASan/UBSan/LSan",
     "hardwareValidated": false
   },
-  "archive": "Eden-NX2-PS5-prototype-00.063.000.tar.gz",
-  "archiveBytes": 43829604,
-  "archiveSha256": "1f12be1d1fbc6a41ec16deb31b4b8a91986606466bcb5a0d5b2da2ec7bc7e810",
-  "ebootSha256": "9003d5cc3885b3f3164a4368c7cbc5723be5d6744bc5f8bee029d8be59d64657",
-  "buildPatchSha256": "af09f9b9add89cda31808afbb21c9068aa6a4281ddea59d02aa1aa6d2290e041",
+  "archive": "Eden-NX2-PS5-prototype-00.064.000.tar.gz",
+  "archiveBytes": 43837172,
+  "archiveSha256": "8096e50278c0dd46475050105e7f3c8264787586bbec454c8e849dd2a2f85857",
+  "ebootSha256": "f8bcd6bc932f0ee12e245b073542f05b79801ee7f8be715cd7b3c2ed93dea586",
+  "buildPatchSha256": "8e2e13c6495e3638126dbe2d0083bb9326cbec001241030d4f78560c1d71c37d",
   "onDemandProfile": {
     "requestPath": "/data/eden-nx2/profile-refresh.request",
     "request": "Unique nonempty nonce, up to 64 bytes, consumed once; polling once per second while HUD GPU sampling runs.",
@@ -518,5 +518,30 @@
     "package": "PASS",
     "hardwarePerformanceValidated": false,
     "notes": "Includes restored DMA shutdown guard and updated inherited checks."
+  },
+  "baseline063": {
+    "userFps": 21,
+    "gameplayReached": true,
+    "visualObservation": "not specified",
+    "splitArmed": false,
+    "profile": "artifacts/profile-063-solo/measurement.json",
+    "sourceChangesThisTurn": false
+  },
+  "resourcePreparation064": {
+    "base": "00.063.000",
+    "scope": "Per-stage texture table preparation memo (8 slots, base/size), per-PushImageDescriptors resolved sampled descriptors (64 slots, full IDs/type/depth/buffer-source/sampler variant-limit policy). No retention across stages/draws; root metadata re-read; writable storage images untouched.",
+    "coherence": "Existing cache locks hold throughout Configure. No GPU writes between the read-handle operations being coalesced. Root checks and original miss/error loaders preserved. Variant cap bit forces miss at policy transition.",
+    "counters": "NX2_RESOURCE_MEMO kind0 tables / kind1 sampled descriptors requests,hits",
+    "hostValidation": "build-server ASan/UBSan PASS on extracted actual descriptor function reference vs optimized and actual texture-table block with fake backend; null/type/depth/variant cap, writable images, root changes/mapping holes/collisions/exceptions/new call. Not pixel/RADV validation.",
+    "hardwareValidated": false,
+    "hardwareObservation": "User reports unchanged ~21FPS (typed21%, interpreted asFPS), pixelated image, uncertain if new. Profile20.093s: sampled54861363 requests /54383256hits=99.13%; table0requests. PushImages0.723s vs1.044s .063, overall config8.492s vs8.650s; insufficient FPS gain. Frontend frame1920x1080 despite guest/videoout3840x2160; same frontend size in .063."
+  },
+  "outputResolutionFinding": {
+    "frontend": "1920x1080",
+    "guestAndVideoout": "3840x2160",
+    "setting": "default1080p; global/game scale1x",
+    "internalSceneResolution": "not established",
+    "applied": "video.output_resolution=2160p, after confirmed closure; 00.064.000 and internal1x unchanged; next launch validation pending",
+    "validation": "Next launch logs confirm EDEN_VULKAN_FRAME_SIZE3840x2160 and videoout3840x2160. User perceives no clear sharpness improvement; internal scene resolution/visual cause still unknown."
   }
 }

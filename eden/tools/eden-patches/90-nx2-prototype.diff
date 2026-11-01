@@ -51748,6 +51748,63 @@ index 0000000..8ac6d26
 +    if (event == 4 || event == 5) state.file.flush();
 +}
 +} // namespace VideoCommon
+diff --git a/src/video_core/native_resource_memo.h b/src/video_core/native_resource_memo.h
+new file mode 100644
+index 0000000..1d06271
+--- /dev/null
++++ b/src/video_core/native_resource_memo.h
+@@ -0,0 +1,51 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++#include <array>
++#include <atomic>
++#include <cstdint>
++#include <utility>
++
++namespace VideoCommon::NativeResourceMemo {
++struct Statistics { std::atomic<std::uint64_t> requests{}, hits{}; };
++inline std::array<Statistics, 2> statistics;
++inline std::uint64_t Mix(std::uint64_t value) {
++    value ^= value >> 33;
++    value *= 0xff51afd7ed558ccdULL;
++    return value ^ (value >> 33);
++}
++struct TableKey {
++    std::uint64_t base{}, size{};
++    bool operator==(const TableKey&) const = default;
++    std::uint64_t Hash() const { return Mix(base ^ (size * 0x9e3779b97f4a7c15ULL)); }
++};
++struct SampledKey {
++    std::uint32_t view{}, sampler{}, type{}, flags{};
++    bool operator==(const SampledKey&) const = default;
++    std::uint64_t Hash() const { return Mix((std::uint64_t{sampler} << 32) | view) ^ Mix((std::uint64_t{flags} << 32) | type); }
++};
++// Caller owns this table for one resource-preparation stage only. Full-key checks;
++// failed loaders do not populate the table, and a collision uses the original loader.
++template<class Key, class Value, unsigned Kind, unsigned Slots>
++class Table {
++    static_assert(Kind < 2 && Slots && (Slots & (Slots - 1)) == 0);
++    struct Entry { Key key{}; Value value{}; bool valid{}; };
++    std::array<Entry, Slots> entries{};
++    std::uint64_t requests{}, hits{};
++public:
++    Table() = default;
++    Table(const Table&) = delete;
++    ~Table() {
++        if (!requests) return;
++        statistics[Kind].requests.fetch_add(requests, std::memory_order_relaxed);
++        statistics[Kind].hits.fetch_add(hits, std::memory_order_relaxed);
++    }
++    template<class Loader> Value Get(const Key& key, Loader&& loader) {
++        ++requests;
++        auto& entry = entries[key.Hash() & (Slots - 1)];
++        if (entry.valid && entry.key == key) { ++hits; return entry.value; }
++        Value value = std::forward<Loader>(loader)();
++        entry = {key, value, true};
++        return value;
++    }
++};
++}
 diff --git a/src/video_core/native_root_table.h b/src/video_core/native_root_table.h
 new file mode 100644
 index 0000000..89cb4ae
@@ -52910,10 +52967,10 @@ index 0ced890..9dac98c 100644
  
      if (maxwell3d.dirty.flags[Dirty::VertexInput]) {
 diff --git a/src/video_core/renderer_vulkan/pipeline_helper.h b/src/video_core/renderer_vulkan/pipeline_helper.h
-index 07de25f..b3874dd 100644
+index 07de25f..7867354 100644
 --- a/src/video_core/renderer_vulkan/pipeline_helper.h
 +++ b/src/video_core/renderer_vulkan/pipeline_helper.h
-@@ -14,6 +14,7 @@
+@@ -14,10 +14,14 @@
  #include "common/common_types.h"
  #include "shader_recompiler/backend/spirv/emit_spirv.h"
  #include "shader_recompiler/shader_info.h"
@@ -52921,7 +52978,21 @@ index 07de25f..b3874dd 100644
  #include "video_core/renderer_vulkan/vk_texture_cache.h"
  #include "video_core/renderer_vulkan/vk_update_descriptor.h"
  #include "video_core/surface.h"
-@@ -362,10 +363,18 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
+ #include "video_core/texture_cache/types.h"
++#ifdef EDEN_NX2_PS5_PROTO
++#include "video_core/native_resource_memo.h"
++#endif
+ #include "video_core/vulkan_common/vulkan_device.h"
+ 
+ namespace Vulkan {
+@@ -359,21 +363,49 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
+     const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
+     views += num_texture_buffers;
+     views += num_image_buffers;
++#ifdef EDEN_NX2_PS5_PROTO
++    struct ResolvedSampled { VkImageView view{}; VkSampler sampler{}; bool rescaled{}; };
++    VideoCommon::NativeResourceMemo::Table<VideoCommon::NativeResourceMemo::SampledKey, ResolvedSampled, 1, 64> sampled_descriptors;
++#endif
      for (const auto& desc : info.texture_descriptors) {
          bool is_rescaled{};
          for (u32 index = 0; index < desc.count; ++index) {
@@ -52929,6 +53000,14 @@ index 07de25f..b3874dd 100644
 +            const auto& guest_view = *views++;
 +            const VideoCommon::ImageViewId image_view_id{guest_view.id};
              const VideoCommon::SamplerId sampler_id{*(samplers++)};
++#ifdef EDEN_NX2_PS5_PROTO
++            Sampler& descriptor_sampler{texture_cache.GetSampler(sampler_id)};
++            const VideoCommon::NativeResourceMemo::SampledKey descriptor_key{
++                image_view_id.index, sampler_id.index, static_cast<u32>(desc.type),
++                u32(desc.is_depth) | (u32(desc.buffer_source.enabled) << 1) |
++                    (u32(descriptor_sampler.VariantLimitReached()) << 2)};
++            const auto resolved = sampled_descriptors.Get(descriptor_key, [&] {
++#endif
              ImageView& image_view{texture_cache.GetImageView(image_view_id)};
              VkImageView vk_image_view{image_view.Handle(desc.type)};
 +            if (desc.buffer_source.enabled && image_view_id != VideoCommon::NULL_IMAGE_VIEW_ID &&
@@ -52941,6 +53020,22 @@ index 07de25f..b3874dd 100644
              if (vk_image_view == VK_NULL_HANDLE) {
                  const VkImageView null_image_view{texture_cache.GetImageView(VideoCommon::NULL_IMAGE_VIEW_ID).Handle(desc.type)};
                  if (null_image_view != VK_NULL_HANDLE) vk_image_view = null_image_view;
+             }
++#ifdef EDEN_NX2_PS5_PROTO
++            return ResolvedSampled{vk_image_view, descriptor_sampler.HandleFor(image_view, desc.is_depth),
++                                   texture_cache.IsRescaling(image_view)};
++            });
++            guest_descriptor_queue.AddSampledImage(resolved.view, resolved.sampler);
++            const bool element_rescaled{resolved.rescaled};
++#else
+             Sampler& sampler{texture_cache.GetSampler(sampler_id)};
+             guest_descriptor_queue.AddSampledImage(vk_image_view,
+                                                    sampler.HandleFor(image_view, desc.is_depth));
+             const bool element_rescaled{texture_cache.IsRescaling(image_view)};
++#endif
+             is_rescaled |= element_rescaled;
+         }
+         rescaling.PushTexture(is_rescaled);
 diff --git a/src/video_core/renderer_vulkan/present/layer.cpp b/src/video_core/renderer_vulkan/present/layer.cpp
 index 9f4aaf3..b68c3cb 100644
 --- a/src/video_core/renderer_vulkan/present/layer.cpp
@@ -53664,11 +53759,14 @@ index 29356cf..332a0d5 100644
      for (const auto& desc : info.storage_buffers_descriptors) {
          ASSERT(desc.count == 1);
 diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
-index 8b5b0bc..5de5414 100644
+index 8b5b0bc..08ca660 100644
 --- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
 +++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
-@@ -1,21 +1,28 @@
+@@ -1,21 +1,31 @@
 +#include "video_core/native_draw_memo.h"
++#ifdef EDEN_NX2_PS5_PROTO
++#include "video_core/native_resource_memo.h"
++#endif
  // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
  // SPDX-License-Identifier: GPL-3.0-or-later
  
@@ -53696,7 +53794,7 @@ index 8b5b0bc..5de5414 100644
  #include "video_core/renderer_vulkan/maxwell_to_vk.h"
  #include "video_core/renderer_vulkan/pipeline_statistics.h"
  #include "video_core/renderer_vulkan/vk_buffer_cache.h"
-@@ -25,12 +32,16 @@
+@@ -25,12 +35,16 @@
  #include "video_core/renderer_vulkan/vk_texture_cache.h"
  #include "video_core/renderer_vulkan/vk_update_descriptor.h"
  #include "video_core/shader_notify.h"
@@ -53714,7 +53812,7 @@ index 8b5b0bc..5de5414 100644
  #define LAMBDA_FORCEINLINE [[msvc::forceinline]]
  #else
  #define LAMBDA_FORCEINLINE
-@@ -350,15 +361,65 @@ void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
+@@ -350,15 +364,65 @@ void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
  
  template <typename Spec>
  bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
@@ -53783,13 +53881,16 @@ index 8b5b0bc..5de5414 100644
      const auto& regs{maxwell3d->regs};
      const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
      const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
-@@ -374,8 +435,49 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+@@ -374,8 +438,62 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
              }
          }
          const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
 +        // Per descriptor/draw snapshot, never retained across draws. The table root,
 +        // mapping and download are invariant while walking one descriptor array.
 +        GPUVAddr buffer_texture_base{};
++#ifdef EDEN_NX2_PS5_PROTO
++        VideoCommon::NativeResourceMemo::Table<VideoCommon::NativeResourceMemo::TableKey, bool, 0, 8> prepared_texture_tables;
++#endif
          const auto read_handle{[&](const auto& desc, u32 index) {
              ASSERT(cbufs[desc.cbuf_index].enabled);
 +            if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&>) {
@@ -53799,19 +53900,29 @@ index 8b5b0bc..5de5414 100644
 +                        const GPUVAddr root = cbufs[desc.cbuf_index].address + desc.cbuf_offset;
 +                        const GPUVAddr base = gpu_memory->Read<u64>(root);
 +                        if (gpu_memory->Read<u64>(root + 8) != source.size || !base ||
-+                            base + source.size < base || !gpu_memory->IsFullyMappedRange(base, source.size))
++                            base + source.size < base)
 +                            throw Shader::RuntimeError("Buffer-backed texture array changed or is unmapped");
 +                        buffer_texture_base = base;
-+                        GPUVAddr expected = base;
-+                        for (const auto& [range_address, range_size] : gpu_memory->GetSubmappedRange(base, source.size)) {
-+                            const auto device_address = gpu_memory->GpuToCpuAddress(range_address);
-+                            if (range_address != expected || !range_size || !device_address)
-+                                throw Shader::RuntimeError("Unmapped texture-handle buffer segment");
-+                            buffer_cache.DownloadMemory(*device_address, range_size);
-+                            expected += range_size;
-+                        }
-+                        if (expected != base + source.size)
-+                            throw Shader::RuntimeError("Incomplete texture-handle buffer mapping");
++                        const auto prepare_table = [&] {
++                            if (!gpu_memory->IsFullyMappedRange(base, source.size))
++                                throw Shader::RuntimeError("Buffer-backed texture array changed or is unmapped");
++                            GPUVAddr expected = base;
++                            for (const auto& [range_address, range_size] : gpu_memory->GetSubmappedRange(base, source.size)) {
++                                const auto device_address = gpu_memory->GpuToCpuAddress(range_address);
++                                if (range_address != expected || !range_size || !device_address)
++                                    throw Shader::RuntimeError("Unmapped texture-handle buffer segment");
++                                buffer_cache.DownloadMemory(*device_address, range_size);
++                                expected += range_size;
++                            }
++                            if (expected != base + source.size)
++                                throw Shader::RuntimeError("Incomplete texture-handle buffer mapping");
++                            return true;
++                        };
++#ifdef EDEN_NX2_PS5_PROTO
++                        prepared_texture_tables.Get({base, source.size}, prepare_table);
++#else
++                        prepare_table();
++#endif
 +                        if (std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS")) {
 +                            std::vector<u8> bytes(source.size);
 +                            gpu_memory->ReadBlock(base, bytes.data(), bytes.size());
@@ -53833,7 +53944,7 @@ index 8b5b0bc..5de5414 100644
              const u32 index_offset{index << desc.size_shift};
              const u32 offset{desc.cbuf_offset + index_offset};
              const GPUVAddr addr{cbufs[desc.cbuf_index].address + offset};
-@@ -418,9 +520,25 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+@@ -418,9 +536,25 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
          for (const auto& desc : info.texture_descriptors) {
              for (u32 index = 0; index < desc.count; ++index) {
                  const auto handle{read_handle(desc, index)};
@@ -53860,7 +53971,7 @@ index 8b5b0bc..5de5414 100644
                  samplers.push_back(sampler);
              }
          }
-@@ -432,24 +550,216 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+@@ -432,24 +566,216 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
  
          return true;
      }};
@@ -54091,7 +54202,7 @@ index 8b5b0bc..5de5414 100644
  
      VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
      const auto bind_stage_info{[&](size_t stage) LAMBDA_FORCEINLINE {
-@@ -493,30 +803,39 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+@@ -493,30 +819,39 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
              texture_buffer_it += Shader::NumDescriptors(info.image_descriptors);
          }
      }};
@@ -54148,7 +54259,7 @@ index 8b5b0bc..5de5414 100644
  
      RescalingPushConstant rescaling;
      RenderAreaPushConstant render_area;
-@@ -524,13 +843,81 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+@@ -524,13 +859,81 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
      const VideoCommon::ImageViewInOut* views_it{views.data()};
      const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
          buffer_cache.BindHostStageBuffers(stage);
@@ -54234,7 +54345,7 @@ index 8b5b0bc..5de5414 100644
          }
      }};
      if constexpr (Spec::enabled_stages[0]) {
-@@ -552,12 +939,16 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+@@ -552,12 +955,16 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
          buffer_cache.runtime.PostCopyBarrier();
          buffer_cache.any_buffer_uploaded = false;
      }
@@ -56832,7 +56943,7 @@ index bc2e82a..3decc26 100644
      if (!image.ExchangeInitialization()) {
          VkImageMemoryBarrier barrier{
 diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
-index 2e9736f..dc3a303 100644
+index 2e9736f..5154abd 100644
 --- a/src/video_core/renderer_vulkan/vk_texture_cache.h
 +++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
 @@ -6,6 +6,7 @@
@@ -56912,6 +57023,16 @@ index 2e9736f..dc3a303 100644
      VkImageAspectFlags aspect_mask = 0;
      bool initialized = false;
  
+@@ -531,6 +564,9 @@ public:
+     }
+ 
+     [[nodiscard]] VkSampler HandleFor(const ImageView& image_view, bool is_depth);
++#ifdef EDEN_NX2_PS5_PROTO
++    [[nodiscard]] bool VariantLimitReached() const noexcept { return variants.size() >= MAX_VARIANTS; }
++#endif
+ 
+ private:
+     struct VariantKey {
 diff --git a/src/video_core/shader_cache.cpp b/src/video_core/shader_cache.cpp
 index f1aff28..3aff04d 100644
 --- a/src/video_core/shader_cache.cpp

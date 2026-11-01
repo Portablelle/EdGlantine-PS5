@@ -4,6 +4,7 @@
 #include "native_cpu_profile.h"
 #include "video_core/gpu_split.h"
 #include "video_core/native_draw_memo.h"
+#include "video_core/native_resource_memo.h"
 #include "cpu_policy.h"
 #include "crash_report.h"
 #include "stall_watchdog.h"
@@ -666,6 +667,12 @@ unsigned GpuBusyPercent() {
             for (unsigned i = 0; i < VideoCommon::NativeDrawMemo::statistics.size(); ++i) {
                 const auto& stat = VideoCommon::NativeDrawMemo::statistics[i];
                 std::fprintf(stderr, "NX2_DRAW_MEMO mono_ns=%lld kind=%u requests=%llu hits=%llu\n", now, i,
+                             static_cast<unsigned long long>(stat.requests.load()),
+                             static_cast<unsigned long long>(stat.hits.load()));
+            }
+            for (unsigned i = 0; i < VideoCommon::NativeResourceMemo::statistics.size(); ++i) {
+                const auto& stat = VideoCommon::NativeResourceMemo::statistics[i];
+                std::fprintf(stderr, "NX2_RESOURCE_MEMO mono_ns=%lld kind=%u requests=%llu hits=%llu\n", now, i,
                              static_cast<unsigned long long>(stat.requests.load()),
                              static_cast<unsigned long long>(stat.hits.load()));
             }
