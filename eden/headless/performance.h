@@ -36,6 +36,8 @@ void SampleGpuFrame(unsigned frame);
 // those as "--".
 unsigned HostCpuPercent();
 unsigned GpuBusyPercent();
+// Called by the session control loop, independent of HUD/telemetry sampling.
+void TickRuntimeControl();
 // The GPU's own time, by timestamps the Vulkan scheduler writes at the start and the end of
 // each command buffer while the overlay asks for them (tools/prepare-vulkan-port.py): the
 // nanoseconds the GPU has spent between them, how many command buffers that is, and whether

@@ -58,7 +58,7 @@
     "RET R0/R55 regression tests adapted to existing strict return linkage validation"
   ],
   "hostSuiteValidated": false,
-  "nx2PatchSha256": "343cf7a73ce0038b7fb652657a9609e4cca00e3c37d038ec0f7709b3e3de38bb",
+  "nx2PatchSha256": "8e2e13c6495e3638126dbe2d0083bb9326cbec001241030d4f78560c1d71c37d",
   "rejectedAdaptations": [
     "QMD history eviction: replays completed descriptors on action 2; regression caught by native_semaphore test"
   ],
@@ -102,7 +102,7 @@
     "installedSourceVersion": "00.042.000",
     "launchOutcome": "Snapshots now remain pending across ordinary render-pass changes; same-scene FPS/rendering and batch/cancellation counters pending."
   },
-  "vulkanPortGeneratorSha256": "243f12d5cf46f82486d267dc335cec94b592b910cf5f3437f3b99cfefd4d7f4a",
+  "vulkanPortGeneratorSha256": "0a3f852a0c3a2a458c68a66b856f9ee2c0c8700ee49a369631334d5a1fd485c0",
   "eglantineAstcCommit": "97ce27ab35153884d2fd05c278433928e429cd91",
   "gather": {
     "hostCases": 3,
@@ -351,7 +351,7 @@
   "buildPatchSha256": "8e2e13c6495e3638126dbe2d0083bb9326cbec001241030d4f78560c1d71c37d",
   "onDemandProfile": {
     "requestPath": "/data/eden-nx2/profile-refresh.request",
-    "request": "Unique nonempty nonce, up to 64 bytes, consumed once; polling once per second while HUD GPU sampling runs.",
+    "request": "Unique nonempty nonce, up to 64 bytes, consumed once; checked once per second by the session control loop, independently of HUD sampling.",
     "windowSeconds": 180,
     "cacheCounters": "Cumulative hits/misses/fills/bytes/evictions/invalidations/clears; use deltas.",
     "detailedWindowSeconds": 20,
@@ -543,5 +543,14 @@
     "internalSceneResolution": "not established",
     "applied": "video.output_resolution=2160p, after confirmed closure; 00.064.000 and internal1x unchanged; next launch validation pending",
     "validation": "Next launch logs confirm EDEN_VULKAN_FRAME_SIZE3840x2160 and videoout3840x2160. User perceives no clear sharpness improvement; internal scene resolution/visual cause still unknown."
+  },
+  "publicationReviewFixes": {
+    "status": "Source fixes after the tested .064 package; not installed on PS5.",
+    "changes": [
+      "Create remote build root before rsync.",
+      "Retire both Vulkan profiling pools after worker join and device idle.",
+      "Run runtime commands and profiling deadlines in a dedicated session loop.",
+      "Refresh source fingerprints."
+    ]
   }
 }

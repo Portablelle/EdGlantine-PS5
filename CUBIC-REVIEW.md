@@ -1,3 +1,29 @@
+# Publication review — November 1, 2026
+
+The complete publication diff was reviewed against the previous GitHub main tree,
+using a temporary review commit with the exact publication tree. This review-only
+commit is not part of the anonymized history being published.
+
+Four findings were addressed:
+
+- Both Vulkan profiling query pools are reset after the scheduler worker joins and
+  the device becomes idle, before the device is destroyed.
+- Remote build and packaging scripts create the destination directory before rsync.
+- Source patch and Vulkan generator fingerprints match the committed files.
+- Session commands and diagnostic deadlines run in an explicit session control
+  loop; GPU-utilization sampling no longer consumes commands or changes runtime state.
+
+Focused tests on the build server passed under ASan/UBSan: profiling-ring behavior,
+pool release across two device lifetimes, failure-state reset, command consumption,
+deadline expiry without HUD sampling, and fresh control state in a new session.
+Tests: `eden/tests-nx2/native-gpu-profile-lifetime.cpp` and
+`eden/tests-nx2/check-runtime-control.py`.
+
+These source fixes postdate the PS5-tested .064 package and have not been installed
+on the console. The 21 FPS result applies to that previously installed package.
+
+---
+
 # Initial snapshot review
 
 `cubic review --commit HEAD --json` reviewed the initial source snapshot locally.

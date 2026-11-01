@@ -19,6 +19,11 @@ bool Same(const Label& a,const Label& b) {
  return a.kind==b.kind && a.first==b.first && a.second==b.second && a.width==b.width && a.height==b.height;
 }
 }
+// Called only after the scheduler worker has joined and the device is idle.
+void Reset() {
+ enabled.store(false, std::memory_order_relaxed);
+ probe = {};
+}
 void Collect(const Device& device) {
  if (!probe.pool || probe.failed) return;
  while(probe.first<probe.next) {

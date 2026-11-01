@@ -19,6 +19,10 @@ would make a real difference. See [Contributing](#contributing) below.
   8.492 seconds of CPU draw configuration and 54,383,256 sampled-descriptor cache
   hits out of 54,861,363 requests. Texture-table counters remained at zero.
   The user confirmed 21 FPS; full rendering validation is not recorded.
+- **Source fixes since the tested .064 package:** publication review identified
+  Vulkan profiling-pool lifetime, remote build-directory creation and runtime
+  control tied to HUD sampling issues. The source fixes these and refreshes its
+  provenance hashes. These changes are not part of the PS5-tested .064 binary.
 - **Latest gameplay result: .064 at 21 FPS**, matching the reported .063 frame
   rate, with GPU splitting disabled. No FPS improvement is observed in this user
   feedback. These results are not a compatibility benchmark or a guarantee for

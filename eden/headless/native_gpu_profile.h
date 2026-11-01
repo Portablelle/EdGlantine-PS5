@@ -13,6 +13,7 @@ struct Ticket { int query{-1}; };
 void BeginBuffer(const Device&, vk::CommandBuffer);
 void EndBuffer();
 void Collect(const Device&);
+void Reset();
 void Begin(vk::CommandBuffer, Ticket&, Label);
 void End(vk::CommandBuffer, const Ticket&);
 }

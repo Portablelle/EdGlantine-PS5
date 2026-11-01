@@ -2,6 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 source ./remote-build-config.sh
+ssh "$EDGLANTINE_BUILD_HOST" mkdir -p -- "$EDGLANTINE_REMOTE_ROOT/eden"
 rsync -az --exclude=.git eden/ "$EDGLANTINE_BUILD_HOST:$EDGLANTINE_REMOTE_ROOT/eden/"
 ssh "$EDGLANTINE_BUILD_HOST" bash -s -- "$EDGLANTINE_REMOTE_ROOT" <<'REMOTE'
 set -euo pipefail

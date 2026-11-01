@@ -583,18 +583,18 @@ void GuestCoreLoads(unsigned loads[4]) {
     for (unsigned i = 0; i < 4; ++i) loads[i] = cores[i].shown;
 }
 
-unsigned GpuBusyPercent() {
+void TickRuntimeControl() {
     // Diagnostic prototype: bounded aggregate sampling, no PC sampling or GPU waits added.
-    static long long next_report = 0;
-    static unsigned reports = 0;
+    static thread_local long long next_report = 0;
+    static thread_local unsigned reports = 0;
 #ifdef EDEN_NX2_PS5_PROTO
-    static long long next_request_check = 0;
-    static std::string last_request;
+    static thread_local long long next_request_check = 0;
+    static thread_local std::string last_request;
     const auto request_now = MonotonicNs();
     if (request_now >= next_request_check) {
         next_request_check = request_now + 1'000'000'000LL;
         constexpr const char* enable_path = "/data/eden-nx2/split-enable.request";
-        static std::string last_enable_request;
+        static thread_local std::string last_enable_request;
         if (auto* enable_file = std::fopen(enable_path, "rb")) {
             char nonce[64];
             const auto bytes = std::fread(nonce, 1, sizeof(nonce), enable_file);
@@ -715,6 +715,9 @@ unsigned GpuBusyPercent() {
             }
         }
     }
+}
+
+unsigned GpuBusyPercent() {
     // The GPU's own time against the wall clock: the Vulkan scheduler stamps the start and the end
     // of every command buffer on the GPU, and what lies between them is time the GPU spent on the
     // game's pictures. Gaps inside one command buffer count as busy, so the share can read a

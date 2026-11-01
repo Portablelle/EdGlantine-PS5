@@ -4,6 +4,7 @@ cd "$(dirname "$0")"
 source ./remote-build-config.sh
 version=$(python3 -c 'import json; print(json.load(open("eden/sce_sys/param.json"))["contentVersion"])')
 [[ $version =~ ^[0-9]{2}\.[0-9]{3}\.[0-9]{3}$ ]]
+ssh "$EDGLANTINE_BUILD_HOST" mkdir -p -- "$EDGLANTINE_REMOTE_ROOT/eden"
 rsync -az --exclude=.git eden/ "$EDGLANTINE_BUILD_HOST:$EDGLANTINE_REMOTE_ROOT/eden/"
 # Package the binary already built by build-remote.sh; do not prepare or compile again.
 ssh "$EDGLANTINE_BUILD_HOST" bash -s -- "$version" "$EDGLANTINE_REMOTE_ROOT" <<'REMOTE'

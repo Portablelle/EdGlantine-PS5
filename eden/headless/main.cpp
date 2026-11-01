@@ -1794,6 +1794,13 @@ int main(int argc, char** argv) {
 #endif
                 const auto session_start = std::chrono::steady_clock::now();
                 [[maybe_unused]] double session_seconds = 0;  // guest-fault relaunch (PS5 only)
+                // Session commands and diagnostic deadlines must progress even with no HUD.
+                std::jthread runtime_control([&](std::stop_token stop) {
+                    while (!stop.stop_requested()) {
+                        Eden::Performance::TickRuntimeControl();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                });
                 std::jthread input_worker;
                 if (pad) input_worker = std::jthread([&](std::stop_token stop) {
 #ifdef EDEN_DEV_PROFILE
@@ -2040,6 +2047,8 @@ int main(int argc, char** argv) {
                         guest_exited ? "guest_exit_callback" : !completion->guest_fault.empty() ? "guest_fault" :
                         completion->captured ? "game_capture_shutdown" : "game_observation_complete");
                 }
+                runtime_control.request_stop();
+                if (runtime_control.joinable()) runtime_control.join();
                 input_worker.request_stop();
                 if (input_worker.joinable()) input_worker.join();
                 if (pad) {

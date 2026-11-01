@@ -814,6 +814,14 @@ void GpuTimeCollect(const Device& device) {
 adapt('src/video_core/renderer_vulkan/vk_scheduler.cpp', 'vulkan_scheduler.cpp', [
     ('#include <memory>', '#include <memory>\n#include <array>\n#include <atomic>\n#include <chrono>\n#include <cstdio>\n#include "dev_vulkan.h"\n#include "performance.h"\n#include "native_gpu_profile.h"'),
     ('namespace Vulkan {\n', 'namespace Vulkan {\n' + GPU_TIME_HELPERS + (port / 'native_gpu_profile.inc').read_text()),
+    ('Scheduler::~Scheduler() = default;', '''Scheduler::~Scheduler() {
+    // Stop CPU recording before retiring device-owned profiling resources.
+    worker_thread.request_stop();
+    if (worker_thread.joinable()) worker_thread.join();
+    void(device.GetLogical().WaitIdle());
+    NativeGpuProfile::Reset();
+    gpu_time = {};
+}'''),
     ('        .pInheritanceInfo = nullptr,\n    });\n    current_upload_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());',
      '        .pInheritanceInfo = nullptr,\n    });\n    GpuTimeBegin(device, current_cmdbuf);\n    NativeGpuProfile::BeginBuffer(device, current_cmdbuf);\n'
      '    current_upload_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());'),
