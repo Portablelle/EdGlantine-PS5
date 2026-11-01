@@ -37,6 +37,23 @@ check uses production lowering with a small execution model for register semanti
 texture pixels and PS5 rendering are not validated by that model.
 See `eden/tests-nx2/check-texture-scratch.py` and the runtime-control test above.
 
+Additional publication checks addressed:
+
+- Non-PS5 Vulkan builds retain conservative gathered-buffer reads until the PS5
+  source-write invalidation hooks are available on those paths.
+- Failure to open/write the observer log or create its optional thread no longer
+  prevents split backend startup. Partial observer state is cleaned up independently.
+- The temporary .018 MME capture/write-tracing hooks are retired. The interpreter
+  exception for method 0x18f remains an explicit native execution policy, independent
+  of file capture and ordinary JIT/memoization configuration.
+- Deployment metadata now reflects the recorded .064 installation, retained .063
+  rollback and user-confirmed 21 FPS result.
+
+The focused edge-case harness exercises actual split startup with observer open,
+write and thread-creation failures, then backend execution/shutdown/recovery. It
+also tests the production gathered-cache mutation methods with and without the
+PS5 build define: `eden/tests-nx2/check-publication-edge-cases.py`.
+
 These source fixes postdate the PS5-tested .064 package and have not been installed
 on the console. The 21 FPS result applies to that previously installed package.
 

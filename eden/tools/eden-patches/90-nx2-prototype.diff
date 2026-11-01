@@ -47455,10 +47455,10 @@ index 974d214..47f50cd 100644
  
 diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
 new file mode 100644
-index 0000000..3c0527b
+index 0000000..6bddd9d
 --- /dev/null
 +++ b/src/video_core/gpu_split.cpp
-@@ -0,0 +1,729 @@
+@@ -0,0 +1,737 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -47613,9 +47613,17 @@ index 0000000..3c0527b
 +#endif
 +    ring = std::make_unique<u64[]>(RingWords);
 +#ifdef EDEN_NX2_PS5_PROTO
-+    StartObserver();
-+    try { StartBackThread(); }
-+    catch (...) { StopObserver(); throw; }
++    StartBackThread();
++    // Optional observation must never decide whether the renderer can run.
++    try { StartObserver(); }
++    catch (const std::exception& error) {
++        StopObserver();
++        std::fprintf(stderr, "NX2_SPLIT_OBSERVER disabled: %s\n", error.what());
++    }
++    catch (...) {
++        StopObserver();
++        std::fputs("NX2_SPLIT_OBSERVER disabled: initialization failed\n", stderr);
++    }
 +#else
 +    StartBackThread();
 +#endif
@@ -49067,7 +49075,7 @@ index e084837..28b1dcf 100644
  
  uvec4 ReadTexel(uint offset) {
 diff --git a/src/video_core/macro.cpp b/src/video_core/macro.cpp
-index 86f528a..e5f4e65 100644
+index 86f528a..e1f6dd6 100644
 --- a/src/video_core/macro.cpp
 +++ b/src/video_core/macro.cpp
 @@ -4,6 +4,12 @@
@@ -49091,15 +49099,16 @@ index 86f528a..e5f4e65 100644
  #endif
  
  #include "common/assert.h"
-@@ -25,6 +32,7 @@
+@@ -25,13 +32,17 @@
  #include "video_core/engines/maxwell_3d.h"
  #include "video_core/engines/maxwell_3d.h"
  #include "video_core/dirty_flags.h"
 +#include "video_core/memory_manager.h"
  #include "video_core/rasterizer_interface.h"
  #include "video_core/macro.h"
++#include "video_core/native_macro_policy.h"
  
-@@ -32,6 +40,8 @@
+ #include "common/assert.h"
  #include "common/bit_field.h"
  #include "common/logging.h"
  #include "video_core/engines/maxwell_3d.h"
@@ -49108,7 +49117,7 @@ index 86f528a..e5f4e65 100644
  
  namespace Tegra {
  
-@@ -1337,8 +1347,353 @@ static void Dump(u64 hash, std::span<const u32> code, bool decompiled = false) {
+@@ -1337,8 +1348,321 @@ static void Dump(u64 hash, std::span<const u32> code, bool decompiled = false) {
      macro_file.write(reinterpret_cast<const char*>(code.data()), code.size_bytes());
  }
  
@@ -49223,33 +49232,8 @@ index 86f528a..e5f4e65 100644
 +        if (TryNativeIndexedIndirect(system, *this, maxwell3d, method, parameters)) return;
 +#endif
 +        maxwell3d.RefreshParameters();
-+#ifdef EDEN_NX2_PS5_PROTO
-+        // Controlled comparison selected before execution; never replay a failed JIT call.
-+        const bool isolate_interpreter = method == 0x18f;
-+#else
-+        const bool isolate_interpreter = false;
-+#endif
-+        if (isolate_interpreter) {
-+            static std::atomic<u32> captures{};
-+            u32 capture = captures.load(std::memory_order_relaxed);
-+            if (capture < 4 && captures.compare_exchange_strong(capture, capture + 1, std::memory_order_relaxed)) {
-+                const auto folder = Common::FS::GetEdenPath(Common::FS::EdenPath::DumpDir) / "mme-isolation-018";
-+                if (Common::FS::CreateDir(folder.parent_path()) && Common::FS::CreateDir(folder)) {
-+                    const auto stem = folder / fmt::format("mme18f-{}-{}",
-+                        std::chrono::steady_clock::now().time_since_epoch().count(), capture);
-+                    const auto save = [&](const char* suffix, std::span<const u32> words) {
-+                        std::ofstream file(Common::FS::PathToUTF8String(stem) + suffix, std::ios::binary);
-+                        file.write(reinterpret_cast<const char*>(words.data()), words.size_bytes());
-+                        if (!file) LOG_ERROR(HW_GPU, "MME isolation capture write failed: {}{}", Common::FS::PathToUTF8String(stem), suffix);
-+                    };
-+                    save(".code.bin", native_code);
-+                    save(".dram.bin", maxwell3d.GetNativeDataRam());
-+                    save(".params.bin", parameters);
-+                    LOG_INFO(HW_GPU, "MME 0x18f selected interpreter before execution, generation={}, capture={}",
-+                             native_code_generation, Common::FS::PathToUTF8String(stem));
-+                }
-+            }
-+        }
++        const bool force_interpreter =
++            SelectNativeMacroExecution(method) == NativeMacroExecution::Interpreter;
 +        const auto context = reinterpret_cast<std::uintptr_t>(this);
 +        static std::unordered_set<std::uintptr_t> captured_contexts;
 +        static const bool capture = std::getenv("EDEN_NATIVE_FRAME_CAPTURE") != nullptr;
@@ -49295,13 +49279,6 @@ index 86f528a..e5f4e65 100644
 +        // A method write of the macro (also what a remembered call replays).
 +        bool read_memory = false;
 +        const auto emit = [&](u32 address, u32 value) {
-+                if (isolate_interpreter) {
-+                    static u32 traced{};
-+                    if (traced < 128) {
-+                        ++traced;
-+                        LOG_INFO(HW_GPU, "MME 0x18f emit address={:#x}, value={:#x}", address, value);
-+                    }
-+                }
 +                if (address >= 0xe00) return false;
 +                if (address == 0x556) {
 +                    // SET_RENDER_ENABLE_OVERRIDE: 0 use the render-enable condition, 1 always,
@@ -49379,7 +49356,7 @@ index 86f528a..e5f4e65 100644
 +            const char* value = std::getenv("EDEN_NX2_MME_JIT");
 +            return value == nullptr || value[0] != '0';
 +        }();
-+        if (use_jit && !isolate_interpreter && TuringMacroJit::TryPrepare(native_jit, native_code, native_code_generation)) {
++        if (use_jit && !force_interpreter && TuringMacroJit::TryPrepare(native_jit, native_code, native_code_generation)) {
 +            fifo.assign(parameters.begin(), parameters.end());
 +            const auto result = native_jit->Execute(
 +                method, fifo, std::span<u32>{*native_interpreter.active_dram},
@@ -49401,7 +49378,7 @@ index 86f528a..e5f4e65 100644
 +            const char* value = std::getenv("EDEN_NX2_MME_MEMO");
 +            return value == nullptr || value[0] != '0';
 +        }();
-+        const bool use_memo = memo_enabled && !isolate_interpreter;
++        const bool use_memo = memo_enabled && !force_interpreter;
 +        if (use_memo) {
 +            // EDEN_NX2_MME_MEMO_STATS: log the memo's counters every 2^24 calls.
 +            if (static const bool memo_stats = std::getenv("EDEN_NX2_MME_MEMO_STATS") != nullptr;
@@ -54386,7 +54363,7 @@ index be5a114..19dd39b 100644
          // Fast check: already reached the requested tick?
          if (gpu_tick.load(std::memory_order_acquire) >= tick) {
 diff --git a/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp b/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp
-index 4d84390..88c6076 100644
+index 4d84390..1932f8a 100644
 --- a/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp
 +++ b/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp
 @@ -277,6 +277,11 @@ MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& schedu
@@ -54401,7 +54378,23 @@ index 4d84390..88c6076 100644
      if (device.IsBufferDeviceAddressSupported()) {
          VkBuffer address_handle = *entry.sparse_handle;
          if (!entry.sparse_handle) {
-@@ -329,6 +334,20 @@ void MultiRangeBufferCache::DropOwner(Scheduler& scheduler, VkBuffer owner) {
+@@ -302,9 +307,15 @@ MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& schedu
+ }
+ 
+ void MultiRangeBufferCache::MarkGathered(u64 key) {
++#ifdef EDEN_NX2_PS5_PROTO
+     if (auto const it = entries.find(key); it != entries.end()) {
+         it->second.dirty = false;
+     }
++#else
++    // Exact source-write invalidation is currently wired only in the PS5 port.
++    // Keep other Vulkan builds on the conservative gather-every-binding path.
++    (void)key;
++#endif
+ }
+ 
+ void MultiRangeBufferCache::DropOwner(Scheduler& scheduler, VkBuffer owner) {
+@@ -329,6 +340,20 @@ void MultiRangeBufferCache::DropOwner(Scheduler& scheduler, VkBuffer owner) {
      }
  }
  
@@ -61597,3 +61590,25 @@ index 473a5b1..3d9f50d 100644
  }
  extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
      SdlState *state = (SdlState *)appstate;
+diff --git a/src/video_core/native_macro_policy.h b/src/video_core/native_macro_policy.h
+new file mode 100644
+index 0000000..ce31742
+--- /dev/null
++++ b/src/video_core/native_macro_policy.h
+@@ -0,0 +1,16 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++#include "common/common_types.h"
++
++namespace Tegra {
++enum class NativeMacroExecution { Automatic, Interpreter };
++// Select before execution. Never retry an already executed JIT call.
++constexpr NativeMacroExecution SelectNativeMacroExecution(u32 method) {
++#ifdef EDEN_NX2_PS5_PROTO
++    if (method == 0x18f) return NativeMacroExecution::Interpreter;
++#else
++    (void)method;
++#endif
++    return NativeMacroExecution::Automatic;
++}
++} // namespace Tegra

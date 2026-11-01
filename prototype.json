@@ -58,7 +58,7 @@
     "RET R0/R55 regression tests adapted to existing strict return linkage validation"
   ],
   "hostSuiteValidated": false,
-  "nx2PatchSha256": "6c99b1feb901a8dff12d5803e78eab76ea09d518ad7fc08aed5e92dfe160b86b",
+  "nx2PatchSha256": "18c3ad947c8262d4bead69bfa5ce117247cbe5a984f3cf6ee8fd69fb1dd223c1",
   "rejectedAdaptations": [
     "QMD history eviction: replays completed descriptors on action 2; regression caught by native_semaphore test"
   ],
@@ -113,18 +113,17 @@
     "hardwareObservation": "Previous rejection absent in 44.9-second .008 log; visual correctness not validated."
   },
   "videoCodecLimitation": "H264 initialization hardware-confirmed successful on Welcome Tour .009; low frame rate remains, full playback/game compatibility not established.",
-  "deploymentHandoff": "00.063.000 rebuilt on build-server with matching embedded version, packaged and verified; full 00.062.000 rollback retained. No launch, commit or push.",
+  "deploymentHandoff": "00.064.000 installed and tested on PS5; user confirmed 21 FPS. Full 00.063.000 rollback retained. Publication-review source fixes are not installed.",
   "deployment": {
     "date": "2026-11-01",
     "path": "/data/homebrew/PPSA99862",
-    "rollback": "/data/ps5-diag/nx2-rollback-062-20261101-eb9d8c35",
-    "previousInstalledVersion": "00.062.000",
-    "installedSourceVersion": "00.063.000",
+    "rollback": "/data/ps5-diag/nx2-rollback-063-20261101",
+    "previousInstalledVersion": "00.063.000",
+    "installedSourceVersion": "00.064.000",
     "filesVerified": 70,
-    "launched": false,
-    "transaction": "eb9d8c3567e98466bd17bc9d59025140",
-    "journal": "/data/ps5-diag/nx2-install-063-20261101-eb9d8c35/install-journal.json",
-    "launchOutcome": "Not launched; awaiting user FPS/rendering test."
+    "launched": true,
+    "journal": "artifacts/profile-064/install-journal.json",
+    "launchOutcome": "User confirmed gameplay at 21 FPS; full rendering correctness not validated."
   },
   "previousTargetedTests": {
     "cases": 395,
@@ -552,7 +551,11 @@
       "Run runtime commands and profiling deadlines in a dedicated session loop.",
       "Refresh source fingerprints.",
       "Reserve FP16 gather scratch registers program-wide and invalidate cached translations.",
-      "Own profiling report state and enable-flag teardown through a session-scoped object."
+      "Own profiling report state and enable-flag teardown through a session-scoped object.",
+      "Keep gathered-buffer reuse disabled outside PS5 until source invalidation is wired there.",
+      "Allow GPU split startup when optional observer output or thread creation fails.",
+      "Retire temporary MME capture hooks and preserve the interpreter exception in an explicit execution policy.",
+      "Update deployment record from the .064 installation journal and user result."
     ],
     "nativeTranslatorSalt": "0x4f554e4345a00007"
   }
