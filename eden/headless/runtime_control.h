@@ -26,14 +26,17 @@ public:
 
 private:
     static bool Consume(const std::string& path, std::string& last_nonce) {
-        auto* file = std::fopen(path.c_str(), "rb");
+        // Claim the inode before reading: a producer may replace path at any time.
+        const auto claimed = path + ".consuming";
+        if (std::rename(path.c_str(), claimed.c_str()) != 0) return false;
+        auto* file = std::fopen(claimed.c_str(), "rb");
         if (!file) return false;
         char nonce[64];
         const auto size = std::fread(nonce, 1, sizeof(nonce), file);
         const bool failed = std::ferror(file) != 0;
         std::fclose(file);
         if (failed) return false;
-        std::remove(path.c_str());
+        std::remove(claimed.c_str());
         const std::string request(nonce, size);
         if (request.empty() || request == last_nonce) return false;
         last_nonce = request;

@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <string>
 #include <pthread.h>
+#include <sys/stat.h>
 #include "core/core.h"
 #include "video_core/gpu_split.h"
 
@@ -32,6 +33,9 @@ int main(int argc,char**argv) {
         split.Defer([&]{executed=42;});split.Drain();assert(executed==42);
         split.Stop();assert(!split.Active());
     };
+    const std::string fifo=std::string(argv[1])+"/observer.fifo";
+    assert(mkfifo(fifo.c_str(),0600)==0);
+    run(fifo.c_str(),0); // Must not block waiting for a reader.
     run(missing.c_str(),0); // Open failure cannot prevent rendering.
     run("/dev/full",0);   // Initial write failure cannot prevent rendering.
     run(good.c_str(),2);   // Backend starts; optional observer thread creation fails.

@@ -14,6 +14,7 @@ public:
     void Tick();
 private:
     void Stop();
+    long long initial_deadline{};
     long long next_report{};
     unsigned reports{};
 };

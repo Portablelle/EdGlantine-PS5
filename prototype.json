@@ -58,7 +58,7 @@
     "RET R0/R55 regression tests adapted to existing strict return linkage validation"
   ],
   "hostSuiteValidated": false,
-  "nx2PatchSha256": "18c3ad947c8262d4bead69bfa5ce117247cbe5a984f3cf6ee8fd69fb1dd223c1",
+  "nx2PatchSha256": "6d5deb191b7720bba800ade0b5a6731fc694ef611ab463ab8bbf6cf584e56d23",
   "rejectedAdaptations": [
     "QMD history eviction: replays completed descriptors on action 2; regression caught by native_semaphore test"
   ],
@@ -102,7 +102,7 @@
     "installedSourceVersion": "00.042.000",
     "launchOutcome": "Snapshots now remain pending across ordinary render-pass changes; same-scene FPS/rendering and batch/cancellation counters pending."
   },
-  "vulkanPortGeneratorSha256": "0a3f852a0c3a2a458c68a66b856f9ee2c0c8700ee49a369631334d5a1fd485c0",
+  "vulkanPortGeneratorSha256": "fadd61bcfe91b2532a3092d47e9645cf2bbd68e6a21df64723c78b2dea0b5ee9",
   "eglantineAstcCommit": "97ce27ab35153884d2fd05c278433928e429cd91",
   "gather": {
     "hostCases": 3,
@@ -555,7 +555,13 @@
       "Keep gathered-buffer reuse disabled outside PS5 until source invalidation is wired there.",
       "Allow GPU split startup when optional observer output or thread creation fails.",
       "Retire temporary MME capture hooks and preserve the interpreter exception in an explicit execution policy.",
-      "Update deployment record from the .064 installation journal and user result."
+      "Update deployment record from the .064 installation journal and user result.",
+      "Conservatively gather every binding until GPU-write invalidation is ordered after draws.",
+      "Gate native timestamp collection on completed submission ticks, including cross-buffer tickets.",
+      "Atomically claim runtime request files before consuming them.",
+      "Reject nonregular observer destinations using a nonblocking open.",
+      "Keep initial profiling deadlines in the session owner.",
+      "Move SDK draw execution and restoration into the native draw HLE module."
     ],
     "nativeTranslatorSalt": "0x4f554e4345a00007"
   }

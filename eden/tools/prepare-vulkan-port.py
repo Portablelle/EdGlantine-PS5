@@ -823,12 +823,12 @@ adapt('src/video_core/renderer_vulkan/vk_scheduler.cpp', 'vulkan_scheduler.cpp',
     gpu_time = {};
 }'''),
     ('        .pInheritanceInfo = nullptr,\n    });\n    current_upload_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());',
-     '        .pInheritanceInfo = nullptr,\n    });\n    GpuTimeBegin(device, current_cmdbuf);\n    NativeGpuProfile::BeginBuffer(device, current_cmdbuf);\n'
+     '        .pInheritanceInfo = nullptr,\n    });\n    GpuTimeBegin(device, current_cmdbuf);\n    NativeGpuProfile::BeginBuffer(device, current_cmdbuf, *master_semaphore);\n'
      '    current_upload_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());'),
     ('        upload_cmdbuf.End();\n        cmdbuf.End();\n',
-     '        upload_cmdbuf.End();\n        GpuTimeEnd(cmdbuf);\n        NativeGpuProfile::EndBuffer();\n        cmdbuf.End();\n'),
+     '        upload_cmdbuf.End();\n        GpuTimeEnd(cmdbuf);\n        NativeGpuProfile::EndBuffer(signal_value);\n        cmdbuf.End();\n'),
     ('            vk::Check(result);\n            break;\n        }\n    });\n    chunk->MarkSubmit();',
-     '            vk::Check(result);\n            break;\n        }\n        GpuTimeCollect(device);\n        NativeGpuProfile::Collect(device);\n    });\n    chunk->MarkSubmit();'),
+     '            vk::Check(result);\n            break;\n        }\n        GpuTimeCollect(device);\n        NativeGpuProfile::Collect(device, *master_semaphore);\n    });\n    chunk->MarkSubmit();'),
     ('    const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore);\n'
      '    AllocateNewContext();\n    return signal_value;',
      '    const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore);\n'

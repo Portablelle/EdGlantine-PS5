@@ -583,7 +583,7 @@ void GuestCoreLoads(unsigned loads[4]) {
     for (unsigned i = 0; i < 4; ++i) loads[i] = cores[i].shown;
 }
 
-ProfilingSession::ProfilingSession() = default;
+ProfilingSession::ProfilingSession() : initial_deadline{NowNs() + 180'000'000'000LL} {}
 ProfilingSession::~ProfilingSession() { Stop(); }
 void ProfilingSession::Stop() {
     detailed_until_ns.store(0, std::memory_order_relaxed);
@@ -612,6 +612,11 @@ void ProfilingSession::Restart() {
 
 void ProfilingSession::Tick() {
     // Diagnostic prototype: bounded aggregate sampling, no PC sampling or GPU waits added.
+    if (initial_deadline && NowNs() >= initial_deadline) {
+        initial_deadline = 0;
+        if (!detailed_until_ns.load(std::memory_order_relaxed))
+            dev_marks.store(false, std::memory_order_relaxed);
+    }
     const auto detailed_deadline = detailed_until_ns.load(std::memory_order_relaxed);
     if (detailed_deadline && NowNs() >= detailed_deadline) {
         dev_marks.store(false, std::memory_order_relaxed);

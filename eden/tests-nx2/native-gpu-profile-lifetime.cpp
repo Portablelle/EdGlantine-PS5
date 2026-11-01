@@ -41,28 +41,34 @@ struct Dispatch {PFN_vkCmdWriteTimestamp vkGetDeviceProcAddr(int,const char*)con
 struct Properties {struct {double timestampPeriod=1;}limits;};
 struct Physical {Properties GetProperties()const{return {};}};
 class Device {public:Logical logical;const Logical& GetLogical()const{return logical;}Dispatch GetDispatchLoader()const{return {};}Physical GetPhysical()const{return {};}};
+class MasterSemaphore {public:u64 done=0;bool IsFree(u64 tick)const{return tick<=done;}};
 #include "native_gpu_profile.inc"
 }
-int main(){using namespace Vulkan;using namespace NativeGpuProfile;Device d;vk::CommandBuffer c;
- BeginBuffer(d,c);assert(probe.next==0);EndBuffer();
- enabled=true;BeginBuffer(d,c);Ticket t;Begin(c,t,{1,1,2,640,480,64});EndBuffer();
+int main(){using namespace Vulkan;using namespace NativeGpuProfile;Device d;vk::CommandBuffer c;MasterSemaphore sem;u64 tick=0;
+ BeginBuffer(d,c,sem);assert(probe.next==0);EndBuffer(++tick);
+ enabled=true;BeginBuffer(d,c,sem);Ticket t;Begin(c,t,{1,1,2,640,480,64});EndBuffer(++tick);
  // An operation can span two natural submissions. The unfinished ticket must pin its slot.
- Collect(d);assert(probe.first==0&&d.logical.reads==0);
- BeginBuffer(d,c);End(c,t);EndBuffer();d.logical.ready=false;Collect(d);assert(probe.first==0);
- d.logical.ready=true;Collect(d);assert(probe.first==2&&probe.totals[0].count==1&&probe.totals[0].ns==100);
+ Collect(d,sem);assert(probe.first==0&&d.logical.reads==0);
+ BeginBuffer(d,c,sem);End(c,t);EndBuffer(++tick);d.logical.ready=false;Collect(d,sem);assert(probe.first==0);
+ d.logical.ready=true;sem.done=tick;Collect(d,sem);assert(probe.first==2&&probe.totals[0].count==1&&probe.totals[0].ns==100);
+ // Host availability from a previous use is insufficient without submission completion.
+ BeginBuffer(d,c,sem);Ticket stale;Begin(c,stale,{1,1,2,640,480,64});End(c,stale);EndBuffer(++tick);
+ const auto reads=d.logical.reads;const auto first=probe.first;
+ Collect(d,sem);assert(probe.first==first && d.logical.reads==reads);
+ sem.done=tick;Collect(d,sem);assert(probe.first==probe.next);
  // A full ring must drop measurement rather than reuse live GPU queries or wait.
  d.logical.ready=false;
- for(unsigned i=0;i<Buffers;++i){BeginBuffer(d,c);Ticket q;Begin(c,q,{1,1,2,640,480,64});End(c,q);EndBuffer();}
- auto next=probe.next;BeginBuffer(d,c);assert(probe.current==-1&&probe.next==next&&probe.dropped==1);EndBuffer();
- d.logical.ready=true;Collect(d);assert(probe.first==probe.next);
- enabled=false;BeginBuffer(d,c);assert(probe.current==-1);
+ for(unsigned i=0;i<Buffers;++i){BeginBuffer(d,c,sem);Ticket q;Begin(c,q,{1,1,2,640,480,64});End(c,q);EndBuffer(++tick);}
+ auto next=probe.next;BeginBuffer(d,c,sem);assert(probe.current==-1&&probe.next==next&&probe.dropped==1);EndBuffer(++tick);
+ d.logical.ready=true;sem.done=tick;Collect(d,sem);assert(probe.first==probe.next);
+ enabled=false;BeginBuffer(d,c,sem);assert(probe.current==-1);
  probe.failed=true; // Failed sessions must also recover on the next device.
  Reset();assert(!enabled && !probe.pool && !probe.failed && !probe.write);
  assert(probe.next==0 && probe.first==0 && probe.current==-1 && destroyed[1]==1);
  alive[1]=false;
  Device second;second.logical.id=2;
- enabled=true;BeginBuffer(second,c);Ticket fresh;Begin(c,fresh,{1,1,2,640,480,64});
- End(c,fresh);EndBuffer();Collect(second);
+ enabled=true;BeginBuffer(second,c,sem);Ticket fresh;Begin(c,fresh,{1,1,2,640,480,64});
+ End(c,fresh);EndBuffer(++tick);sem.done=tick;Collect(second,sem);
  assert(*probe.pool==2 && probe.totals[0].count==1);
  Reset();assert(destroyed[2]==1);alive[2]=false;
  Reset();assert(destroyed[1]==1 && destroyed[2]==1);

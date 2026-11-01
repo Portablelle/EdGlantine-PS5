@@ -76,6 +76,17 @@ int main(int argc,char**argv){
  assert(enables==2 && dev_marks);
  }
  assert(!dev_marks && !Vulkan::NativeGpuProfile::enabled && detailed_until_ns==0);
+ {
+ dev_marks=true;Eden::Performance::ProfilingSession profiling;
+ clock_ns+=179'000'000'000LL;profiling.Tick();assert(dev_marks);
+ clock_ns+=1'000'000'000LL;profiling.Tick();assert(!dev_marks);
+ }
+ // Replacement after claim remains available for the next poll.
+ request("split-enable.request","old");
+ std::filesystem::rename(root/"split-enable.request",root/"split-enable.request.consuming");
+ request("split-enable.request","new");
+ std::filesystem::remove(root/"split-enable.request.consuming");
+ assert(std::filesystem::exists(root/"split-enable.request"));
  std::puts("RUNTIME_CONTROL_OK: no HUD, consume once, expiry, early teardown, fresh session");
 }
 '''

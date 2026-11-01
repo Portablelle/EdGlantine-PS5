@@ -52,11 +52,10 @@ int main(){
  cache.InvalidateSource(7,0,4);
 #endif
  assert(bind()==29);assert(bind()==29);
-#ifdef EDEN_NX2_PS5_PROTO
- assert(copies==2);
-#else
  assert(copies==3);
-#endif
+ // A pending output is invalidated before binding, then written by the draw.
+ cache.InvalidateSource(7,0,4);assert(bind()==29);
+ source=41;assert(bind()==41);
  std::puts("GATHER_REUSE_OK: source mutation stays coherent, platform policy respected");
 }
 '''

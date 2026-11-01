@@ -2,8 +2,8 @@
 namespace NativeGpuProfile {
 namespace {
 constexpr unsigned Buffers = 64, Regions = 16;
-struct Sample { Label label; bool ended{}; };
-struct Buffer { std::array<Sample, Regions> samples{}; unsigned used{}, read{}; bool submitted{}; std::uint64_t epoch{}; };
+struct Sample { Label label; bool ended{}; std::uint64_t tick{}; };
+struct Buffer { std::array<Sample, Regions> samples{}; unsigned used{}, read{}; bool submitted{}; std::uint64_t epoch{}, tick{}; };
 struct Total { Label label; std::uint64_t count{}, ns{}, maximum{}; };
 struct Probe {
  vk::QueryPool pool;
@@ -24,14 +24,14 @@ void Reset() {
  enabled.store(false, std::memory_order_relaxed);
  probe = {};
 }
-void Collect(const Device& device) {
+void Collect(const Device& device, const MasterSemaphore& semaphore) {
  if (!probe.pool || probe.failed) return;
  while(probe.first<probe.next) {
   auto& buffer=probe.buffers[probe.first%Buffers];
-  if(!buffer.submitted) break;
+  if(!buffer.submitted || !semaphore.IsFree(buffer.tick)) break;
   while(buffer.read<buffer.used) {
    const auto& sample=buffer.samples[buffer.read];
-   if(!sample.ended) goto report;
+   if(!sample.ended || !sample.tick || !semaphore.IsFree(sample.tick)) goto report;
    std::array<u64,2> stamps{};
    const unsigned query=(probe.first%Buffers)*Regions*2+buffer.read*2;
    const auto result=device.GetLogical().GetQueryResults(*probe.pool,query,2,sizeof(stamps),stamps.data(),sizeof(u64),VK_QUERY_RESULT_64_BIT);
@@ -61,9 +61,9 @@ report:
    t.label.width,t.label.height,t.label.stride,static_cast<unsigned long long>(t.count),static_cast<unsigned long long>(t.ns),static_cast<unsigned long long>(t.maximum),static_cast<unsigned long long>(probe.dropped));
  }
 }
-void BeginBuffer(const Device& device,vk::CommandBuffer command) {
+void BeginBuffer(const Device& device,vk::CommandBuffer command, const MasterSemaphore& semaphore) {
  probe.current=-1;
- Collect(device);
+ Collect(device, semaphore);
  if(!enabled.load(std::memory_order_relaxed)||probe.failed)return;
  const auto requested=epoch.load(std::memory_order_relaxed);
  if(probe.epoch!=requested) {probe.epoch=requested;probe.totals={};probe.dropped=0;probe.report=std::chrono::steady_clock::now();}
@@ -81,8 +81,16 @@ void BeginBuffer(const Device& device,vk::CommandBuffer command) {
   probe.current=static_cast<int>(slot);
  } catch(const std::exception& error) {probe.failed=true;std::fprintf(stderr,"NX2_GPU_SAMPLE disabled: %s\n",error.what());}
 }
-void EndBuffer() {
- if(probe.current>=0)probe.buffers[probe.current].submitted=true;
+void EndBuffer(std::uint64_t submission_tick) {
+ if(probe.current>=0) {
+  auto& buffer=probe.buffers[probe.current];
+  buffer.submitted=true; buffer.tick=submission_tick;
+ }
+ // A ticket may end in a later command buffer than the one where it began.
+ for(auto& buffer:probe.buffers)
+  for(unsigned i=0;i<buffer.used;++i)
+   if(buffer.samples[i].ended && !buffer.samples[i].tick)
+    buffer.samples[i].tick=submission_tick;
  probe.current=-1;
 }
 void Begin(vk::CommandBuffer command,Ticket& ticket,Label label) {

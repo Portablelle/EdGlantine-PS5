@@ -47455,10 +47455,10 @@ index 974d214..47f50cd 100644
  
 diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
 new file mode 100644
-index 0000000..6bddd9d
+index 0000000..5216e0f
 --- /dev/null
 +++ b/src/video_core/gpu_split.cpp
-@@ -0,0 +1,737 @@
+@@ -0,0 +1,743 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -47482,6 +47482,7 @@ index 0000000..6bddd9d
 +#ifdef EDEN_NX2_PS5_PROTO
 +#include <cerrno>
 +#include <fcntl.h>
++#include <sys/stat.h>
 +#include "video_core/native_semaphore_observation.h"
 +#include <time.h>
 +#include <unistd.h>
@@ -47710,9 +47711,14 @@ index 0000000..6bddd9d
 +    observer_samples.store(0, std::memory_order_release);
 +    const char* path = std::getenv("EDEN_NX2_SPLIT_OBSERVER_LOG");
 +    if (!path || !*path) path = "/data/eden-nx2/logs/split-observer.log";
-+    observer_fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND, 0666);
++    observer_fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_NONBLOCK, 0666);
 +    if (observer_fd < 0) throw std::system_error(errno, std::generic_category(), "open split observer log");
 +    try {
++        struct stat info{};
++        if (::fstat(observer_fd, &info) != 0)
++            throw std::system_error(errno, std::generic_category(), "stat split observer log");
++        if (!S_ISREG(info.st_mode))
++            throw std::system_error(EINVAL, std::generic_category(), "split observer requires a regular file");
 +        constexpr char prepared[] = "NX2_SPLIT_OBSERVER prepared version=062\n";
 +        if (!WriteObserver(prepared, sizeof(prepared) - 1))
 +            throw std::system_error(observer_error.load(), std::generic_category(), "write split observer log");
@@ -49075,7 +49081,7 @@ index e084837..28b1dcf 100644
  
  uvec4 ReadTexel(uint offset) {
 diff --git a/src/video_core/macro.cpp b/src/video_core/macro.cpp
-index 86f528a..e1f6dd6 100644
+index 86f528a..47a9c0d 100644
 --- a/src/video_core/macro.cpp
 +++ b/src/video_core/macro.cpp
 @@ -4,6 +4,12 @@
@@ -49099,7 +49105,7 @@ index 86f528a..e1f6dd6 100644
  #endif
  
  #include "common/assert.h"
-@@ -25,13 +32,17 @@
+@@ -25,13 +32,18 @@
  #include "video_core/engines/maxwell_3d.h"
  #include "video_core/engines/maxwell_3d.h"
  #include "video_core/dirty_flags.h"
@@ -49114,122 +49120,21 @@ index 86f528a..e1f6dd6 100644
  #include "video_core/engines/maxwell_3d.h"
 +#include "video_core/nx2_profile.h"
 +#include "video_core/native_draw_indirect.h"
++#include "video_core/native_draw_hle.h"
  
  namespace Tegra {
  
-@@ -1337,8 +1348,321 @@ static void Dump(u64 hash, std::span<const u32> code, bool decompiled = false) {
+@@ -1337,8 +1349,219 @@ static void Dump(u64 hash, std::span<const u32> code, bool decompiled = false) {
      macro_file.write(reinterpret_cast<const char*>(code.data()), code.size_bytes());
  }
  
-+#ifdef EDEN_NX2_PS5_PROTO
-+namespace {
-+bool TryNativeIndexedIndirect(Core::System& system, MacroEngine& engine, Maxwell3D& maxwell,
-+                              u32 method, std::span<const u32> parameters) {
-+    namespace Hle = NativeDrawIndirect;
-+    if (method != Hle::Entry || !maxwell.AnyParametersDirty()) return false;
-+    static const bool enabled = [] {
-+        const auto* value = std::getenv("EDEN_NX2_NATIVE_DRAW_HLE");
-+        return !value || value[0] != '0';
-+    }();
-+    if (!enabled) return false;
-+    if (engine.native_hle_generation != engine.native_code_generation) {
-+        engine.native_hle_generation = engine.native_code_generation;
-+        engine.native_hle_sdk = Hle::SdkHash(engine.native_code) == Hle::KnownSdkHash;
-+    }
-+    if (!engine.native_hle_sdk || !Hle::Matches(engine.native_code, method)) {
-+        Hle::code_fallback.fetch_add(1, std::memory_order_relaxed);
-+        return false;
-+    }
-+    // This SDK's register-reading macros do not observe draw scratch registers.
-+    // Replay uses shadow arguments, not the live indirect buffer; keep its original path.
-+    if (maxwell.shadow_state.shadow_ram_control == Maxwell3D::Regs::ShadowRamControl::Replay ||
-+        maxwell.engine_state != Maxwell3D::EngineHint::None || !maxwell.replace_table.empty() ||
-+        maxwell.regs.topology_override != Maxwell3D::Regs::PrimitiveTopologyOverride::None ||
-+        Settings::values.renderer_backend.GetValue() != Settings::RendererBackend::Vulkan ||
-+        engine.native_execution_failed) {
-+        const auto count = Hle::state_fallback.fetch_add(1, std::memory_order_relaxed);
-+        if (!count) LOG_INFO(HW_GPU, "Native draw HLE state fallback: shadow={} hint={} override={}",
-+            static_cast<u32>(maxwell.shadow_state.shadow_ram_control),
-+            static_cast<u32>(maxwell.engine_state), static_cast<u32>(maxwell.regs.topology_override));
-+        return false;
-+    }
-+    std::array<u64, 6> addresses{};
-+    if (parameters.size() == addresses.size())
-+        for (size_t i = 0; i < addresses.size(); ++i) addresses[i] = maxwell.GetMacroAddress(i);
-+    auto& memory = maxwell.GetMemoryManager();
-+    if (!Hle::ArgumentShape(parameters, addresses) ||
-+        (addresses[0] && memory.IsMemoryDirty(addresses[0], 4, VideoCommon::CacheType::BufferCache)) ||
-+        !memory.IsFullyMappedRange(addresses[1], 20) || !memory.IsContinuousRange(addresses[1], 20)) {
-+        Hle::source_fallback.fetch_add(1, std::memory_order_relaxed);
-+        return false;
-+    }
-+    // The replacement attributes apply to CB0: require the captured SDK binding ABI.
-+    const auto cb_address = maxwell.regs.const_buffer.Address();
-+    const auto& vertex_cb = maxwell.state.shader_stages[0].const_buffers[0];
-+    bool binding_matches = vertex_cb.enabled && vertex_cb.address == cb_address && vertex_cb.size >= 0x648;
-+    for (size_t stage = 1; stage < maxwell.state.shader_stages.size(); ++stage) {
-+        if (!maxwell.regs.IsShaderConfigEnabled(stage + 1)) continue;
-+        const auto& cb = maxwell.state.shader_stages[stage].const_buffers[0];
-+        if (cb.enabled && (cb.address != cb_address || cb.size < 0x648)) binding_matches = false;
-+    }
-+    const auto argument_device = memory.GpuToCpuAddress(addresses[1]);
-+    const auto constant_device = memory.GpuToCpuAddress(cb_address + 0x640);
-+    if (!binding_matches || !argument_device || !constant_device ||
-+        !memory.IsFullyMappedRange(cb_address + 0x640, 8) ||
-+        !memory.IsContinuousRange(cb_address + 0x640, 8) ||
-+        (*argument_device <= *constant_device ? *constant_device - *argument_device < 20
-+                                             : *argument_device - *constant_device < 8)) {
-+        const auto count = Hle::source_fallback.fetch_add(1, std::memory_order_relaxed);
-+        if (!count) LOG_INFO(HW_GPU, "Native draw HLE binding fallback: cb={:#x} vertex_cb={:#x} enabled={} size={:#x}",
-+            cb_address, vertex_cb.address, vertex_cb.enabled, vertex_cb.size);
-+        return false;
-+    }
-+    const auto estimate = maxwell.EstimateIndexBufferSize();
-+    if (!estimate || estimate > std::numeric_limits<u32>::max() / 4) {
-+        Hle::source_fallback.fetch_add(1, std::memory_order_relaxed);
-+        return false;
-+    }
-+    if (!maxwell.SnapshotNativeDrawShadow(addresses[1], parameters[0])) {
-+        Hle::source_fallback.fetch_add(1, std::memory_order_relaxed);
-+        return false;
-+    }
-+    // Every rejection above precedes writes or drawing. Never replay after partial execution.
-+    const auto emit = [&](u32 address, u32 value) { maxwell.CallMethod(system, address, value, true); };
-+    Hle::ResetBases(emit);
-+    maxwell.engine_state = Maxwell3D::EngineHint::OnHLEMacro;
-+    maxwell.SetHLEReplacementAttributeType(0, 0x640, Maxwell3D::HLEReplacementAttributeType::BaseVertex);
-+    maxwell.SetHLEReplacementAttributeType(0, 0x644, Maxwell3D::HLEReplacementAttributeType::BaseInstance);
-+    auto& manager = maxwell.draw_manager;
-+    const auto previous_indirect = manager.indirect_state;
-+    SCOPE_EXIT {
-+        maxwell.engine_state = Maxwell3D::EngineHint::None;
-+        maxwell.replace_table.clear();
-+        manager.indirect_state = previous_indirect;
-+        manager.draw_state.draw_mode = Maxwell3D::DrawManager::DrawMode::General;
-+        manager.draw_state.instance_count = 0;
-+        manager.draw_state.draw_indexed = false;
-+    };
-+    manager.indirect_state = {
-+        .is_byte_count = false, .is_indexed = true, .include_count = false,
-+        .count_start_address = 0, .indirect_start_address = addresses[1],
-+        .buffer_size = 20, .max_draw_counts = 1, .stride = 20,
-+    };
-+    maxwell.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
-+    manager.DrawIndexedIndirect(maxwell, Maxwell3D::Regs::PrimitiveTopology::Triangles, 0, static_cast<u32>(estimate));
-+    const auto count = Hle::accepted.fetch_add(1, std::memory_order_relaxed) + 1;
-+    if (count <= 4 || count % 8192 == 0)
-+        LOG_INFO(HW_GPU, "NX2_NATIVE_DRAW_INDIRECT accepted={} arguments={:#x} index_capacity={}", count, addresses[1], estimate);
-+    return true;
-+}
-+}
-+#endif
 +
  void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u32 method,
                            std::span<const u32> parameters) {
 +    VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
 +    if (native_turing) {
 +#ifdef EDEN_NX2_PS5_PROTO
-+        if (TryNativeIndexedIndirect(system, *this, maxwell3d, method, parameters)) return;
++        if (NativeDrawHle::TryExecute(system, *this, maxwell3d, method, parameters)) return;
 +#endif
 +        maxwell3d.RefreshParameters();
 +        const bool force_interpreter =
@@ -54363,7 +54268,7 @@ index be5a114..19dd39b 100644
          // Fast check: already reached the requested tick?
          if (gpu_tick.load(std::memory_order_acquire) >= tick) {
 diff --git a/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp b/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp
-index 4d84390..1932f8a 100644
+index 4d84390..ccfe96a 100644
 --- a/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp
 +++ b/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp
 @@ -277,6 +277,11 @@ MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& schedu
@@ -54378,23 +54283,21 @@ index 4d84390..1932f8a 100644
      if (device.IsBufferDeviceAddressSupported()) {
          VkBuffer address_handle = *entry.sparse_handle;
          if (!entry.sparse_handle) {
-@@ -302,9 +307,15 @@ MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& schedu
+@@ -302,9 +307,10 @@ MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& schedu
  }
  
  void MultiRangeBufferCache::MarkGathered(u64 key) {
-+#ifdef EDEN_NX2_PS5_PROTO
-     if (auto const it = entries.find(key); it != entries.end()) {
-         it->second.dirty = false;
-     }
-+#else
-+    // Exact source-write invalidation is currently wired only in the PS5 port.
-+    // Keep other Vulkan builds on the conservative gather-every-binding path.
+-    if (auto const it = entries.find(key); it != entries.end()) {
+-        it->second.dirty = false;
+-    }
++    // Binding-time invalidation precedes GPU writes and may overlap this gather.
++    // Until invalidation is ordered after each producing draw, conservatively
++    // gather every binding on all platforms, including PS5.
 +    (void)key;
-+#endif
  }
  
  void MultiRangeBufferCache::DropOwner(Scheduler& scheduler, VkBuffer owner) {
-@@ -329,6 +340,20 @@ void MultiRangeBufferCache::DropOwner(Scheduler& scheduler, VkBuffer owner) {
+@@ -329,6 +335,20 @@ void MultiRangeBufferCache::DropOwner(Scheduler& scheduler, VkBuffer owner) {
      }
  }
  
@@ -61612,3 +61515,124 @@ index 0000000..ce31742
 +    return NativeMacroExecution::Automatic;
 +}
 +} // namespace Tegra
+diff --git a/src/video_core/native_draw_hle.h b/src/video_core/native_draw_hle.h
+new file mode 100644
+index 0000000..7f2a1a3
+--- /dev/null
++++ b/src/video_core/native_draw_hle.h
+@@ -0,0 +1,115 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++#ifdef EDEN_NX2_PS5_PROTO
++#include <cstdlib>
++#include "common/scope_exit.h"
++#include "common/settings.h"
++#include "common/logging.h"
++#include "video_core/engines/maxwell_3d.h"
++#include "video_core/dirty_flags.h"
++#include "video_core/memory_manager.h"
++#include "video_core/macro.h"
++#include "video_core/native_draw_indirect.h"
++namespace Tegra::NativeDrawHle {
++using Maxwell3D = Engines::Maxwell3D;
++// Owns SDK recognition, binding validation and draw-state restoration.
++inline bool TryExecute(Core::System& system, MacroEngine& engine, Maxwell3D& maxwell,
++                              u32 method, std::span<const u32> parameters) {
++    namespace Hle = NativeDrawIndirect;
++    if (method != Hle::Entry || !maxwell.AnyParametersDirty()) return false;
++    static const bool enabled = [] {
++        const auto* value = std::getenv("EDEN_NX2_NATIVE_DRAW_HLE");
++        return !value || value[0] != '0';
++    }();
++    if (!enabled) return false;
++    if (engine.native_hle_generation != engine.native_code_generation) {
++        engine.native_hle_generation = engine.native_code_generation;
++        engine.native_hle_sdk = Hle::SdkHash(engine.native_code) == Hle::KnownSdkHash;
++    }
++    if (!engine.native_hle_sdk || !Hle::Matches(engine.native_code, method)) {
++        Hle::code_fallback.fetch_add(1, std::memory_order_relaxed);
++        return false;
++    }
++    // This SDK's register-reading macros do not observe draw scratch registers.
++    // Replay uses shadow arguments, not the live indirect buffer; keep its original path.
++    if (maxwell.shadow_state.shadow_ram_control == Maxwell3D::Regs::ShadowRamControl::Replay ||
++        maxwell.engine_state != Maxwell3D::EngineHint::None || !maxwell.replace_table.empty() ||
++        maxwell.regs.topology_override != Maxwell3D::Regs::PrimitiveTopologyOverride::None ||
++        Settings::values.renderer_backend.GetValue() != Settings::RendererBackend::Vulkan ||
++        engine.native_execution_failed) {
++        const auto count = Hle::state_fallback.fetch_add(1, std::memory_order_relaxed);
++        if (!count) LOG_INFO(HW_GPU, "Native draw HLE state fallback: shadow={} hint={} override={}",
++            static_cast<u32>(maxwell.shadow_state.shadow_ram_control),
++            static_cast<u32>(maxwell.engine_state), static_cast<u32>(maxwell.regs.topology_override));
++        return false;
++    }
++    std::array<u64, 6> addresses{};
++    if (parameters.size() == addresses.size())
++        for (size_t i = 0; i < addresses.size(); ++i) addresses[i] = maxwell.GetMacroAddress(i);
++    auto& memory = maxwell.GetMemoryManager();
++    if (!Hle::ArgumentShape(parameters, addresses) ||
++        (addresses[0] && memory.IsMemoryDirty(addresses[0], 4, VideoCommon::CacheType::BufferCache)) ||
++        !memory.IsFullyMappedRange(addresses[1], 20) || !memory.IsContinuousRange(addresses[1], 20)) {
++        Hle::source_fallback.fetch_add(1, std::memory_order_relaxed);
++        return false;
++    }
++    // The replacement attributes apply to CB0: require the captured SDK binding ABI.
++    const auto cb_address = maxwell.regs.const_buffer.Address();
++    const auto& vertex_cb = maxwell.state.shader_stages[0].const_buffers[0];
++    bool binding_matches = vertex_cb.enabled && vertex_cb.address == cb_address && vertex_cb.size >= 0x648;
++    for (size_t stage = 1; stage < maxwell.state.shader_stages.size(); ++stage) {
++        if (!maxwell.regs.IsShaderConfigEnabled(stage + 1)) continue;
++        const auto& cb = maxwell.state.shader_stages[stage].const_buffers[0];
++        if (cb.enabled && (cb.address != cb_address || cb.size < 0x648)) binding_matches = false;
++    }
++    const auto argument_device = memory.GpuToCpuAddress(addresses[1]);
++    const auto constant_device = memory.GpuToCpuAddress(cb_address + 0x640);
++    if (!binding_matches || !argument_device || !constant_device ||
++        !memory.IsFullyMappedRange(cb_address + 0x640, 8) ||
++        !memory.IsContinuousRange(cb_address + 0x640, 8) ||
++        (*argument_device <= *constant_device ? *constant_device - *argument_device < 20
++                                             : *argument_device - *constant_device < 8)) {
++        const auto count = Hle::source_fallback.fetch_add(1, std::memory_order_relaxed);
++        if (!count) LOG_INFO(HW_GPU, "Native draw HLE binding fallback: cb={:#x} vertex_cb={:#x} enabled={} size={:#x}",
++            cb_address, vertex_cb.address, vertex_cb.enabled, vertex_cb.size);
++        return false;
++    }
++    const auto estimate = maxwell.EstimateIndexBufferSize();
++    if (!estimate || estimate > std::numeric_limits<u32>::max() / 4) {
++        Hle::source_fallback.fetch_add(1, std::memory_order_relaxed);
++        return false;
++    }
++    if (!maxwell.SnapshotNativeDrawShadow(addresses[1], parameters[0])) {
++        Hle::source_fallback.fetch_add(1, std::memory_order_relaxed);
++        return false;
++    }
++    // Every rejection above precedes writes or drawing. Never replay after partial execution.
++    const auto emit = [&](u32 address, u32 value) { maxwell.CallMethod(system, address, value, true); };
++    Hle::ResetBases(emit);
++    maxwell.engine_state = Maxwell3D::EngineHint::OnHLEMacro;
++    maxwell.SetHLEReplacementAttributeType(0, 0x640, Maxwell3D::HLEReplacementAttributeType::BaseVertex);
++    maxwell.SetHLEReplacementAttributeType(0, 0x644, Maxwell3D::HLEReplacementAttributeType::BaseInstance);
++    auto& manager = maxwell.draw_manager;
++    const auto previous_indirect = manager.indirect_state;
++    SCOPE_EXIT {
++        maxwell.engine_state = Maxwell3D::EngineHint::None;
++        maxwell.replace_table.clear();
++        manager.indirect_state = previous_indirect;
++        manager.draw_state.draw_mode = Maxwell3D::DrawManager::DrawMode::General;
++        manager.draw_state.instance_count = 0;
++        manager.draw_state.draw_indexed = false;
++    };
++    manager.indirect_state = {
++        .is_byte_count = false, .is_indexed = true, .include_count = false,
++        .count_start_address = 0, .indirect_start_address = addresses[1],
++        .buffer_size = 20, .max_draw_counts = 1, .stride = 20,
++    };
++    maxwell.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
++    manager.DrawIndexedIndirect(maxwell, Maxwell3D::Regs::PrimitiveTopology::Triangles, 0, static_cast<u32>(estimate));
++    const auto count = Hle::accepted.fetch_add(1, std::memory_order_relaxed) + 1;
++    if (count <= 4 || count % 8192 == 0)
++        LOG_INFO(HW_GPU, "NX2_NATIVE_DRAW_INDIRECT accepted={} arguments={:#x} index_capacity={}", count, addresses[1], estimate);
++    return true;
++}
++} // namespace Tegra::NativeDrawHle
++#endif

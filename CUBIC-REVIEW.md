@@ -39,8 +39,8 @@ See `eden/tests-nx2/check-texture-scratch.py` and the runtime-control test above
 
 Additional publication checks addressed:
 
-- Non-PS5 Vulkan builds retain conservative gathered-buffer reads until the PS5
-  source-write invalidation hooks are available on those paths.
+- All Vulkan builds retain conservative gathered-buffer reads until invalidation
+  is ordered after producing draws, including overlapping pending outputs.
 - Failure to open/write the observer log or create its optional thread no longer
   prevents split backend startup. Partial observer state is cleaned up independently.
 - The temporary .018 MME capture/write-tracing hooks are retired. The interpreter
@@ -53,6 +53,13 @@ The focused edge-case harness exercises actual split startup with observer open,
 write and thread-creation failures, then backend execution/shutdown/recovery. It
 also tests the production gathered-cache mutation methods with and without the
 PS5 build define: `eden/tests-nx2/check-publication-edge-cases.py`.
+
+The final review also prompted submission-completion guards for timestamp reads
+(including tickets spanning command buffers), atomic claiming of runtime requests,
+nonblocking observer opens restricted to regular files, session-owned initial
+profiling deadlines, and a dedicated native draw HLE module owning SDK validation
+and draw-state restoration. Targeted regressions cover stale query availability,
+pending-output invalidation, FIFO destinations, and initial deadline expiry.
 
 These source fixes postdate the PS5-tested .064 package and have not been installed
 on the console. The 21 FPS result applies to that previously installed package.
