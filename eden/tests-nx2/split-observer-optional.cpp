@@ -7,11 +7,23 @@
 #include <string>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <cstring>
 #include "core/core.h"
 #include "video_core/gpu_split.h"
 
 static std::atomic<unsigned> creates{};
 static unsigned fail_create{};
+static bool fail_prepared_write{}, saw_write_failure{};
+extern "C" ssize_t __real_write(int,const void*,size_t);
+extern "C" ssize_t __wrap_write(int fd,const void* data,size_t size) {
+    constexpr char marker[]="NX2_SPLIT_OBSERVER prepared";
+    if (fail_prepared_write && size>=sizeof(marker)-1 &&
+        std::memcmp(data,marker,sizeof(marker)-1)==0) {
+        saw_write_failure=true;errno=ENOSPC;return -1;
+    }
+    return __real_write(fd,data,size);
+}
 extern "C" int __real_pthread_create(pthread_t*,const pthread_attr_t*,void*(*)(void*),void*);
 extern "C" int __wrap_pthread_create(pthread_t* thread,const pthread_attr_t* attr,void*(*fn)(void*),void* arg) {
     if(++creates==fail_create) return EAGAIN;
@@ -37,7 +49,9 @@ int main(int argc,char**argv) {
     assert(mkfifo(fifo.c_str(),0600)==0);
     run(fifo.c_str(),0); // Must not block waiting for a reader.
     run(missing.c_str(),0); // Open failure cannot prevent rendering.
-    run("/dev/full",0);   // Initial write failure cannot prevent rendering.
+    run("/dev/full",0);   // Nonregular destination is rejected.
+    fail_prepared_write=true;run(good.c_str(),0);
+    assert(saw_write_failure);fail_prepared_write=false;
     run(good.c_str(),2);   // Backend starts; optional observer thread creation fails.
     run(good.c_str(),0);   // Observer and backend can restart normally after failures.
     std::puts("SPLIT_OBSERVER_OPTIONAL_OK: open/write/thread failures, execution, shutdown and recovery");

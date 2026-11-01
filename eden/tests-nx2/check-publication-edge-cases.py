@@ -21,7 +21,7 @@ with tempfile.TemporaryDirectory(prefix='nx2-publication-edges-') as directory:
         target=temp/'include/video_core'/name
         target.write_text(''.join(line[1:]+'\n' for line in body.splitlines() if line.startswith('+')))
     flags=[compiler,'-std=c++20','-O1','-g','-fsanitize=address,undefined','-pthread']
-    subprocess.run(flags+['-DEDEN_NX2_PS5_PROTO','-I',str(temp/'include'),str(temp/'include/video_core/gpu_split.cpp'),str(root/'tests-nx2/split-observer-optional.cpp'),'-Wl,--wrap=pthread_create','-o',str(temp/'split-test')],check=True)
+    subprocess.run(flags+['-DEDEN_NX2_PS5_PROTO','-I',str(temp/'include'),str(temp/'include/video_core/gpu_split.cpp'),str(root/'tests-nx2/split-observer-optional.cpp'),'-Wl,--wrap=pthread_create,--wrap=write','-o',str(temp/'split-test')],check=True)
     subprocess.run([str(temp/'split-test'),str(temp)],check=True)
     source=(core/'src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp').read_text()
     def method(name):

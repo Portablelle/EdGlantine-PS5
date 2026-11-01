@@ -51180,45 +51180,29 @@ index 0000000..38d31c5
 +}
 diff --git a/src/video_core/native_draw_memo.h b/src/video_core/native_draw_memo.h
 new file mode 100644
-index 0000000..063888f
+index 0000000..2561179
 --- /dev/null
 +++ b/src/video_core/native_draw_memo.h
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,21 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +#pragma once
-+#include <array>
-+#include <atomic>
-+#include <cstdint>
-+#include <utility>
++#include "video_core/native_memo_table.h"
 +namespace VideoCommon::NativeDrawMemo {
-+struct Statistics { std::atomic<std::uint64_t> requests{}, hits{}; };
++using Statistics = NativeMemo::Statistics;
 +inline std::array<Statistics, 2> statistics;
-+// Stack-owned snapshot for one ConfigureImpl only. Full keys guard collisions;
-+// a miss always invokes the original typed loader, including its error paths.
++template<unsigned Kind> struct Hash {
++    std::uint64_t operator()(std::uint64_t key) const {
++        // Handles are word-aligned GPU addresses; samplers are table indices.
++        const auto value = Kind == 0 ? key >> 2 : key;
++        return value ^ (value >> 6);
++    }
++};
++// Stack-owned snapshot for one ConfigureImpl only.
 +template<class T, unsigned Kind, unsigned Slots = 64>
-+class Table {
-+    static_assert(Kind < 2 && Slots && (Slots & (Slots - 1)) == 0);
-+    struct Entry { std::uint64_t key{}; T value{}; bool valid{}; };
-+    std::array<Entry, Slots> entries{};
-+    std::uint64_t requests{}, hits{};
++class Table : public NativeMemo::Table<std::uint64_t, T, Slots, Hash<Kind>> {
++    static_assert(Kind < statistics.size());
 +public:
-+    Table() = default;
-+    Table(const Table&) = delete;
-+    Table& operator=(const Table&) = delete;
-+    ~Table() {
-+        statistics[Kind].requests.fetch_add(requests, std::memory_order_relaxed);
-+        statistics[Kind].hits.fetch_add(hits, std::memory_order_relaxed);
-+    }
-+    template<class Loader> T Get(std::uint64_t key, Loader&& loader) {
-+        ++requests;
-+        // Handles are word-aligned GPU addresses; samplers are integer table indices.
-+        const auto hash = Kind == 0 ? key >> 2 : key;
-+        auto& entry = entries[(hash ^ (hash >> 6)) & (Slots - 1)];
-+        if (entry.valid && entry.key == key) { ++hits; return entry.value; }
-+        const T value = std::forward<Loader>(loader)();
-+        entry = {key, value, true};
-+        return value;
-+    }
++    Table() : NativeMemo::Table<std::uint64_t, T, Slots, Hash<Kind>>{statistics[Kind]} {}
 +};
 +}
 diff --git a/src/video_core/native_draw_shadow.h b/src/video_core/native_draw_shadow.h
@@ -51633,19 +51617,20 @@ index 0000000..8ac6d26
 +} // namespace VideoCommon
 diff --git a/src/video_core/native_resource_memo.h b/src/video_core/native_resource_memo.h
 new file mode 100644
-index 0000000..1d06271
+index 0000000..30b90a4
 --- /dev/null
 +++ b/src/video_core/native_resource_memo.h
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,37 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +#pragma once
 +#include <array>
 +#include <atomic>
 +#include <cstdint>
 +#include <utility>
++#include "video_core/native_memo_table.h"
 +
 +namespace VideoCommon::NativeResourceMemo {
-+struct Statistics { std::atomic<std::uint64_t> requests{}, hits{}; };
++using Statistics = NativeMemo::Statistics;
 +inline std::array<Statistics, 2> statistics;
 +inline std::uint64_t Mix(std::uint64_t value) {
 +    value ^= value >> 33;
@@ -51662,30 +51647,15 @@ index 0000000..1d06271
 +    bool operator==(const SampledKey&) const = default;
 +    std::uint64_t Hash() const { return Mix((std::uint64_t{sampler} << 32) | view) ^ Mix((std::uint64_t{flags} << 32) | type); }
 +};
-+// Caller owns this table for one resource-preparation stage only. Full-key checks;
-+// failed loaders do not populate the table, and a collision uses the original loader.
++struct Hash {
++    template<class Key> std::uint64_t operator()(const Key& key) const { return key.Hash(); }
++};
++// Caller owns the snapshot for one resource-preparation stage only.
 +template<class Key, class Value, unsigned Kind, unsigned Slots>
-+class Table {
-+    static_assert(Kind < 2 && Slots && (Slots & (Slots - 1)) == 0);
-+    struct Entry { Key key{}; Value value{}; bool valid{}; };
-+    std::array<Entry, Slots> entries{};
-+    std::uint64_t requests{}, hits{};
++class Table : public NativeMemo::Table<Key, Value, Slots, Hash> {
++    static_assert(Kind < statistics.size());
 +public:
-+    Table() = default;
-+    Table(const Table&) = delete;
-+    ~Table() {
-+        if (!requests) return;
-+        statistics[Kind].requests.fetch_add(requests, std::memory_order_relaxed);
-+        statistics[Kind].hits.fetch_add(hits, std::memory_order_relaxed);
-+    }
-+    template<class Loader> Value Get(const Key& key, Loader&& loader) {
-+        ++requests;
-+        auto& entry = entries[key.Hash() & (Slots - 1)];
-+        if (entry.valid && entry.key == key) { ++hits; return entry.value; }
-+        Value value = std::forward<Loader>(loader)();
-+        entry = {key, value, true};
-+        return value;
-+    }
++    Table() : NativeMemo::Table<Key, Value, Slots, Hash>{statistics[Kind]} {}
 +};
 +}
 diff --git a/src/video_core/native_root_table.h b/src/video_core/native_root_table.h
@@ -61636,3 +61606,46 @@ index 0000000..7f2a1a3
 +}
 +} // namespace Tegra::NativeDrawHle
 +#endif
+diff --git a/src/video_core/native_memo_table.h b/src/video_core/native_memo_table.h
+new file mode 100644
+index 0000000..a1e592d
+--- /dev/null
++++ b/src/video_core/native_memo_table.h
+@@ -0,0 +1,37 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++#include <array>
++#include <atomic>
++#include <cstdint>
++#include <utility>
++namespace VideoCommon::NativeMemo {
++struct Statistics { std::atomic<std::uint64_t> requests{}, hits{}; };
++// Snapshot lifetime is selected by the caller. Full keys guard collisions;
++// throwing loaders leave the previous slot unchanged.
++template<class Key, class Value, unsigned Slots, class Hash>
++class Table {
++    static_assert(Slots && (Slots & (Slots - 1)) == 0);
++    struct Entry { Key key{}; Value value{}; bool valid{}; };
++    std::array<Entry, Slots> entries{};
++    Statistics& statistics;
++    Hash hash;
++    std::uint64_t requests{}, hits{};
++public:
++    explicit Table(Statistics& counters, Hash hasher = {}) : statistics{counters}, hash{hasher} {}
++    Table(const Table&) = delete;
++    Table& operator=(const Table&) = delete;
++    ~Table() {
++        if (!requests) return;
++        statistics.requests.fetch_add(requests, std::memory_order_relaxed);
++        statistics.hits.fetch_add(hits, std::memory_order_relaxed);
++    }
++    template<class Loader> Value Get(const Key& key, Loader&& loader) {
++        ++requests;
++        auto& entry = entries[hash(key) & (Slots - 1)];
++        if (entry.valid && entry.key == key) { ++hits; return entry.value; }
++        Value value = std::forward<Loader>(loader)();
++        entry = {key, value, true};
++        return value;
++    }
++};
++} // namespace VideoCommon::NativeMemo

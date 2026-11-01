@@ -58,7 +58,7 @@
     "RET R0/R55 regression tests adapted to existing strict return linkage validation"
   ],
   "hostSuiteValidated": false,
-  "nx2PatchSha256": "6d5deb191b7720bba800ade0b5a6731fc694ef611ab463ab8bbf6cf584e56d23",
+  "nx2PatchSha256": "2b1e5b145926725940498f1e685081ce7e89b4580ba1648df6f86746bfb075a9",
   "rejectedAdaptations": [
     "QMD history eviction: replays completed descriptors on action 2; regression caught by native_semaphore test"
   ],
@@ -561,7 +561,9 @@
       "Atomically claim runtime request files before consuming them.",
       "Reject nonregular observer destinations using a nonblocking open.",
       "Keep initial profiling deadlines in the session owner.",
-      "Move SDK draw execution and restoration into the native draw HLE module."
+      "Move SDK draw execution and restoration into the native draw HLE module.",
+      "Share memo-table storage, collision handling, loading and statistics aggregation through explicit hash policies.",
+      "Exercise observer write failure on an accepted regular file using ENOSPC injection."
     ],
     "nativeTranslatorSalt": "0x4f554e4345a00007"
   }

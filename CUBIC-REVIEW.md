@@ -61,6 +61,10 @@ profiling deadlines, and a dedicated native draw HLE module owning SDK validatio
 and draw-state restoration. Targeted regressions cover stale query availability,
 pending-output invalidation, FIFO destinations, and initial deadline expiry.
 
+Draw and resource memo tables now share one implementation with explicit hash
+policies and statistics sinks. The observer regression injects ENOSPC on the first
+write to an accepted regular file, independently of the nonregular-file checks.
+
 These source fixes postdate the PS5-tested .064 package and have not been installed
 on the console. The 21 FPS result applies to that previously installed package.
 
