@@ -1,89 +1,126 @@
 # EdGlantine-PS5
 
-**00.063.000 installée** : regroupement des pages, propriétaires mémoire et espacements
-de textures Eglantine ; compilation/tests ciblés sur build-server réussis. Rollback 00.062.000
-conservé. FPS/rendu à mesurer ; application non relancée.
+EdGlantine-PS5 is an experimental PS5 port based on ProsperoEden and the Eden NX2
+engine, with adaptations from the Eglantine forks. It reaches gameplay in tested
+scenarios, but performance, rendering correctness and stability still need work.
 
-Ce projet dérive de ProsperoEden 1.005.000 et du fork expérimental Eden NX2.
-Il ne remplace pas Botty et ne modifie pas son moteur Switch 1.
+**Contributors welcome.** The latest reported gameplay result is **21 FPS** on
+version **00.063.000**. A stable **30 FPS has not been achieved** in that test.
+The newer **00.064.000** build is installed and awaiting performance feedback.
+Help with profiling, CPU/GPU optimization, memory synchronization and PS5 testing
+would make a real difference. See [Contributing](#contributing) below.
 
-**État : .062 conserve l’attente après activation : 29 222 lus pour 29 226 attendus. 14 snapshots DMA / 724 octets, aucun sale ; lecture ordonnée sans effet sur cette attente. Producteur/soumission/décodage à poursuivre. Aucun gain FPS du découpage démontré.**
-La .017 arrête explicitement la session sur une commande DMA sans moteur lié,
-après une erreur FIFO du macro MME 0x18f. La copie possédée ne suffit pas à résoudre
-le problème. La .018 sélectionne l’interpréteur pour ce macro avant toute exécution,
-avec captures initiales bornées ; les autres macros conservent le JIT.
-La .019 reproduit un arrêt DMA avant ce macro. La .020 transporte les préfixes
-de soumission avec chaque lot : le bloc change après soumission avant sa lecture,
-à adresse device identique. La .021 désactive le report des notifications CPU
-pour isoler un problème possible d’ordre des écritures ; elle reproduit la mutation.
-La .022 enregistre les écritures du moteur et les notifications CPU sur les blocs
-en attente : une relecture de buffer GPU de 4 Ko écrase les commandes.
-La .023 limite les copies à la plage demandée, conserve les données GPU voisines
-encore modifiées et retire la trace lourde. Cinq cas ciblés passent sur build-server.
-La .023 reste jouable dans l’essai observé jusqu’à ~65 s, mais à 6 FPS.
-La .024 rétablit le report CPU mais reproduit l’arrêt DMA. La .025 applique
-les notifications et invalidations CPU avant la relecture, avec reprise synchrone
-sur le thread GPU, mais l’essai reste bloqué sur écran noir avec méthodes compute
-hors plage. La .026 revient aux notifications immédiates, retire ces drains et
-arrête explicitement les méthodes compute hors banque pour capturer leur bloc.
-La .026 atteint l’écran jouable à 6 FPS dans l’essai observé. La .027 groupe les
-lectures exactes des pointeurs SSBO avant liaison, avec secours individuel ;
-la .027 reste à 6 FPS et les attentes restent comparables. La .028 mesure
-les attentes par appelant : DownloadBufferMemory domine avec ~29 400 appels
-pour ~3,26 s en cinq secondes. La .029 complète l’origine ReadBlock/FlushRegion
-et les volumes : la copie des blocs DMA est le lecteur dominant (~3,34 s sur cinq).
-La .030 essaie le réglage DMA Unsafe existant, avec précision GPU haute et
-relecture des paramètres indirects conservées : image correcte, 8 FPS puis 3 FPS
-plus loin selon l’utilisateur. La .031 réutilise des fenêtres GPU déjà relues lors
-de la reprise des paramètres, invalidées à toute écriture GPU recouvrante.
-Seuls les octets demandés sont copiés vers le jeu ; gain à mesurer.
-Le correctif de gather FP16 est conservé.
-La .014 paraît correcte visuellement selon l’utilisateur, mais reste à ~14 FPS.
-Un gather FP16 encore refusé a été corrigé dans .015 ; la prochaine capture doit
-séparer le coût vidéo de celui du rendu après le menu.
-La conversion vidéo 4K est passée de 96,18 à 21,15 ms/image ; sur le même intervalle
-vidéo, la cadence est passée de 7,04 à 14,96 images/s. Le menu atteint 59,94 FPS,
-mais la .011 présentait des défauts graphiques après validation. La .012 corrige
-deux formes de shaders de textures rejetées dans les logs. Les défauts sont réduits
-selon l’utilisateur ; d’autres formes sont encore rejetées, le rendu reste à corriger.
+## Current state
 
-Compilation exclusivement sur `build-server`, tests ciblés et progression incrémentale.
-Sources et patches sont versionnés ; paquets, dumps, jeux, clés, SDK et copies de
-travail des références restent locaux. Résultats : [TEST-REPORT.md](TEST-REPORT.md).
+- **Latest build: 00.064.000.** Shares CPU preparation of texture tables and sampled
+  descriptors within each stage. It preserves the .063 page batching, memory-owner
+  and texture-stride fixes. The build and targeted tests passed on the build server;
+  console FPS, rendering and cache-hit results are still pending.
+- **Performance reference: .063 at 21 FPS** during gameplay with GPU splitting
+  disabled. This is one observed result, not a compatibility benchmark or a
+  guarantee for other games or scenes. Rendering quality was not specified for
+  that run; earlier versions had visual defects.
+- **Measured bottlenecks:** a 20.112-second .063 solo capture recorded 8.650 seconds
+  of CPU draw preparation/configuration, including 3.731 seconds of descriptor
+  work and 2.812 seconds of resource reads. These phases are nested and must not
+  be added together. GPU command-buffer timestamps covered 5.765 seconds; this
+  does not measure total GPU utilization.
+- **Experimental GPU splitting:** available but disabled at startup. Explicit
+  activation has caused freezes. The latest split investigation (.062) still
+  observed a semaphore at 29,222 while waiting for 29,226; ordered DMA snapshots
+  did not resolve it. No performance gain from splitting is established.
+- **Validation limits:** targeted host tests and native build checks pass for recent
+  changes, but do not establish broad game compatibility, long-session stability
+  or correct rendering on PS5. The latest optimization still needs a controlled
+  before/after measurement on the console.
 
-- Titre : `PPSA99862` — **Eden NX2 Prototype**.
-- Données, sauvegardes, configuration et caches : `/data/eden-nx2`.
-- Entrée du prototype : `/data/eden-nx2/game/exefs/main`, avec `main.npdm`,
-  les autres modules ExeFS et le dossier `../romfs` du même jeu.
-- Le point d'entrée est lancé s'il existe ; sinon le frontend indépendant s'ouvre.
-- JIT MME NX2 graphique et compute activé ; ancien JIT des macros Maxwell désactivé.
-- Découpage expérimental des threads GPU désactivé ; placement six cœurs + GPU si la topologie est validée.
-- Auto-mise à jour désactivée, payload d'auto-remplacement non fourni.
-- Installation séparée sur PS5 autorisée et réalisée le 31 octobre 2026 ; jeu non relancé automatiquement.
+The current focus is to reduce CPU draw preparation and redundant transfers while
+preserving memory correctness, and to diagnose the split-mode freeze before
+considering it usable. Measurements and version history are in
+[TEST-REPORT.md](TEST-REPORT.md); planned work is in [ROADMAP.md](ROADMAP.md).
 
-Les références exactes figurent dans `prototype.json`. `eden/` contient le port PS5,
-les adaptations et les tests. `eden/tools/eden-patches/90-nx2-prototype.diff`
-s'applique après les quatre patches source d'origine au cœur Eden épinglé.
-`core/` est la copie de travail développée de ce cœur, pas un autre moteur installé.
+## Contributing
 
-## Adaptations EglantinePS5 — 00.040.000
+Please help make EdGlantine-PS5 faster and more stable. Contributions can be code,
+reproducible measurements, debugging findings or documented PS5 tests.
+Useful areas include:
 
-Trois adaptations de `heydemoura/EglantinePS5` (`a2c5a908`) : buffers de transfert
-Vulkan arrondis par pas de 16 Mio au-delà de 16 Mio, réutilisation selon leur capacité
-réelle et libération des seuls buffers terminés/non différés avant une nouvelle
-tentative après manque de mémoire ; signalement unique des commandes auto-stubbées
-par service/commande, sans élargir la politique de réponse existante ; engagement
-du heap par blocs physiques décroissants jusqu’à 2 Mio, avec rollback complet en
-cas d’échec partiel et conservation de la continuité virtuelle.
+- **CPU draw preparation:** descriptor setup, shader-resource lookup and SSBO
+  binding, guided by the measured costs above.
+- **GPU transfers and synchronization:** reduce redundant gather/scatter copies
+  and readbacks while preserving dirty-range tracking, ownership and ordering.
+- **GPU split stability:** trace semaphore producers, command submission and
+  decoding to identify why progress stops after activation.
+- **Rendering and regression tests:** small reproductions for texture/shader
+  issues, focused tests of affected production paths and checks on real hardware.
 
-Les tests ciblés s’exécutent avec `bash tests-nx2/run-eglantine-three.sh` sur `build-server`.
-La validation hôte ne reproduit pas le pilote PS5. Aucun gain FPS/mémoire ni
-correctif du comptoir noir n’est revendiqué. La réduction des mips BCn n’est pas importée.
+Open an issue with the build version, hardware/software environment, settings,
+reproduction steps, scene and measured FPS/frame times. For performance changes,
+compare the same scene and settings before and after, and state whether rendering
+or stability changed. Include relevant sanitized logs; do not attach games,
+keys, proprietary SDKs or personal information.
 
-## Compilation
+Pull requests should explain the problem, the change and the validation performed.
+Keep changes focused, credit upstream work with repository/commit links, and
+preserve its license notices. Follow the remote build workflow below and run the
+targeted tests relevant to your change. Host-test success alone is not a PS5
+performance result; identify untested hardware behavior clearly.
 
-Toutes les configurations et compilations, y compris les shaders et les tests C++,
-s'exécutent sur `build-server`, jamais sur le Mac. La destination SSH se configure dans un fichier local ignoré par Git :
+## Credits
+
+EdGlantine-PS5 builds on the work of these projects and their contributors:
+
+- [ProsperoEden](https://github.com/blackbearreloaded/ProsperoEden): the PS5 port, native application wrapper, build infrastructure and platform adaptations used as the foundation of this project.
+- [Eden NX2](https://git.eden-emu.dev/Takoroka/eden-nx2): the experimental NX2 engine on which the initial prototype was based.
+- [Eden-NS2](https://github.com/0x2593/Eden-NS2): native shader support, GPU descriptors and buffers, texture streaming, and NX2 services integrated into this prototype.
+- [Eglantine — Djihads80](https://github.com/Djihads80/Eglantine): GPU page tracking, ASTC layer uploads, cache validation, shader fixes and research into sparse texture residency.
+- [Eglantine — zortos293](https://github.com/zortos293/Eglantine): partial-page batching, memory-owner tracking and texture layer/row stride fixes integrated in 00.063.000.
+- [EglantinePS5 — heydemoura](https://github.com/heydemoura/EglantinePS5): the basis for staging-buffer sizing and reuse, one-time service-command reporting, and fragmented heap commitment adaptations.
+
+Exact revisions and adaptation details are recorded in `prototype.json` and the
+milestone documents. Original copyright notices and third-party licenses are
+preserved in the source tree. These credits do not imply upstream endorsement.
+
+## Repository and runtime layout
+
+Builds run on the remote build server, with targeted tests and incremental changes.
+Sources and patches are versioned; packages, dumps, games, keys, SDKs and reference
+working copies remain local.
+
+- Title: `PPSA99862` — **Eden NX2 Prototype**.
+- Data, saves, configuration and caches: `/data/eden-nx2`.
+- Prototype entry point: `/data/eden-nx2/game/exefs/main`, alongside `main.npdm`,
+  the other ExeFS modules and the same game's `../romfs` directory.
+- The entry point launches if present; otherwise the standalone frontend opens.
+- Graphics and compute NX2 MME JIT enabled; legacy Maxwell macro JIT disabled.
+- Experimental GPU thread splitting inactive by default; six-core + GPU placement
+  applies only if the topology is validated.
+- Self-update disabled; no self-replacement payload included.
+
+Exact references are in `prototype.json`. `eden/` contains the PS5 port, adaptations
+and tests. `eden/tools/eden-patches/90-nx2-prototype.diff` applies after the four
+original source patches to the pinned Eden core. `core/` is the expanded working
+copy of that core, not another installed engine.
+
+## EglantinePS5 adaptations — 00.040.000
+
+Three adaptations from `heydemoura/EglantinePS5` (`a2c5a908`): Vulkan staging buffers
+rounded in 16 MiB increments above 16 MiB, reuse based on actual capacity, and release
+of completed/non-deferred buffers only before retrying an out-of-memory allocation;
+one-time reporting of auto-stubbed commands per service/command without broadening
+the existing response policy; heap commitment using progressively smaller physical
+blocks down to 2 MiB, with full rollback on partial failure and preserved virtual
+continuity.
+
+Run targeted tests with `bash tests-nx2/run-eglantine-three.sh` on the build server.
+Host validation does not reproduce the PS5 driver. No FPS/memory gain or fix for
+the black counter is claimed. BCn mip trimming is not imported.
+
+## Building
+
+All configuration and compilation, including shaders and C++ tests, run on the
+remote Linux build server, never on the Mac. Configure the SSH destination in a
+local file excluded from Git:
 
 ```sh
 mkdir -p .local
@@ -93,211 +130,207 @@ EDGLANTINE_REMOTE_ROOT=/tmp/edglantine-ps5-build
 CONFIG
 ```
 
-`build-server` est un alias d’exemple à remplacer par votre serveur Linux.
-Le répertoire distant doit contenir les dépendances préparées ; il est monté
-comme `/work` dans le conteneur. `build-remote.sh` y synchronise ce projet.
-Après compilation, `bash package-remote.sh` construit le dossier du titre,
-réutilise le binaire déjà compilé, vérifie l’isolation du paquet puis récupère l’archive dans
-`artifacts/`. Aucun de ces scripts ne contacte la console.
-`make install` est désactivé dans ce projet.
+`build-server` is an example alias; replace it with your Linux server.
+The remote directory must contain the prepared dependencies and is mounted as
+`/work` inside the container. `build-remote.sh` synchronizes this project there.
+After building, `bash package-remote.sh` creates the title directory, reuses the
+compiled binary, checks package isolation and retrieves the archive into
+`artifacts/`. Neither script contacts the console.
+`make install` is disabled in this project.
 
-Le cache source incorpore le hash du patch NX2 : modifier le patch recrée le cœur
-préparé et réapplique les patches PS5 avant de reconfigurer. Les dépendances et
-les flags sont ceux de ProsperoEden, épinglés dans `eden/tools/deps.json`.
-La copie de l'archive originale du wrapper est conservée dans `sources/`.
+The source cache includes the NX2 patch hash: changing the patch recreates the
+prepared core and reapplies the PS5 patches before reconfiguration. Dependencies
+and flags come from ProsperoEden and are pinned in `eden/tools/deps.json`.
+A copy of the original wrapper archive is retained in `sources/`.
 
-## Validation effectuée
+## Completed validation
 
-Le lien PS5 RADV/OpenGL, l'inventaire du paquet, les imports, l'alignement du SELF
-et l'identité indépendante passent. Les tests hérités de chargement, de mémoire,
-de JIT CPU, de diagnostic et de durée de vie des threads GPU ont passé après
-adaptation de leurs attentes aux six cœurs et aux nouveaux appels NX2.
-Les tests spécifiques vérifient les écritures différées concurrentes à six cœurs,
-les accès exclusifs, la présence du JIT MME NX2 avec son allocateur PS5 dans le binaire et l'isolation des chemins.
-Le test de réservation de 20 Gio avec 6 Mio réellement engagés utilise le backing
-Linux, pas les API mémoire d'une PS5.
+PS5 RADV/OpenGL linking, package inventory, imports, SELF alignment and separate
+title identity checks pass. Inherited loading, memory, CPU JIT, diagnostic and GPU
+thread lifecycle tests passed after their expectations were adapted to six cores
+and the new NX2 calls. Dedicated tests cover concurrent deferred writes across six
+cores, exclusive accesses, inclusion of the NX2 MME JIT and its PS5 allocator in
+the binary, and path isolation. The 20 GiB reservation test with 6 MiB actually
+committed uses Linux backing, not PS5 memory APIs.
 
-Les journaux de la version MME sont dans `artifacts/mme-jit/`. Le jalon graphique
-précède l'activation compute ; son patch est conservé dans `milestones/graphics-mme.diff`.
-Le journal `package.log` correspond au build final graphique + compute.
+MME build logs are in `artifacts/mme-jit/`. The graphics milestone predates compute
+activation; its patch is retained in `milestones/graphics-mme.diff`.
+`package.log` corresponds to the final graphics + compute build.
 
-## Correctifs Eglantine — 00.032.000
+## Eglantine fixes — 00.032.000
 
-Le pool du compilateur shader détruit maintenant chaque objet construit, et non
-son union de stockage vide (`59047f0`). Les registres indéfinis SPIR-V U1/U32
-produisent par défaut faux/zéro pour éviter les couleurs parasites observées
-sur AMD dans Eglantine (`bb35360`). Les autres types restent inchangés.
+The shader compiler pool now destroys each constructed object rather than its
+empty storage union (`59047f0`). Undefined SPIR-V U1/U32 registers default to
+false/zero to avoid the stray colors observed on AMD in Eglantine (`bb35360`).
+Other types are unchanged.
 
-Pour désactiver le correctif AMD sur PS5, créer le fichier vide
-`/data/eden-nx2/undef-zero-off.txt`, puis fermer et relancer entièrement
-l’application. Le supprimer et relancer réactive le correctif. L’environnement
-`EDEN_NX2_UNDEF_ZERO=0` permet aussi sa désactivation avant le démarrage.
-Le choix est figé pour le processus et journalisé. Les versions de cache Vulkan
-38 (actif) et 39 (désactivé) remplacent la version 37 ; changer de mode rejette
-l’ancien cache. Le sel du traducteur natif passe à `0x4f554e4345a00006`.
-Aucun gain mémoire/FPS ni correctif visuel PS5 n’est encore mesuré.
+To disable the AMD fix on PS5, create the empty file
+`/data/eden-nx2/undef-zero-off.txt`, then fully close and relaunch the application.
+Deleting it and relaunching re-enables the fix. Setting `EDEN_NX2_UNDEF_ZERO=0`
+before startup also disables it. The choice is fixed for the process and logged.
+Vulkan cache versions 38 (enabled) and 39 (disabled) replace version 37; switching
+modes rejects the old cache. The native translator salt becomes
+`0x4f554e4345a00006`. No memory/FPS gain or PS5 visual fix has yet been measured
+for this change.
 
-## Intégration Eglantine et gather — 00.008.000
+## Eglantine and gather integration — 00.008.000
 
-Référence Eglantine : `b40ad217ab829226841cb71f6e4c5cb05977a225`.
-Correction des suites de pages après remapping, rejet des caches Vulkan tronqués,
-notifications docké/portable NX2, métadonnées des dumps, décodage des seules couches
-ASTC modifiées et libération des gros scratch CPU. Le chemin ASTC réutilise notre
-suivi des pages ; `tex_partial=off` conserve le repli complet. La résidence sparse
-sélective et la génération d'images FSR3 ne sont pas activées.
+Eglantine reference: `b40ad217ab829226841cb71f6e4c5cb05977a225`.
+Fixes include page runs after remapping, rejection of truncated Vulkan caches,
+NX2 docked/handheld notifications, dump metadata, decoding only modified ASTC
+layers and releasing large CPU scratch buffers. The ASTC path reuses our page
+tracking; `tex_partial=off` retains the full-upload fallback. Selective sparse
+residency and FSR3 frame generation are not enabled.
 
-L'écriture atomique du cache était déjà présente dans le générateur PS5 ; elle
-est conservée, avec les nouvelles validations de lecture. Les tests RET du fork
-sont adaptés à nos contrôles de liaison existants, sans les assouplir.
-Voir [l'inventaire d'intégration](milestones/eglantine-update/README.md).
+Atomic cache writing was already present in the PS5 generator; it is retained
+alongside the new read validation. The fork's RET tests are adapted to our existing
+linkage checks without relaxing them. See the
+[integration inventory](milestones/eglantine-update/README.md).
 
-Le correctif gather et l'identification du PANIC vidéo sont coordonnés dans
+The gather fix and identification of the video PANIC are documented in
 [milestones/gather-panic/ANALYSIS.md](milestones/gather-panic/ANALYSIS.md).
-La requête Welcome Tour identifiée ensuite est H.264, et non VP8 ; son initialisation est corrigée depuis la .009.
+The subsequently identified Welcome Tour request is H.264, not VP8; its
+initialization has been fixed since .009.
 
-## Gestion sparse expérimentale — 00.006.000
+## Experimental sparse management — 00.006.000
 
-Le backend de couches sparse est intégré mais désactivé par défaut. L'opt-in
-`EDEN_NX2_SPARSE_LAYERS=1` utilise des allocations par couche, toutes résidentes
-avant publication, et des attentes GPU avant binding/libération. Les budgets
-sont de 64 Mio par image et 128 Mio cumulés ; les dispositions non prises en
-charge reviennent aux images classiques. En cas de fin GPU incertaine, les
-allocations sont conservées et l'erreur remonte, sans libération hasardeuse.
+The sparse-layer backend is integrated but disabled by default. Opting in with
+`EDEN_NX2_SPARSE_LAYERS=1` uses per-layer allocations, all resident before
+publication, and GPU waits before binding/release. Budgets are 64 MiB per image
+and 128 MiB in total; unsupported layouts fall back to ordinary images. If GPU
+completion is uncertain, allocations are retained and the error is propagated
+without unsafe release.
 
-Il n'y a pas encore d'éviction sélective des couches ni de gain mémoire mesuré.
-Voir `milestones/sparse-layers/README.md` pour les garanties, tests et limites.
+There is no selective layer eviction or measured memory gain yet.
+See `milestones/sparse-layers/README.md` for guarantees, tests and limitations.
 
-## Correctifs shaders — 00.005.000
+## Shader fixes — 00.005.000
 
-Les annulations de barrières et les sorties de boucle sont soumises à la preuve
-du chemin de sortie ; WARPSYNC doit correspondre à sa jonction. Les nouvelles
-formes déjà prises en charge (stores vectoriels RZ, cube-array LOD zéro, RED MIN)
-sont vérifiées par leur IR ou leur résultat, en conservant les variantes invalides.
-Voir `milestones/shader-fixes/ANALYSIS.md`. Aucun test shader n'est exclu.
+Barrier cancellation and loop exits require proof of the exit path; WARPSYNC must
+match its reconvergence point. Newly supported forms (RZ vector stores, zero-LOD
+cube-array sampling, RED MIN) are checked through their IR or results while
+retaining invalid variants. See `milestones/shader-fixes/ANALYSIS.md`.
+No shader tests are excluded.
 
-## Intégration Eden-NS2 — 00.004.000
+## Eden-NS2 integration — 00.004.000
 
-Révision importée : `e2f285ab1ecd3a2475c2ccad66f23b06b94ead5c` de
-`https://github.com/0x2593/Eden-NS2`. L'inventaire de fusion et les snapshots du
-prototype précédent sont dans `milestones/ns2/`.
+Imported revision: `e2f285ab1ecd3a2475c2ccad66f23b06b94ead5c` from
+[0x2593/Eden-NS2](https://github.com/0x2593/Eden-NS2). The merge inventory and
+previous prototype snapshots are in `milestones/ns2/`.
 
-Les changements du moteur incluent les shaders natifs, les descripteurs et buffers
-GPU, le streaming de textures et les transferts bornés, ainsi que leurs services
-NX2 associés (horloge invitée, audio, vidéo et superviseur graphique). Les frontends
-PC/Android et le changement Windows de `vfs_real.cpp` ne sont pas importés.
-Le décodeur AV1 libgav1 est épinglé à `c1deec657b32b911920c78e078cfd089faa77200`
-et utilise les mutex standard, sans exemples ni tests externes.
+Engine changes include native shaders, GPU descriptors and buffers, texture
+streaming and bounded transfers, and associated NX2 services (guest clock, audio,
+video and graphics supervisor). PC/Android frontends and the Windows change to
+`vfs_real.cpp` are not imported. The AV1 decoder libgav1 is pinned to
+`c1deec657b32b911920c78e078cfd089faa77200` and uses standard mutexes, with examples
+and external tests disabled.
 
-La génération des sources PS5 préserve les nouveaux chemins de pipelines différés
-et de regroupement des buffers. Le suivi des pages partielles est celui de NX2 :
-l'ancien suivi PS5 n'est pas superposé, pour ne pas décrémenter deux fois les comptes
-de pages. `tex_partial=off` force encore le repli vers les transferts complets ;
-les anciens compteurs/vérificateurs `tex_partial_check` ne mesurent plus ce chemin.
-Les seuils mémoire PS5 et les allocations natives sont conservés ; le repli PC
-vers une autre classe de mémoire hôte n'est pas activé. Le GPU split reste exclu.
+PS5 source generation preserves the new deferred-pipeline and buffer-batching
+paths. Partial-page tracking comes from NX2: the old PS5 tracker is not layered
+on top, preventing double decrements of page counts. `tex_partial=off` still
+forces full transfers; the old `tex_partial_check` counters/checkers no longer
+measure this path. PS5 memory thresholds and native allocations are preserved;
+the desktop fallback to another host-memory class is not enabled. GPU splitting
+remains excluded in this milestone.
 
-Six cœurs applicatifs invités conservent leur identité ; les cœurs virtuels 6, 7
-et 63 se traduisent vers le cœur système 3. L’ancien repli SVC modulo six a été retiré : il contredisait la table virtuelle,
-perdait le bit 63 et pouvait transformer un identifiant Switch 1 invalide en
-identifiant accepté. La validation porte sur les identifiants et masques originaux ;
-la conversion physique reste dans le noyau. Les limites de cœur et les unités
-d'horloge exposées aux processus hérités restent distinctes. Le test dédié vérifie
-les traductions et les files d'écritures des six cœurs sous ASan/UBSan.
+Six guest application cores retain their identities; virtual cores 6, 7 and 63
+map to system core 3. The old modulo-six SVC fallback was removed: it contradicted
+the virtual table, lost bit 63 and could turn an invalid Switch 1 identifier into
+an accepted one. Validation uses the original identifiers and masks; physical
+translation stays in the kernel. Core limits and clock units exposed to legacy
+processes remain distinct. A dedicated test checks translations and six-core
+write queues under ASan/UBSan.
 
-`tests-nx2/build-ns2-host.sh` compile les tests du moteur dans un build Linux séparé,
-avec une copie indépendante des sources préparées. Les tests masqués de captures
-commerciales ne sont pas activés. Cette validation hôte ne remplace pas une
-exécution sur PS5.
+`tests-nx2/build-ns2-host.sh` compiles engine tests in a separate Linux build using
+an independent copy of the prepared sources. Hidden commercial-capture tests are
+not enabled. Host validation does not replace execution on PS5.
 
-## Apports Eglantine dans 00.004.000
+## Eglantine contributions in 00.004.000
 
-Révision examinée : `6f5e137ec4eb83bbff9ea15f1ad1a8407cfc0cba`,
-`https://github.com/Djihads80/Eglantine`.
-Deux adaptations sont retenues : statistiques vides avant initialisation et
-notifications regroupées des grandes pages GPU (les petites pages l'étaient déjà).
-Le nettoyage QMD inspiré de `6e7edd7` a été rejeté : la suite native_semaphore
-montre qu'une suppression de l'historique fait rejouer un descripteur terminé
-sur une action 2. Le comportement Eden-NS2 conserve cet historique.
+Examined revision: `6f5e137ec4eb83bbff9ea15f1ad1a8407cfc0cba`,
+[Djihads80/Eglantine](https://github.com/Djihads80/Eglantine).
+Two adaptations are retained: empty statistics before initialization and batched
+large GPU-page notifications (small pages were already batched). QMD cleanup
+inspired by `6e7edd7` was rejected: the native_semaphore suite shows that deleting
+history replays a completed descriptor on action 2. Eden-NS2 preserves that history.
 
-Les tests dédiés exécutent les vraies méthodes de mise à jour des tables avec un
-backend enregistreur et le véritable ordonnanceur QMD sous ASan/UBSan : plages
-vides, inchangées, disjointes et longues ; conservation de l'historique
-de complétion et des dépendances. Ils ne simulent pas le pilote graphique.
+Dedicated tests execute the real table-update methods with a recording backend
+and the real QMD scheduler under ASan/UBSan: empty, unchanged, disjoint and long
+ranges; preservation of completion history and dependencies. They do not simulate
+the graphics driver.
 
-La piste de résidence sparse par couche est suivie dans [ROADMAP.md](ROADMAP.md).
-La résidence sélective correspondante reste à porter (les uploads ASTC par couche
-sont intégrés en 00.008) : ces modifications couplent l'allocateur Vulkan, les capacités du pilote, le suivi des blocs GPU
-et les uploads ASTC. Les chiffres PC publiés dans les commits ne sont pas des
-mesures PS5. Le split GPU, les adaptations MoltenVK et les changements du frontend
-SDL ne sont pas importés.
+Per-layer sparse residency is tracked in [ROADMAP.md](ROADMAP.md). Selective
+residency remains to be ported (per-layer ASTC uploads are integrated in 00.008):
+these changes couple the Vulkan allocator, driver capabilities, GPU block tracking
+and ASTC uploads. Desktop figures published in commits are not PS5 measurements.
+GPU splitting, MoltenVK adaptations and SDL frontend changes are not imported
+in this milestone.
 
-## Caches ARM et placement à six cœurs — 00.003.000
+## ARM caches and six-core placement — 00.003.000
 
-`eden/headless/cpu_policy.h` définit 256 Mio pour le cœur invité 0 et 96 Mio pour
-chacun des cœurs 1 à 5, pour ARM64 comme pour ARM32. Total : 736 Mio par architecture
-active, contre 688 Mio dans le prototype précédent (+48 Mio de capacité).
-Les instances hors des six cœurs restent à 16 Mio et le JIT nul à 8 Mio.
-L'allocateur existant conserve son allocation progressive lorsque le backend
-l'autorise. Ces budgets sont un point de départ, pas une optimisation mesurée sur jeu.
+`eden/headless/cpu_policy.h` sets 256 MiB for guest core 0 and 96 MiB for each of
+cores 1–5, for both ARM64 and ARM32. Total: 736 MiB per active architecture,
+compared with 688 MiB in the previous prototype (+48 MiB capacity). Instances
+outside the six cores remain at 16 MiB and the null JIT at 8 MiB. The existing
+allocator retains progressive allocation where supported by the backend. These
+budgets are a starting point, not an optimization measured in a game.
 
-Le placement sonde les CPU autorisés avec CPUID et vérifie chaque changement
-d'affinité. Il exige sept cœurs physiques distincts pour les six CPU invités et le
-GPU. Les tâches auxiliaires utilisent un cœur physique supplémentaire lorsqu'il
-est disponible, sinon les frères SMT des CPU invités ; le frère SMT du GPU est
-exclu. Les threads connus `HostTiming` et `VSyncThread` suivent aussi cette règle,
-même s'ils naissent sur un thread déjà épinglé.
+Placement probes allowed CPUs with CPUID and verifies each affinity change.
+It requires seven distinct physical cores for the six guest CPUs and GPU.
+Auxiliary tasks use an additional physical core if available, otherwise guest
+CPU SMT siblings; the GPU's SMT sibling is excluded. Known threads `HostTiming`
+and `VSyncThread` follow the same rule, even when created by an already pinned thread.
 
-Une topologie masquée, incohérente, insuffisante ou un refus de sonde laisse le
-placement au système. L'ancien test de temps sur seulement trois CPU ne sert plus
-à déduire une topologie complète. Si un pin individuel est refusé, le thread tente
-de reprendre le masque initial du processus. Aucune disposition matérielle de la
-console de l'utilisateur n'a été supposée ni interrogée.
+Hidden, inconsistent or insufficient topology, or a rejected probe, leaves
+placement to the OS. The old timing test on only three CPUs no longer infers a
+complete topology. If an individual pin is rejected, the thread attempts to
+restore the process's original mask. No hardware layout of the user's console
+was assumed or queried.
 
-Les journaux de cette version sont dans `artifacts/six-core-cpu/`. Les tests de
-`tools/check-worker-affinity.py` exécutent le code de production avec des API
-natives simulées : sept workers, permutations APIC/CPU, masques hérités, CPU
-supplémentaires, exclusion du frère GPU, refus et restauration vérifiée.
-Les contrôles des deux wrappers générés vérifient qu'ils utilisent la politique
-commune, tout en conservant le petit cache du JIT nul. Les diagnostics CPU ciblés
-acceptent maintenant les cœurs 0 à 5 et distinguent correctement le GPU (index 6).
+Logs for this version are in `artifacts/six-core-cpu/`.
+`tools/check-worker-affinity.py` executes production code with simulated native
+APIs: seven workers, APIC/CPU permutations, inherited masks, extra CPUs, exclusion
+of the GPU sibling, rejection and verified restoration. Checks of both generated
+wrappers ensure they use the common policy while retaining the small null-JIT
+cache. Targeted CPU diagnostics now accept cores 0–5 and identify the GPU separately
+(index 6).
 
-## Portage MME
+## MME port
 
-`core/src/video_core/macro_jit_ps5_allocator.h` utilise les fonctions de mémoire
-directe du port : une vue RW/NX et une vue RX. Le Xbyak déjà adapté conserve les
-adresses RX pour ses labels et tables de sauts, et écrit via la vue RW, y compris
-lors des agrandissements. Aucun repli vers un mmap desktop exécutable/écrivable.
-Chaque tampon est limité à 16 Mio ; le total des tampons est limité à 64 Mio,
-hors métadonnées et pages d'en-tête, en comptant les remplacements en cours.
+`core/src/video_core/macro_jit_ps5_allocator.h` uses the port's direct-memory
+functions: an RW/NX view and an RX view. The adapted Xbyak retains RX addresses
+for labels and jump tables and writes through the RW view, including during growth.
+There is no fallback to a writable/executable desktop mmap. Each buffer is limited
+to 16 MiB; all buffers together are limited to 64 MiB, excluding metadata and
+header pages and including replacements in progress.
 
-Un programme n'est publié qu'après sa génération et sa relocalisation complètes.
-Un refus d'allocation ou de mapping fait utiliser le chemin sans JIT pour cette
-génération de macros. Il n'y a pas de nouvelle tentative jusqu'à un changement de
-génération ou une nouvelle instance. Une erreur après le début de l'exécution
-reste une erreur : les commandes déjà émises ne sont pas rejouées.
-Le GPU reste propriétaire unique de l'exécution ; le split-front reste exclu.
+A program is published only after generation and relocation finish. Allocation
+or mapping failure selects the non-JIT path for that macro generation. It is not
+retried until a new generation or instance. An error after execution begins remains
+an error: already emitted commands are not replayed. The GPU remains the sole
+execution owner; split-front remains excluded in this milestone.
 
-`tests-nx2/run-mme.py` compile sur le dédié les tests différentiels contre
-l'interpréteur réel : arithmétique, branches/boucles, lectures de registres,
-écritures/lectures de RAM MME, callbacks, FIFO qui se réalloue, erreurs,
-AutoGrow avec table relocalisée, invalidation par génération, refus d'allocation
-et d'alias, limites et libération. Le backend de test utilise des mappings Linux
-RW/RX réels ; il ne simule pas l'exécution complète d'un jeu ni le matériel PS5.
+`tests-nx2/run-mme.py` compiles differential tests against the real interpreter
+on the dedicated server: arithmetic, branches/loops, register reads, MME RAM
+reads/writes, callbacks, reallocating FIFO, errors, AutoGrow with relocated tables,
+generation invalidation, allocation/alias rejection, limits and release. The test
+backend uses real Linux RW/RX mappings; it does not simulate full game execution
+or PS5 hardware.
 
-Le binaire avec symboles et sa carte de lien restent dans le cache isolé du dédié
-(`cache/ps5-eden-headless.c9cb1134b201/native-local/bin/`) pour un diagnostic futur.
+The symbol-bearing binary and link map remain in the dedicated server's isolated
+cache (`cache/ps5-eden-headless.c9cb1134b201/native-local/bin/`) for future diagnosis.
 
-## Limites
+## Limitations
 
-Compiler ne valide pas un jeu. Les services NX2 restent partiellement simulés et
-les stages graphiques non implémentés par le fork restent absents. Le layout invité
-réserve 12 Gio plus 8 Gio pour le serveur graphique ; le backing PS5 à la demande
-est conservé, mais la mémoire réellement occupée doit encore être mesurée sur la
-console. Les seuils du cache propres au pool partagé PS5 sont conservés.
-Le HUD hérité présente encore quatre colonnes de charge CPU ; le moteur, ses files
-et ses compteurs internes ont été adaptés à six cœurs.
+A successful build does not validate a game. NX2 services remain partly simulated,
+and graphics stages not implemented by the fork remain unavailable. The guest
+layout reserves 12 GiB plus 8 GiB for the graphics server; PS5 on-demand backing
+is retained, but actual memory use still needs measurement on the console.
+PS5 shared-pool cache thresholds are preserved. The inherited HUD still shows
+four CPU-load columns; the engine, its queues and internal counters have been
+adapted to six cores.
 
-Les fichiers du paquet ne doivent pas être copiés sur le titre de Botty ou de
-ProsperoEden. L'identité séparée PPSA99862 a été enregistrée sur la console. La mise à jour
-00.007.000 conserve cette inscription ; la fiche système peut encore indiquer
-00.006.000. Le paquet actif est désormais 00.031.000 ; consulter `prototype.json` pour le rollback conservé.
+Package files must only be installed under this project's separate title identity,
+`PPSA99862`. The 00.007.000 update preserved its registration; the system entry
+could still show 00.006.000. The earlier package record listed 00.031.000; consult
+`prototype.json` and the current status above for the installed version and retained rollback.

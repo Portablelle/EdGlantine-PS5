@@ -1,59 +1,59 @@
-# Prochaines étapes du prototype NX2 PS5
+# Next steps for the NX2 PS5 prototype
 
-## Résidence sparse des textures par couche — audit dédié réalisé
+## Per-layer sparse texture residency — dedicated audit completed
 
-Piste conservée pour un travail ultérieur.
-Aucun déploiement ni accès console n'est autorisé par cette note.
+This work is retained for a future task.
+This note does not authorize deployment or console access.
 
-Premier jalon réalisé : `experiments/sparse-textures/README.md`. Le pilote possède
-les bindings et annonce la résidence 2D, mais ne garantit pas les lectures à zéro
-des trous. Tests des routines RADV sous ASan/UBSan et bibliothèque de diagnostic
-cross-compilée PS5 réussis sur le dédié. Aucun chemin de résidence par couche
-n'est activé par défaut.
+First milestone completed: `experiments/sparse-textures/README.md`. The driver
+provides bindings and advertises 2D residency, but does not guarantee zero reads
+from holes. Tests of the RADV routines under ASan/UBSan and a PS5 cross-compiled
+diagnostic library passed on the dedicated server. No per-layer residency path
+is enabled by default.
 
-Deuxième jalon : 00.006.000 intègre le gestionnaire de couches, les budgets, la
-synchronisation et la quarantaine sur erreur. Il lie toutes les couches visibles
-avant publication. Voir `milestones/sparse-layers/README.md`. La priorité restante
-est la preuve des accès aux couches pour rendre possible une résidence sélective,
-puis des dépendances GPU plus fines ; aucun gain mémoire sélectif n'est encore revendiqué.
+Second milestone: 00.006.000 integrates the layer manager, budgets,
+synchronization and error quarantine. It binds all visible layers before
+publication. See `milestones/sparse-layers/README.md`. The remaining priority is
+to prove layer-access bounds to enable selective residency, then introduce finer
+GPU dependencies; no selective memory saving is claimed yet.
 
-Référence : [Eglantine](https://github.com/Djihads80/Eglantine), révision
-`6f5e137ec4eb83bbff9ea15f1ad1a8407cfc0cba`, notamment les commits `6380b66`,
-`97ce27a`, `940d44c` et `d4ee7fc`.
+Reference: [Eglantine](https://github.com/Djihads80/Eglantine), revision
+`6f5e137ec4eb83bbff9ea15f1ad1a8407cfc0cba`, particularly commits `6380b66`,
+`97ce27a`, `940d44c` and `d4ee7fc`.
 
-En 00.008, les uploads/décodages ASTC des couches modifiées sont intégrés sans
-résidence sélective ; voir `milestones/eglantine-update/README.md`.
+Version 00.008 integrates uploads/ASTC decoding of modified layers without
+selective residency; see `milestones/eglantine-update/README.md`.
 
-Objectif : éviter de réserver et de retransférer toutes les couches de grandes
-textures peu utilisées. Allouer les blocs GPU et les couches d'image à la demande,
-et ne redécoder que les couches ASTC modifiées. Gains PS5 non mesurés.
+Goal: avoid reserving and retransferring every layer of large, sparsely used
+textures. Allocate GPU blocks and image layers on demand, and decode only
+modified ASTC layers again. PS5 gains have not been measured.
 
-Travail possible sur le dédié, sans console :
+Work possible on the dedicated server without console access:
 
-1. Examiner le pilote RADV et la couche Vulkan épinglés dans le port : exposition
-   de sparseBinding, sparseResidencyImage2D, propriétés de résidence, formats
-   et queues compatibles avec vkQueueBindSparse.
-2. Comparer les chemins de mémoire GPU d'Eglantine à ceux d'Eden-NS2 déjà importés.
-   Définir un seul propriétaire pour le suivi des blocs, couches et pages modifiées.
-3. Prototyper derrière une option désactivée par défaut, avec détection des
-   capacités et repli vers les images ordinaires lorsque le format ou le pilote
-   ne permet pas cette résidence. Adapter les plafonds au pool partagé PS5.
-4. Tester les calculs de couches/mips, les blocs non engagés, les écritures et
-   remappages, les barrières, les échecs d'allocation et la libération après usage
-   GPU. Vérifier aussi les rendus vers ces images, pas uniquement leur lecture.
-5. Compiler et empaqueter une variante distincte sur le dédié ; conserver le
-   prototype validé pour comparaison et retour arrière.
+1. Inspect the port's pinned RADV driver and Vulkan layer: exposure of
+   sparseBinding, sparseResidencyImage2D, residency properties, formats and
+   queues compatible with vkQueueBindSparse.
+2. Compare Eglantine GPU-memory paths with the already imported Eden-NS2 paths.
+   Define a single owner for tracking modified blocks, layers and pages.
+3. Prototype behind a disabled-by-default option, with capability detection and
+   fallback to ordinary images when the format or driver does not support this
+   residency. Adapt limits to the PS5 shared pool.
+4. Test layer/mip calculations, uncommitted blocks, writes and remaps, barriers,
+   allocation failures and release after GPU use. Cover rendering into these
+   images as well as reads.
+5. Build and package a separate variant on the dedicated server; retain the
+   validated prototype for comparison and rollback.
 
-Validation matérielle ultérieure, seulement dans une tâche qui l'autorise :
-confirmer les capacités réellement exposées par le pilote, puis comparer mémoire
-engagée, volumes transférés, temps de trame, rendu et stabilité sur la même scène.
-Une compilation ou les mesures PC d'Eglantine ne suffisent pas à activer ce chemin
-par défaut sur PS5. Botty et son moteur Switch 1 restent hors du périmètre.
+Later hardware validation requires a task authorizing console access: confirm
+actual driver capabilities, then compare committed memory, transfer volumes,
+frame time, rendering and stability in the same scene. A successful build or
+Eglantine desktop measurements are not enough to enable this path by default
+on PS5. Legacy Switch 1 engine work remains out of scope.
 
-## Tests shaders Eden-NS2 — corrigés en 00.005.000
+## Eden-NS2 shader tests — fixed in 00.005.000
 
-Les onze cas ont été réconciliés : huit corrections de validation du contrôle de
-flux et trois attentes obsolètes remplacées par des vérifications sémantiques.
-La suite ciblée passe : 380 cas et 1 870 846 assertions. Voir `TEST-REPORT.md` et
-`milestones/shader-fixes/ANALYSIS.md`. La qualification graphique en jeu sur PS5
-reste à effectuer dans une tâche autorisant explicitement la console.
+All eleven cases were reconciled: eight control-flow validation fixes and three
+outdated expectations replaced with semantic checks. The targeted suite passes:
+380 cases and 1,870,846 assertions. See `TEST-REPORT.md` and
+`milestones/shader-fixes/ANALYSIS.md`. In-game graphics qualification on PS5
+remains to be performed in a task explicitly authorizing console access.

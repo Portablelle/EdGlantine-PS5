@@ -1,75 +1,77 @@
-# Welcome Tour : gather PerPx et PANIC 2001-0033
+# Welcome Tour: PerPx gather and PANIC 2001-0033
 
 ## Shader
 
-Capture PS5 00.007.000 : shader natif à 0x1f986ed200, instruction +0xc0,
-mots `040a7b63 33800408 041e2f08 100fc200`, refus à 5,495 s.
-Le champ 76..77 vaut 2 : PerPx, quatre décalages (x,y) signés stockés
-sur huit octets, dans deux registres. Coordonnées R4/R5, offsets R8/R9,
-sorties R10/R11 et R8/R9. Les sorties recouvrent les offsets.
+PS5 00.007.000 capture: native shader at 0x1f986ed200, instruction +0xc0,
+words `040a7b63 33800408 041e2f08 100fc200`, rejected at 5.495 s.
+Field 76..77 equals 2: PerPx, four signed (x,y) offsets stored in eight bytes
+across two registers. Coordinates R4/R5, offsets R8/R9, outputs R10/R11 and R8/R9.
+The outputs overlap the offsets.
 
-La traduction utilise Maxwell TLD4.PTP, émet d'abord les résultats dans
-R250..R253 puis les copie selon le masque dans les deux sorties. Le frontend
-lit des offsets signés de 8 bits pour les programmes natifs ; le comportement
-Maxwell historique à 6 bits reste inchangé. Le sel du cache natif est augmenté.
-Seul le mode 2D PerPx sans comparaison de profondeur ni sortie demi-précision
-est ajouté. Les autres variantes restent refusées.
+Translation uses Maxwell TLD4.PTP, first emitting results into R250..R253, then
+copying them according to the mask into the two outputs. The frontend reads
+signed 8-bit offsets for native programs; legacy Maxwell 6-bit behavior is
+unchanged. The native cache salt is incremented. Only 2D PerPx without depth
+comparison or half-precision output is added. Other variants remain rejected.
 
-Références primaires Mesa NAK, révision b1fe47e94409d81924c8663f58fac97e66ab4527 :
-- [sm70_encode.rs](https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa/+/b1fe47e94409d81924c8663f58fac97e66ab4527/src/nouveau/compiler/nak/sm70_encode.rs), OpTld4, bits76..78=PerPx.
-- [nak_nir_lower_tex.c](https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa/+/b1fe47e94409d81924c8663f58fac97e66ab4527/src/nouveau/compiler/nak_nir_lower_tex.c), packing des offsets TG4 et répartition coordonnées/src0, offsets/src1.
+Primary Mesa NAK references, revision b1fe47e94409d81924c8663f58fac97e66ab4527:
+
+- [sm70_encode.rs](https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa/+/b1fe47e94409d81924c8663f58fac97e66ab4527/src/nouveau/compiler/nak/sm70_encode.rs): OpTld4, bits76..78=PerPx.
+- [nak_nir_lower_tex.c](https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa/+/b1fe47e94409d81924c8663f58fac97e66ab4527/src/nouveau/compiler/nak_nir_lower_tex.c): TG4 offset packing and coordinates/src0, offsets/src1 placement.
 
 ## PANIC
 
-Capture : SetTerminateResult(0x4201), puis Break/PANIC à 20,416 s.
-`svc_results.h` définit Kernel/33 comme ResultNotImplemented (2001-0033).
-La pile remonte à main+0xaba0a0 : AbortImpl est appelé sur le résultat non nul
-retourné par l'initialisation d'un décodeur vidéo. Les imports ELF dynamiques
-présents dans le NSO identifient les branches InitializeH264/Av1/Vp8/Vp9Decoder.
-Les 423 WebM du RomFS de mise à jour sont tous marqués V_VP8.
+Capture: SetTerminateResult(0x4201), then Break/PANIC at 20.416 s.
+`svc_results.h` defines Kernel/33 as ResultNotImplemented (2001-0033).
+The stack leads to main+0xaba0a0: AbortImpl is called on the nonzero result
+returned by video-decoder initialization. Dynamic ELF imports in the NSO
+identify InitializeH264/Av1/Vp8/Vp9Decoder branches. All 423 WebM files in the
+update RomFS are tagged V_VP8.
 
-Dans le SDK du dump, InitializeVp8Decoder à 0x8a94ebd0 appelle le helper
-0x8a94f294. À 0x8a94f320..354, celui-ci forme une requête TIPC : en-tête0xd8,
-5 mots bruts, un handle copié, taille mémoire, codec4, format d'entrée et
-format de sortie. À 0x8a94f3b0 le résultat IPC est récupéré puis retourné si
-non nul. Ces adresses sont propres au chargement capturé (base sdk0x8a670000).
+In the dump's SDK, InitializeVp8Decoder at 0x8a94ebd0 calls helper 0x8a94f294.
+At 0x8a94f320..354, this helper forms a TIPC request: header0xd8, 5 raw words,
+one copied handle, memory size, codec4, input format and output format. At
+0x8a94f3b0 the IPC result is retrieved and returned if nonzero. These addresses
+belong to the captured load (sdk base0x8a670000).
 
-Le protocole du prototype décode ce paquet comme InitializeByTransferMemory,
-commande200, codec4. Son admission accepte AV1, H.264 et un chemin VP9, jamais
-VP8/codec4 ; le résultat est donc NotImplemented. Cela suggérait une lacune du décodage VP8 ; cette attribution précise est
-infirmée par la trace directe de 00.008 ci-dessous. La capture Info ne contient pas
-les paramètres IPC exacts de cette session : une trace d'erreur ciblée est
-ajoutée pour confirmer directement la requête refusée lors du prochain essai.
+The prototype protocol decodes this packet as InitializeByTransferMemory,
+command200, codec4. Its admission accepts AV1, H.264 and a VP9 path, never
+VP8/codec4, so it returns NotImplemented. This suggested missing VP8 decoding;
+that specific attribution is disproved by the direct 00.008 trace below. The
+Info capture does not contain the exact IPC parameters of this session; a
+targeted error trace is added to confirm the rejected request directly in the
+next run.
 
-Aucune réussite fictive n'est renvoyée, aucune vidéo n'est supprimée. Ajouter
-le backend VP8, sa configuration, ses sorties et des tests de décodage reste
-un chantier distinct. Les analyses NSO sont statiques, après décompression
-bornée et contrôle SHA256 des segments ; aucun code du jeu n'est exécuté sur Mac.
+No fake success is returned and no video is removed. Adding a VP8 backend,
+configuration, outputs and decoding tests remains separate work. NSO analysis
+is static, following bounded decompression and SHA256 segment checks; no game
+code executes on the Mac.
 
-## Validation et installation
+## Validation and installation
 
-Compilation PS5 sur `build-server` réussie. Tests gather : 3 cas, 5 541 assertions,
-tous réussis. Suite ciblée commune : 395 cas, 1 877 310 assertions, tous réussis.
-Le paquet commun 00.008.000 a été installé le 31 octobre 2026 : 70 fichiers
-vérifiés par SHA256 en transfert SELF brut, ancienne version 00.007.000
-conservée intégralement dans `/data/ps5-diag/nx2-rollback-007-20261031`.
-Le param.json actif confirme 00.008.000. Aucun lancement du jeu n'a été effectué
-après installation ; validation graphique sur console encore en attente.
-Botty, les données du jeu et les sauvegardes n'ont pas été modifiés.
+PS5 build on the build server passed. Gather tests: 3 cases, 5,541 assertions,
+all passed. Shared targeted suite: 395 cases, 1,877,310 assertions, all passed.
+The shared 00.008.000 package was installed on October 31, 2026: 70 files verified
+by SHA256 in raw SELF transfer mode; the complete previous 00.007.000 version
+was retained at `/data/ps5-diag/nx2-rollback-007-20261031`.
+Active param.json confirms 00.008.000. No game launch was performed after
+installation; console graphics validation remains pending. Game data and saves
+were unchanged.
 
-## Trace directe 00.008 : correction du diagnostic vidéo
+## Direct 00.008 trace: correcting the video diagnosis
 
-Le lancement utilisateur suivant charge bien 00.008.000. La capture de 44,9 s
-ne contient plus le rejet texture gather ni ExceptionRaised ; cela ne valide
-pas encore la justesse du rendu, toujours noir selon l’utilisateur.
-À 20,314502 s : commande 201, decoder=true, codec=0, input_format=3,
-output_format=2, output_mode=1, mémoire 0x1745b000, résultat 0x4201.
-SetTerminateResult et PANIC suivent à 20,317 s. Cette combinaison est rejetée
-par tous les chemins d’admission actuels, avant création du backend vidéo.
-Ce n’est pas la commande 200/codec4 du helper VP8 analysé auparavant.
-La présence de vidéos VP8 dans le RomFS ne prouve donc pas le codec de cette
-requête. Il faut établir la signification de commande201/codec0/input3 dans
-le SDK/protocole avant de choisir un backend ou modifier l’admission.
-Les images continuent d’être mises en file après le PANIC ; les compteurs de
-présentation ne prouvent pas que le jeu progresse. Capture privée :
-`backups/nx2-008-live-20261031/` du workspace ps5. Aucun changement console.
+The next user launch loads 00.008.000. The 44.9-second capture no longer contains
+the texture-gather rejection or ExceptionRaised; this does not yet validate
+rendering correctness, with a black image still reported by the user.
+At 20.314502 s: command 201, decoder=true, codec=0, input_format=3,
+output_format=2, output_mode=1, memory 0x1745b000, result 0x4201.
+SetTerminateResult and PANIC follow at 20.317 s. This combination is rejected
+by all current admission paths before creating the video backend. It is not
+command 200/codec4 from the previously analyzed VP8 helper. VP8 videos in RomFS
+therefore do not prove the codec of this request. The meaning of
+command201/codec0/input3 in the SDK/protocol must be established before choosing
+a backend or changing admission.
+
+Frames continue to be queued after the PANIC; presentation counters do not prove
+game progress. Private capture: `backups/nx2-008-live-20261031/` in the PS5
+workspace. No console changes.

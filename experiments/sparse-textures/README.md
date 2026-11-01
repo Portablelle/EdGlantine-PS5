@@ -1,100 +1,98 @@
-# Résidence sparse des textures : laboratoire PS5 NX2
+# Sparse texture residency: PS5 NX2 lab
 
-État : audit et tests host réussis sur `build-server`, bibliothèque de diagnostic
-cross-compilée PS5. **Pas d'intégration au moteur, pas d'activation sparse par
-couche, pas de déploiement.** Ce document décrit le jalon initial sur 00.005.000. Le gestionnaire intégré ensuite
-dans 00.006.000 est décrit par `../../milestones/sparse-layers/README.md` ; il
-utilise une résidence complète avant publication, sans dépendre de trous à zéro.
+Status: audit and host tests passed on the build server; diagnostic library
+cross-compiled for PS5. **No engine integration, no per-layer sparse activation,
+no deployment.** This document describes the initial 00.005.000 milestone.
+The manager later integrated in 00.006.000 is described in
+`../../milestones/sparse-layers/README.md`; it uses full residency before
+publication without relying on zero-filled holes.
 
-## Résultats vérifiés dans le pilote épinglé
+## Verified findings in the pinned driver
 
-RADV PS5 : `7b59ef27c1b09b9671bc4153c41940c3155c3af2`.
-Sources examinées : copie réellement préparée pour le build sous
-`/work/mihawk-vulkan-review/.deps/work/radv-src` sur le dédié.
-Les hashes des unités testées figurent dans
-`../../artifacts/sparse-audit/source-hashes.json`.
+PS5 RADV: `7b59ef27c1b09b9671bc4153c41940c3155c3af2`.
+Examined sources: the copy actually prepared for the build under
+`/work/mihawk-vulkan-review/.deps/work/radv-src` on the dedicated server.
+Hashes of tested units are in `../../artifacts/sparse-audit/source-hashes.json`.
 
-- Le winsys renseigne `has_sparse=true`, `has_sparse_cpu_binds=true` et
-  `has_sparse_prt=false`. RADV annonce `sparseBinding` et
-  `sparseResidencyImage2D` si les queues sparse ne sont pas désactivées.
-  Les familles graphics/compute exposent alors le bit de binding sparse.
-  Ce sont des conclusions du code épinglé, pas une interrogation de la PS5.
-- `shaderResourceResidency` et `residencyNonResidentStrict` restent faux.
-  Les plages non liées pointent vers un bloc physique partagé de 2 Mio,
-  initialement mis à zéro. Une écriture peut en changer le contenu : il ne
-  constitue donc pas une garantie de zéro pour les futures lectures de trous.
-- La granularité Vulkan 2D est exprimée en **texels** : 128×128 pour RGBA8,
-  256×256 pour BC3, soit 64 Kio par tuile dans les deux cas. Le bind convertit
-  ensuite les coordonnées BC en blocs compressés. Il ne faut pas réappliquer
-  le facteur 4 du format au résultat Vulkan dans ce pilote.
-- Le chemin GFX9+ sépare les couches puis les mips et utilise des mip tails par
-  couche. Les offsets/strides/taille réels restent à demander après création de
-  chaque image via ses sparse memory requirements ; ils ne se déduisent pas
-  seulement des dimensions ou du format.
-- Le mapping PS5 impose des multiples de 16 Kio. Les plages virtuelles sont
-  réservées par granules de 2 Mio, tandis que les bindings peuvent être plus fins.
-- Les bindings CPU attendent les sémaphores fournis avant de modifier les mappings.
-  Un mutex de soumission ne remplace pas l'attente de fin des travaux GPU utilisant
-  les anciens mappings.
-- Les binds ne sont pas transactionnels : un échec sur la seconde rangée peut
-  laisser la première liée. Même problème pour un unbind en plusieurs morceaux.
-  L'appelant ne peut pas déduire « aucun mapping modifié » d'un résultat d'échec.
+- The winsys sets `has_sparse=true`, `has_sparse_cpu_binds=true` and
+  `has_sparse_prt=false`. RADV advertises `sparseBinding` and
+  `sparseResidencyImage2D` when sparse queues are not disabled. Graphics/compute
+  families then expose the sparse-binding bit. These are findings from the
+  pinned source, not queries to the PS5.
+- `shaderResourceResidency` and `residencyNonResidentStrict` remain false.
+  Unbound ranges point to a shared physical 2 MiB block, initially zeroed.
+  Writes can change its contents, so it does not guarantee zero for later
+  reads from holes.
+- Vulkan 2D granularity is expressed in **texels**: 128×128 for RGBA8 and
+  256×256 for BC3, or 64 KiB per tile in both cases. Binding then converts BC
+  coordinates to compressed blocks. Do not apply the format's factor of 4
+  again to the Vulkan result in this driver.
+- The GFX9+ path separates layers, then mips, and uses per-layer mip tails.
+  Actual offsets/strides/sizes must still be queried from each image's sparse
+  memory requirements after creation; dimensions and format alone are insufficient.
+- PS5 mappings require multiples of 16 KiB. Virtual ranges are reserved in
+  2 MiB granules, while bindings can be finer.
+- CPU bindings wait for supplied semaphores before changing mappings. A submission
+  mutex does not replace waiting for GPU work that uses the old mappings.
+- Binds are not transactional: failure on the second row can leave the first bound.
+  Multi-part unbind has the same issue. A failure result does not imply that no
+  mappings changed.
 
-## Ce qui a été préparé
+## Prepared components
 
-`probe.c`/`probe.h` interrogent les capacités physiques, la famille choisie et le
-format avec les usages demandés. Le diagnostic distingue disponibilité physique
-et activation sur le device logique. Il n'alloue aucune image et ne soumet aucun
-travail. La demande expérimentale est explicite ; le cas désactivé est testé.
-Pour le premier design qui suppose des trous lisibles à zéro, le diagnostic
-bloque lorsque `residencyNonResidentStrict` est faux. Ce n'est pas une affirmation
-que tout usage sparse du pilote serait interdit : un design garantissant des
-accès uniquement à des sous-ressources résidentes doit être étudié séparément.
+`probe.c`/`probe.h` query physical capabilities, the selected family and the
+format with the requested usages. Diagnostics distinguish physical availability
+from logical-device enablement. They allocate no images and submit no work.
+The experimental request is explicit; the disabled case is tested. For the first
+design, which assumes holes read as zero, the probe blocks when
+`residencyNonResidentStrict` is false. This does not mean every sparse use of the
+driver is forbidden: a design guaranteeing access only to resident subresources
+must be studied separately.
 
-`extract-driver.py` extrait les fonctions de production des unités RADV, sans
-réécrire leur algorithme. Le harness remplace le device, le winsys et les appels
-système par des mocks qui enregistrent les mappings et injectent les erreurs.
-Les tests exécutent les calculs et l'ordre des appels réels, sous ASan/UBSan :
+`extract-driver.py` extracts production functions from RADV units without rewriting
+their algorithms. The harness replaces the device, winsys and system calls with
+mocks that record mappings and inject errors. Tests execute the actual calculations
+and call order under ASan/UBSan:
 
-- granularités RGBA8 et BC3 ; offsets de couche et de mip ; tuiles de bord ;
-- plusieurs rangées, mip tail opaque et unbind ;
-- attente avant mapping et refus de mapper si l'attente échoue ;
-- erreur après un premier bind et un premier morceau d'unbind ;
-- alignement PS5, débordements de plages et indisponibilité du bloc partagé ;
-- diagnostic désactivé, fonctionnalités non activées, queue/format refusés,
-  absence de garantie de zéro, listes dépassant les bornes du diagnostic.
+- RGBA8 and BC3 granularities; layer and mip offsets; edge tiles;
+- multiple rows, opaque mip tail and unbind;
+- wait before mapping and refusal to map if the wait fails;
+- error after an initial bind and an initial unbind segment;
+- PS5 alignment, range overflow and unavailable shared block;
+- disabled diagnostics, features not enabled, rejected queue/format, no zero-read
+  guarantee and lists exceeding diagnostic bounds.
 
-Tous passent. `run-dedicated.sh` compile aussi `probe.c` avec `prospero-clang`
-et crée `libnx2-sparse-probe.ps5.a`. Ce fichier est une bibliothèque de diagnostic,
-**pas un ELF à lancer ni une nouvelle version de l'émulateur**. Il n'est lié à
-aucun paquet existant. Les tests n'exécutent ni le GPU ni les API mémoire PS5.
-Journal et artefacts : `../../artifacts/sparse-audit/`.
+All pass. `run-dedicated.sh` also compiles `probe.c` with `prospero-clang` and
+creates `libnx2-sparse-probe.ps5.a`. This is a diagnostic library, **not an ELF
+to launch or a new emulator version**. It is not linked into any existing package.
+The tests execute neither GPU work nor PS5 memory APIs.
+Logs and artifacts: `../../artifacts/sparse-audit/`.
 
-## Prochaine tranche de portage
+## Next porting stage
 
-1. Ajouter un planificateur par image/couche à partir des vrais requirements :
-   granularité, alignement, memoryTypeBits, mip tails individuels ou partagés,
-   metadata et tailles vérifiées sans débordement. Prévoir des plafonds globaux
-   adaptés au pool partagé PS5 ; ne pas copier les budgets PC par image.
-2. Choisir une sémantique sûre pour les trous. Sans PRT strict, garder l'image
-   classique par défaut. Étudier des vues limitées aux couches résidentes et
-   rendre résidentes toutes les destinations avant transfert, ASTC compute ou
-   rendu. Les échantillonnages et filtrages pouvant franchir une limite doivent
-   également être couverts ; une simple liste de couches écrites ne suffit pas.
-3. Gérer explicitement le cycle alloué → partiellement lié → lié → en usage →
-   retiré → délié → libéré. En cas d'échec partiel, conserver les allocations
-   susceptibles de rester mappées jusqu'à récupération prouvée ou destruction
-   contrôlée du device. Le `roll_back()` d'Eglantine qui libère après échec de
-   BindSparse ne peut pas être copié tel quel.
-4. Synchroniser les anciens utilisateurs GPU, le bind, puis les uploads/décodages
-   et les nouveaux lecteurs. Traiter aussi les autres queues. Tester remappage,
-   destruction et erreurs de fence ; `submit_mutex` seul ne suffit pas.
-5. Relier le propriétaire de résidence au tracker NX2 déjà importé, sans doubler
-   les notifications de pages. Une fois ces invariants couverts sur le dédié,
-   intégrer derrière une option désactivée et compiler une variante distincte.
+1. Add a per-image/layer planner based on actual requirements: granularity,
+   alignment, memoryTypeBits, individual/shared mip tails, metadata and sizes
+   checked for overflow. Define global limits suitable for the PS5 shared pool;
+   do not copy desktop per-image budgets.
+2. Choose safe hole semantics. Without strict PRT, retain ordinary images by
+   default. Study views restricted to resident layers and make every destination
+   resident before transfers, ASTC compute or rendering. Sampling and filtering
+   that can cross a boundary must also be covered; a list of written layers alone
+   is insufficient.
+3. Explicitly manage the allocated → partially bound → bound → in use → retired →
+   unbound → freed lifecycle. On partial failure, retain allocations that may
+   remain mapped until recovery is proven or the device is destroyed in a
+   controlled manner. Eglantine's `roll_back()`, which frees after BindSparse
+   failure, cannot be copied unchanged.
+4. Synchronize old GPU users, binding, then uploads/decoding and new readers.
+   Cover other queues too. Test remapping, destruction and fence failures;
+   `submit_mutex` alone is insufficient.
+5. Connect the residency owner to the already imported NX2 tracker without
+   duplicating page notifications. Once these invariants are covered on the
+   dedicated server, integrate behind a disabled option and build a separate variant.
 
-Aucune modification des flags de capacités du pilote n'est nécessaire à ce stade.
-Forcer PRT/strict à true sans implémentation créerait une fausse promesse.
-La validation ultérieure sur console devra confirmer les requêtes réelles,
-les données lues après bind/remap, les barrières et le rendu sous pression mémoire.
-Elle nécessite une tâche autorisant explicitement la console.
+No driver capability flags need changing at this stage. Forcing PRT/strict to
+true without implementation would create a false guarantee. Later console
+validation must confirm actual queries, data read after bind/remap, barriers
+and rendering under memory pressure. It requires a task explicitly authorizing
+console access.

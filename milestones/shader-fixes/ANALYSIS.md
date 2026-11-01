@@ -1,53 +1,51 @@
-# Analyse des onze échecs shaders — prototype NX2
+# Analysis of eleven shader failures — NX2 prototype
 
-Périmètre : prototype indépendant PPSA99862, sources Eden-NS2 épinglées à
-`e2f285ab1ecd3a2475c2ccad66f23b06b94ead5c`. Compilation et tests sur `build-server`.
+Scope: separate PPSA99862 prototype, Eden-NS2 sources pinned to
+`e2f285ab1ecd3a2475c2ccad66f23b06b94ead5c`. Builds and tests run on the build server.
 
-## Huit cas de contrôle de flux
+## Eight control-flow cases
 
-Six tests d'annulation de barrières échouaient : sortie de portée interne,
-annulation de deux barrières, conservation des parents, deux chemins de nettoyage
-séparés et annulation interne à une jonction parent.
-Le raccourci de BREAK acceptait l'annulation dès qu'une portée SYNC englobante
-existait, avant la preuve du chemin de sortie. Il acceptait donc des variantes
-qui changeaient le prédicat ou revenaient vers une portée annulée. Pour deux
-BREAK consécutifs, il ignorait le premier sans enregistrer la chaîne validée :
-le second était ensuite confronté au mauvais jeton interne et rejeté.
-Suppression de ce raccourci : les preuves existantes du chemin linéaire ou du
-chemin de contrôle s'exécutent, puis marquent ensemble les annulations validées.
-Les tests suivent toujours les deux branches du CFG Maxwell et vérifient les
-jonctions, les nettoyages, la terminaison et les chemins qui ne doivent pas être
-visités. Les variantes négatives sont conservées.
+Six barrier-cancellation tests failed: leaving an inner scope, cancelling two
+barriers, preserving parents, two separate cleanup paths and inner cancellation
+at a parent reconvergence point. The BREAK shortcut accepted cancellation as soon
+as an enclosing SYNC scope existed, before proving the exit path. It therefore
+accepted variants that changed the predicate or returned to a cancelled scope.
+For two consecutive BREAKs, it ignored the first without recording the validated
+chain; the second then encountered the wrong inner token and was rejected.
 
-Le raccourci CALL.REL.NOINC qui saute une branche arrière contournait également
-la preuve du nettoyage d'une portée active. Il est désormais limité aux boucles
-sans portée, ou au cas déjà explicite d'une jonction immédiate. Dans une portée,
-le contrôle existant du nettoyage exclut les retours en arrière, les sorties de
-portée et les formes de nettoyage non prouvées.
+Removing this shortcut lets the existing linear-path or control-path proofs run,
+then mark the validated cancellations together. Tests still follow both branches
+of the Maxwell CFG and check reconvergence, cleanup, termination and paths that
+must not be visited. Negative variants are retained.
 
-Enfin, WARPSYNC après BSYNC pouvait devenir un NOP lorsque la cible BSSY ne
-correspondait pas à cette jonction. Cette incohérence est rejetée. Le chemin
-valide conserve sa barrière mémoire ; les trois jetons testés restent couverts.
+The CALL.REL.NOINC shortcut that skips a backward branch also bypassed proof of
+active-scope cleanup. It is now restricted to loops without a scope or the already
+explicit case of immediate reconvergence. Inside a scope, the existing cleanup
+check excludes backward jumps, scope exits and unproven cleanup forms.
 
-Ces corrections rendent la traduction plus conservatrice pour les chemins dont
-la validité n'est pas prouvée. Elles n'établissent pas à elles seules la sémantique
-de toutes les formes de contrôle Ampere ni la compatibilité d'un jeu complet.
+Finally, WARPSYNC after BSYNC could become a NOP when the BSSY target did not match
+that reconvergence point. This inconsistency is rejected. The valid path retains
+its memory barrier; all three tested tokens remain covered.
 
-## Trois attentes négatives devenues obsolètes
+These fixes make translation more conservative for paths whose validity has not
+been proved. They do not, by themselves, establish the semantics of all Ampere
+control-flow forms or full-game compatibility.
 
-- AST vectoriel depuis RZ : le traducteur scalarise déjà les composantes pour
-  éviter un débordement du numéro de registre. Le test vérifie maintenant les
-  deux, trois et quatre attributs consécutifs et leur lecture de RZ dans l'IR.
-- TEX cube-array LOD zéro : le chemin TEX général produit déjà un échantillonnage
-  à LOD explicite nul. Le test vérifie le type cube-array, le descripteur, le LOD,
-  les quatre coordonnées et les copies RGBA vers les destinations séparées.
-  L'autre variante négative, registre source mal aligné, est conservée.
-- RED.E.MIN U32 : le bit modifié sélectionnait MIN, déjà traduit, et non une
-  instruction invalide. Le test exécute maintenant MIN et MAX pour 25 couples
-  de valeurs chacun, dont les limites signées/non signées, en contrôlant le
-  pointeur 64 bits, la mémoire voisine et tous les registres/prédicats.
-  Le pointeur impair et les bits de mode invalides restent rejetés.
+## Three outdated negative expectations
 
-Aucun des onze cas n'est exclu par un filtre et aucun test n'est marqué en échec
-attendu. Les résultats définitifs et les limites de validation figurent dans
-`TEST-REPORT.md` à la racine du prototype.
+- Vector AST from RZ: the translator already scalarizes components to avoid
+  register-number overflow. The test now checks two, three and four consecutive
+  attributes and their RZ reads in the IR.
+- Zero-LOD cube-array TEX: the general TEX path already emits an explicit zero-LOD
+  sample. The test checks cube-array type, descriptor, LOD, all four coordinates
+  and RGBA copies to separate destinations. The other negative variant, an
+  unaligned source register, is retained.
+- RED.E.MIN U32: the changed bit selected MIN, which was already translated,
+  rather than an invalid instruction. The test now executes MIN and MAX for
+  25 value pairs each, including signed/unsigned boundaries, checking the 64-bit
+  pointer, neighboring memory and every register/predicate. Odd pointers and
+  invalid mode bits remain rejected.
+
+None of the eleven cases is filtered out, and no test is marked as an expected
+failure. Final results and validation limits are in `TEST-REPORT.md` at the
+prototype root.
