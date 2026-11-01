@@ -6,7 +6,8 @@ scenarios, but performance, rendering correctness and stability still need work.
 
 **Contributors welcome.** The latest reported gameplay result is **21 FPS** on
 version **00.063.000**. A stable **30 FPS has not been achieved** in that test.
-The newer **00.064.000** build is installed and awaiting performance feedback.
+The newer **00.064.000** build has also been tested on PS5, with a profiling capture
+retrieved; its FPS has not been separately confirmed in the recorded results.
 Help with profiling, CPU/GPU optimization, memory synchronization and PS5 testing
 would make a real difference. See [Contributing](#contributing) below.
 
@@ -15,7 +16,10 @@ would make a real difference. See [Contributing](#contributing) below.
 - **Latest build: 00.064.000.** Shares CPU preparation of texture tables and sampled
   descriptors within each stage. It preserves the .063 page batching, memory-owner
   and texture-stride fixes. The build and targeted tests passed on the build server;
-  console FPS, rendering and cache-hit results are still pending.
+  the user also confirmed testing on PS5. The 20.093-second console capture records
+  8.492 seconds of CPU draw configuration and 54,383,256 sampled-descriptor cache
+  hits out of 54,861,363 requests. Texture-table counters remained at zero. A
+  separately confirmed FPS result and full rendering validation are not recorded.
 - **Performance reference: .063 at 21 FPS** during gameplay with GPU splitting
   disabled. This is one observed result, not a compatibility benchmark or a
   guarantee for other games or scenes. Rendering quality was not specified for
@@ -31,8 +35,8 @@ would make a real difference. See [Contributing](#contributing) below.
   did not resolve it. No performance gain from splitting is established.
 - **Validation limits:** targeted host tests and native build checks pass for recent
   changes, but do not establish broad game compatibility, long-session stability
-  or correct rendering on PS5. The latest optimization still needs a controlled
-  before/after measurement on the console.
+  or correct rendering on PS5. The .063/.064 captures may differ in scene activity, so they do not establish
+  an isolated FPS gain from the latest optimization.
 
 The current focus is to reduce CPU draw preparation and redundant transfers while
 preserving memory correctness, and to diagnose the split-mode freeze before

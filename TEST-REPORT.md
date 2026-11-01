@@ -10,8 +10,19 @@ No state retained across stages/draws; splitting remains disabled by default.
 Focused build-server ASan/UBSan test: PASS. Real reference/optimized function and
 actual table block extracted. Parameters, edge cases, errors, mapping, collisions
 and a fresh call covered, with fake backends; pixels/RADV not validated by this test.
-NX2_RESOURCE_MEMO counters added. Console FPS/rendering/hits remain to be measured
-against the 21 FPS reference. No commit/push/Cubic.
+NX2_RESOURCE_MEMO counters added. The user confirmed testing .064 on PS5.
+Console capture: 20.093 s, CPU draw configuration 8.492 s, including cfg_desc
+3.413 s and cfg_read 2.965 s; push_images 0.723 s. These wall-time counters are
+nested and must not be added. Sampled-descriptor memo: 54,861,363 requests,
+54,383,256 hits; texture-table counters: zero requests/hits.
+The capture records 21 FPS as an assumption, not a separately confirmed user result.
+The .063 reference remains 21 FPS. Different scene activity limits the comparison;
+no isolated FPS gain or complete rendering validation is established.
+Frontend frame dimensions are 1920x1080, with queued output and driver videoout at
+3840x2160. The 1080p intermediate is also present in .063 logs and is a plausible
+contributor to pixelation, not proof of every internal scene resolution or a .064
+regression. Measurement: artifacts/profile-064/measurement.json.
+No commit/push/Cubic during the implementation and installation.
 Details: artifacts/profile-064/CHANGE.md.
 
 ---
