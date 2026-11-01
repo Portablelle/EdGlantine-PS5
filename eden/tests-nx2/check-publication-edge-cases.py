@@ -39,22 +39,19 @@ struct Source{u64 handle,offset,size;};
 struct Entry{bool dirty=true;std::vector<Source> sources;};
 struct MultiRangeBufferCache{
  std::unordered_map<u64,Entry> entries;
- void MarkGathered(u64);void InvalidateSource(VkBuffer,VkDeviceSize,VkDeviceSize);
+ void MarkGathered(u64);
 };
-'''+method('MarkGathered')+method('InvalidateSource')+r'''
+'''+method('MarkGathered')+r'''
 int main(){
  MultiRangeBufferCache cache;cache.entries[1]={true,{{7,0,4}}};
  unsigned source=17,gathered=0,copies=0;
  auto bind=[&]{if(cache.entries[1].dirty){gathered=source;++copies;cache.MarkGathered(1);}return gathered;};
  assert(bind()==17);
  source=29;
-#ifdef EDEN_NX2_PS5_PROTO
- cache.InvalidateSource(7,0,4);
-#endif
  assert(bind()==29);assert(bind()==29);
  assert(copies==3);
  // A pending output is invalidated before binding, then written by the draw.
- cache.InvalidateSource(7,0,4);assert(bind()==29);
+ assert(bind()==29);
  source=41;assert(bind()==41);
  std::puts("GATHER_REUSE_OK: source mutation stays coherent, platform policy respected");
 }

@@ -58,7 +58,7 @@
     "RET R0/R55 regression tests adapted to existing strict return linkage validation"
   ],
   "hostSuiteValidated": false,
-  "nx2PatchSha256": "d3e7cd62227155655e408972b041a5b8464ffce8c9e06404e3d7791a8fe0fb59",
+  "nx2PatchSha256": "15e53d9c6e330c48474ce405fb4e18443ffda9e0817da77a5e0566069438244c",
   "rejectedAdaptations": [
     "QMD history eviction: replays completed descriptors on action 2; regression caught by native_semaphore test"
   ],
@@ -567,7 +567,8 @@
       "Exercise observer write failure on an accepted regular file using ENOSPC injection.",
       "Move profiling orchestration out of shared performance and use subsystem-owned reports.",
       "Apply resolved shadow registers without an externally controlled observation bypass.",
-      "Label gathered-reuse measurements as historical; reuse is disabled in current sources."
+      "Label gathered-reuse measurements as historical; reuse is disabled in current sources.",
+      "Remove source-range retention and invalidation scans made ineffective by conservative gathers."
     ],
     "nativeTranslatorSalt": "0x4f554e4345a00007"
   }

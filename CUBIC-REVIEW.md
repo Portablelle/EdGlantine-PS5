@@ -73,6 +73,12 @@ interpreter comparisons, checking command offsets, replacement attributes and st
 restoration. It does not validate Vulkan driver execution or pixels. Gathered-view
 reuse metadata now clearly labels its earlier measurements as historical.
 
+Review disposition: the suggestion to move the optional observer into a separate
+class is deferred as a structural improvement, not a demonstrated runtime defect.
+Its output failures, thread-creation failures, shutdown and FIFO rejection are
+covered by targeted tests. Obsolete source-range retention and invalidation scans
+were removed because the conservative gather policy makes them ineffective.
+
 These source fixes postdate the PS5-tested .064 package and have not been installed
 on the console. The 21 FPS result applies to that previously installed package.
 

@@ -53028,7 +53028,7 @@ index 27ca531..8e46efa 100644
  
  } // namespace Vulkan
 diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
-index 1a33189..592ccd5 100644
+index 1a33189..7fb1f69 100644
 --- a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
 +++ b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
 @@ -1,3 +1,4 @@
@@ -53054,14 +53054,13 @@ index 1a33189..592ccd5 100644
      scheduler.Finish();
  }
  
-@@ -446,12 +451,40 @@ bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
+@@ -446,12 +451,36 @@ bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,
      return can_use_upload_cmdbuf;
  }
  
 +#ifdef EDEN_NX2_PS5_PROTO
 +void BufferCacheRuntime::MarkBufferWritten(const Buffer& buffer, u64 offset, u64 size) {
 +    scheduler.BeforeNativeBufferWrite(buffer.Handle(), offset, size);
-+    multi_range_buffers.InvalidateSource(buffer.Handle(), offset, size);
 +}
 +#endif
 +
@@ -53079,9 +53078,6 @@ index 1a33189..592ccd5 100644
          return;
      }
 +#ifdef EDEN_NX2_PS5_PROTO
-+    for (const auto& copy : copies) {
-+        multi_range_buffers.InvalidateSource(dst_buffer, copy.dst_offset, copy.size);
-+    }
 +    bool overlaps_snapshot = false;
 +    for (const auto& copy : copies)
 +        overlaps_snapshot |= scheduler.HasNativeSnapshotConflict(dst_buffer, copy.dst_offset, copy.size);
@@ -53095,18 +53091,17 @@ index 1a33189..592ccd5 100644
      static constexpr VkMemoryBarrier READ_BARRIER{
          .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
          .pNext = nullptr,
-@@ -519,6 +552,10 @@ void BufferCacheRuntime::PostCopyBarrier() {
+@@ -519,6 +548,9 @@ void BufferCacheRuntime::PostCopyBarrier() {
  }
  
  void BufferCacheRuntime::ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t size, u32 value) {
 +#ifdef EDEN_NX2_PS5_PROTO
 +    scheduler.BeforeNativeBufferWrite(dest_buffer, offset, size);
-+    multi_range_buffers.InvalidateSource(dest_buffer, offset, size);
 +#endif
      if (dest_buffer == VK_NULL_HANDLE) {
          return;
      }
-@@ -545,7 +582,92 @@ void BufferCacheRuntime::ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t si
+@@ -545,7 +577,92 @@ void BufferCacheRuntime::ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t si
      });
  }
  
@@ -54306,22 +54301,21 @@ index be5a114..19dd39b 100644
          // Fast check: already reached the requested tick?
          if (gpu_tick.load(std::memory_order_acquire) >= tick) {
 diff --git a/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp b/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp
-index 4d84390..ccfe96a 100644
+index 4d84390..f6f343e 100644
 --- a/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp
 +++ b/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp
-@@ -277,6 +277,11 @@ MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& schedu
+@@ -277,6 +277,10 @@ MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& schedu
          entry.gathered = memory_allocator.CreateBuffer(gather_ci, MemoryUsage::DeviceLocal);
          entry.dirty = true;
      }
 +    // Gathered entries need the same owner lifetime and write tracking as sparse views.
-+    entry.sources.assign(sources.begin(), sources.end());
 +    if (entry.owners.empty()) {
 +        for (const auto& source : sources) entry.owners.push_back(source.handle);
 +    }
      if (device.IsBufferDeviceAddressSupported()) {
          VkBuffer address_handle = *entry.sparse_handle;
          if (!entry.sparse_handle) {
-@@ -302,9 +307,10 @@ MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& schedu
+@@ -302,9 +306,10 @@ MultiRangeRef MultiRangeBufferCache::Get(const Device& device, Scheduler& schedu
  }
  
  void MultiRangeBufferCache::MarkGathered(u64 key) {
@@ -54335,48 +54329,14 @@ index 4d84390..ccfe96a 100644
  }
  
  void MultiRangeBufferCache::DropOwner(Scheduler& scheduler, VkBuffer owner) {
-@@ -329,6 +335,20 @@ void MultiRangeBufferCache::DropOwner(Scheduler& scheduler, VkBuffer owner) {
+@@ -329,6 +334,7 @@ void MultiRangeBufferCache::DropOwner(Scheduler& scheduler, VkBuffer owner) {
      }
  }
  
-+void MultiRangeBufferCache::InvalidateSource(VkBuffer owner, VkDeviceSize offset, VkDeviceSize size) {
-+    if (owner == VK_NULL_HANDLE || size == 0) return;
-+    for (auto& [key, entry] : entries) {
-+        if (entry.dirty) continue;
-+        for (const auto& source : entry.sources) {
-+            if (source.handle != owner || source.size == 0) continue;
-+            // Subtraction avoids overflowing range endpoints (including VK_WHOLE_SIZE).
-+            const bool overlaps = offset <= source.offset ? source.offset - offset < size
-+                                                         : offset - source.offset < source.size;
-+            if (overlaps) { entry.dirty = true; break; }
-+        }
-+    }
-+}
 +
  void MultiRangeBufferCache::Invalidate(u64 key) {
      if (auto const it = entries.find(key); it != entries.end()) {
          it->second.dirty = true;
-diff --git a/src/video_core/renderer_vulkan/vk_multi_range_buffer.h b/src/video_core/renderer_vulkan/vk_multi_range_buffer.h
-index f40d3aa..dc6b022 100644
---- a/src/video_core/renderer_vulkan/vk_multi_range_buffer.h
-+++ b/src/video_core/renderer_vulkan/vk_multi_range_buffer.h
-@@ -57,6 +57,8 @@ public:
- 
-     void Invalidate(u64 key);
- 
-+    void InvalidateSource(VkBuffer owner, VkDeviceSize offset, VkDeviceSize size);
-+
-     void DropOwner(Scheduler& scheduler, VkBuffer owner);
- 
-     VkDeviceSize block_size{DEFAULT_BLOCK_SIZE};
-@@ -73,6 +75,7 @@ private:
-         vk::Buffer gathered;
-         SparseBuffer sparse_handle;
-         std::vector<VkBuffer> owners;
-+        std::vector<MultiRangeSource> sources;
-         VkDeviceAddress address{};
-         VkDeviceSize size{};
-         u64 geometry{};
 diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
 index 5e057dd..ee13962 100644
 --- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
