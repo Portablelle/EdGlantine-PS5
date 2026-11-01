@@ -43405,12 +43405,13 @@ index 0000000..4b721a0
 +} // namespace VideoCommon
 diff --git a/src/video_core/buffer_cache/readback_statistics.h b/src/video_core/buffer_cache/readback_statistics.h
 new file mode 100644
-index 0000000..52af21a
+index 0000000..b150bd4
 --- /dev/null
 +++ b/src/video_core/buffer_cache/readback_statistics.h
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,21 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +#pragma once
++#include <cstdio>
 +#include <atomic>
 +#include <cstdint>
 +namespace VideoCommon::ReadbackStatistics {
@@ -43419,6 +43420,15 @@ index 0000000..52af21a
 +inline void Count(std::atomic<std::uint64_t>& counter, std::uint64_t amount = 1) {
 +    if (enabled.load(std::memory_order_relaxed)) counter.fetch_add(amount, std::memory_order_relaxed);
 +}
++inline void Report(long long now) {
++            namespace Stats = VideoCommon::ReadbackStatistics;
++            std::fprintf(stderr, "NX2_READBACK_CACHE mono_ns=%lld hits=%llu misses=%llu fills=%llu bytes=%llu evictions=%llu invalidations=%llu clears=%llu\n", now,
++                static_cast<unsigned long long>(Stats::hits.load()), static_cast<unsigned long long>(Stats::misses.load()),
++                static_cast<unsigned long long>(Stats::fills.load()), static_cast<unsigned long long>(Stats::bytes.load()),
++                static_cast<unsigned long long>(Stats::evictions.load()), static_cast<unsigned long long>(Stats::invalidations.load()),
++                static_cast<unsigned long long>(Stats::clears.load()));
++}
++
 +}
 diff --git a/src/video_core/buffer_cache/storage_buffer_size.h b/src/video_core/buffer_cache/storage_buffer_size.h
 new file mode 100644
@@ -45467,7 +45477,7 @@ index 078d3d4..b525636 100644
  
      void ConsumeSinkImpl(Core::System& system) override;
 diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
-index e7da9d9..3eae3d8 100644
+index e7da9d9..b683678 100644
 --- a/src/video_core/engines/maxwell_3d.cpp
 +++ b/src/video_core/engines/maxwell_3d.cpp
 @@ -1,10 +1,14 @@
@@ -45599,7 +45609,7 @@ index e7da9d9..3eae3d8 100644
      if (c == Regs::ShadowRamControl::Track || c == Regs::ShadowRamControl::TrackWithFilter)
          return shadow_state.reg_array[method] = argument;
      else if (c == Regs::ShadowRamControl::Replay)
-@@ -283,39 +339,80 @@ u32 Maxwell3D::ProcessShadowRam(u32 method, u32 argument) {
+@@ -283,39 +339,84 @@ u32 Maxwell3D::ProcessShadowRam(u32 method, u32 argument) {
  
  void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
      const auto control = shadow_state.shadow_ram_control;
@@ -45645,6 +45655,10 @@ index e7da9d9..3eae3d8 100644
 +#ifdef EDEN_NX2_PS5_PROTO
 +    NativeDrawShadowWrite(method, argument, false);
 +#endif
++    ApplyRegisterValue(method, argument);
++}
++
++void Maxwell3D::ApplyRegisterValue(u32 method, u32 argument) {
      regs.reg_array[method] = argument;
      for (auto const& table : dirty.tables)
          dirty.flags[table[method]] = true;
@@ -45686,7 +45700,7 @@ index e7da9d9..3eae3d8 100644
          return ProcessMacroBind(argument);
      case MAXWELL3D_REG_INDEX(falcon[4]):
          return ProcessFirmwareCall4();
-@@ -372,25 +469,40 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
+@@ -372,25 +473,40 @@ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argume
      }
  }
  
@@ -45730,7 +45744,7 @@ index e7da9d9..3eae3d8 100644
  
      // Methods after 0xE00 are special, they're actually triggers for some microcode that was
      // uploaded to the GPU during initialization.
-@@ -398,14 +510,60 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
+@@ -398,14 +514,60 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
          ProcessMacro(system, method, &method_argument, 1, is_last_call);
          return;
      }
@@ -45791,7 +45805,7 @@ index e7da9d9..3eae3d8 100644
      // Methods after 0xE00 are special, they're actually triggers for some microcode that was
      // uploaded to the GPU during initialization.
      if (method >= MacroRegistersStart) {
-@@ -453,11 +611,11 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
+@@ -453,11 +615,11 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
  }
  
  void Maxwell3D::ProcessMacroUpload(u32 data) {
@@ -45805,7 +45819,7 @@ index e7da9d9..3eae3d8 100644
  }
  
  void Maxwell3D::ProcessFirmwareCall4() {
-@@ -586,6 +744,9 @@ void Maxwell3D::ProcessCounterReset() {
+@@ -586,6 +748,9 @@ void Maxwell3D::ProcessCounterReset() {
  }
  
  void Maxwell3D::ProcessSyncPoint() {
@@ -45815,7 +45829,7 @@ index e7da9d9..3eae3d8 100644
      const u32 sync_point = regs.sync_info.sync_point.Value();
      [[maybe_unused]] const u32 cache_flush = regs.sync_info.clean_l2.Value();
      rasterizer->SignalSyncPoint(sync_point);
-@@ -595,6 +756,15 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
+@@ -595,6 +760,15 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
      // Bind the buffer currently in CB_ADDRESS to the specified index in the desired shader
      // stage.
      const auto& bind_data = regs.bind_groups[stage_index];
@@ -45831,7 +45845,7 @@ index e7da9d9..3eae3d8 100644
      auto& buffer = state.shader_stages[stage_index].const_buffers[bind_data.shader_slot];
      buffer.enabled = bind_data.valid.Value() != 0;
      buffer.address = regs.const_buffer.Address();
-@@ -657,13 +827,485 @@ Texture::TSCEntry Maxwell3D::GetTSCEntry(u32 tsc_index) const {
+@@ -657,13 +831,483 @@ Texture::TSCEntry Maxwell3D::GetTSCEntry(u32 tsc_index) const {
  
  u32 Maxwell3D::GetRegisterValue(u32 method) const {
      ASSERT(method < Regs::NUM_REGS && "Invalid Maxwell3D register");
@@ -45872,12 +45886,10 @@ index e7da9d9..3eae3d8 100644
 +        throw std::runtime_error("Native draw shadow snapshot unavailable");
 +    NativeDrawShadow::Values registers{}, shadow{};
 +    native_draw_shadow.Resolve(arguments, registers, shadow);
-+    resolving_native_draw_shadow = true;
 +    for (size_t i = 0; i < registers.size(); ++i) {
-+        ProcessDirtyRegisters(NativeDrawShadow::Methods[i], registers[i]);
++        ApplyRegisterValue(NativeDrawShadow::Methods[i], registers[i]);
 +        shadow_state.reg_array[NativeDrawShadow::Methods[i]] = shadow[i];
 +    }
-+    resolving_native_draw_shadow = false;
 +    native_draw_shadow.Clear();
 +    Rasterizer().ResetNativeDrawArguments();
 +    NativeDrawIndirect::shadow_reads.fetch_add(1, std::memory_order_relaxed);
@@ -45888,7 +45900,7 @@ index e7da9d9..3eae3d8 100644
 +}
 +
 +void Maxwell3D::NativeDrawShadowWrite(u32 method, u32 value, bool shadow) {
-+    if (resolving_native_draw_shadow || native_draw_shadow.Empty() || NativeDrawShadow::Index(method) < 0) return;
++    if (native_draw_shadow.Empty() || NativeDrawShadow::Index(method) < 0) return;
 +    if (native_draw_shadow.Full()) ResolveNativeDrawShadow();
 +    if (native_draw_shadow.Write(method, value, shadow)) {
 +        Rasterizer().ResetNativeDrawArguments();
@@ -46318,7 +46330,7 @@ index e7da9d9..3eae3d8 100644
 +
  } // namespace Tegra::Engines
 diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
-index 0cab2ae..d0f2351 100644
+index 0cab2ae..9e6df6d 100644
 --- a/src/video_core/engines/maxwell_3d.h
 +++ b/src/video_core/engines/maxwell_3d.h
 @@ -7,10 +7,15 @@
@@ -46378,7 +46390,7 @@ index 0cab2ae..d0f2351 100644
          // clang-format off
          union {
              struct {
-@@ -3125,9 +3141,40 @@ public:
+@@ -3125,9 +3141,37 @@ public:
      };
  
      State state{};
@@ -46390,9 +46402,6 @@ index 0cab2ae..d0f2351 100644
 +    bool SnapshotNativeDrawShadow(GPUVAddr arguments, u32 topology);
 +    void ResolveNativeDrawShadow();
 +    void ResolveNativeDrawRegisters();
-+    void NativeDrawShadowWrite(u32 method, u32 value, bool shadow);
-+    NativeDrawShadow native_draw_shadow;
-+    bool resolving_native_draw_shadow{};
 +#endif
 +
 +
@@ -46419,7 +46428,7 @@ index 0cab2ae..d0f2351 100644
  
      /// Write the value to the register identified by method.
      void CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) override;
-@@ -3135,6 +3182,14 @@ public:
+@@ -3135,6 +3179,14 @@ public:
      /// Write multiple values to the register identified by method.
      void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
  
@@ -46434,7 +46443,7 @@ index 0cab2ae..d0f2351 100644
      bool ShouldExecute() const {
          return execute_on;
      }
-@@ -3169,6 +3224,8 @@ public:
+@@ -3169,6 +3221,8 @@ public:
          return 0;
      }
  
@@ -46443,7 +46452,20 @@ index 0cab2ae..d0f2351 100644
      void RefreshParameters() {
          if (!current_macro_dirty) {
              return;
-@@ -3221,7 +3278,16 @@ private:
+@@ -3204,6 +3258,12 @@ private:
+     u32 ProcessShadowRam(u32 method, u32 argument);
+ 
+     void ProcessDirtyRegisters(u32 method, u32 argument);
++    // Resolved state applies directly, without observing it as a new incoming write.
++    void ApplyRegisterValue(u32 method, u32 argument);
++#ifdef EDEN_NX2_PS5_PROTO
++    void NativeDrawShadowWrite(u32 method, u32 value, bool shadow);
++    NativeDrawShadow native_draw_shadow;
++#endif
+ 
+     void ConsumeSinkImpl(Core::System& system) override;
+ 
+@@ -3221,7 +3281,16 @@ private:
       * @param method Method to call
       * @param parameters Arguments to the method call
       */
@@ -46461,7 +46483,7 @@ index 0cab2ae..d0f2351 100644
  
      /// Handles writes to the macro uploading register.
      void ProcessMacroUpload(u32 data);
-@@ -3260,11 +3326,27 @@ private:
+@@ -3260,11 +3329,27 @@ private:
  
      /// Macro method that is currently being executed / being fed parameters.
      u32 executing_macro = 0;
@@ -46489,7 +46511,7 @@ index 0cab2ae..d0f2351 100644
  
      Upload::State upload_state;
  
-@@ -3272,6 +3354,28 @@ private:
+@@ -3272,6 +3357,28 @@ private:
  
      std::vector<std::pair<GPUVAddr, size_t>> macro_segments;
      bool current_macro_dirty{};
@@ -48204,14 +48226,15 @@ index 0000000..5216e0f
 +} // namespace VideoCommon
 diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
 new file mode 100644
-index 0000000..28c01b1
+index 0000000..6f6471b
 --- /dev/null
 +++ b/src/video_core/gpu_split.h
-@@ -0,0 +1,275 @@
+@@ -0,0 +1,284 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
 +#pragma once
++#include <cstdio>
 +
 +#include <atomic>
 +#include <cstring>
@@ -48239,6 +48262,14 @@ index 0000000..28c01b1
 +namespace VideoCommon {
 +struct SplitPerformance {
 +    inline static std::atomic<unsigned long long> words{}, batches{}, drains{}, wait_ns{}, backend_ns{}, sync_reads{};
++    static void Report(long long now) {
++            using Split = VideoCommon::SplitPerformance;
++            std::fprintf(stderr, "NX2_SPLIT_PERF mono_ns=%lld words=%llu batches=%llu drains=%llu wait_ns=%llu backend_ns=%llu sync_reads=%llu\n", now,
++                         Split::words.load(), Split::batches.load(), Split::drains.load(),
++                         Split::wait_ns.load(), Split::backend_ns.load(), Split::sync_reads.load());
++
++}
++
 +};
 +
 +// Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
@@ -51109,12 +51140,13 @@ index 0000000..a8d6c94
 +} // namespace Tegra
 diff --git a/src/video_core/native_draw_indirect.h b/src/video_core/native_draw_indirect.h
 new file mode 100644
-index 0000000..38d31c5
+index 0000000..075bcb6
 --- /dev/null
 +++ b/src/video_core/native_draw_indirect.h
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,80 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +#pragma once
++#include <cstdio>
 +#include <algorithm>
 +#include <array>
 +#include <atomic>
@@ -51177,15 +51209,30 @@ index 0000000..38d31c5
 +
 +namespace Tegra::NativeDrawIndirect {
 +inline std::atomic<std::uint64_t> snapshot_deferred{}, snapshot_cancelled{}, snapshot_regions{}, snapshot_commands{}, snapshot_batches{}, snapshot_write_conflicts{};
++inline void Report() {
++            namespace Hle = Tegra::NativeDrawIndirect;
++            std::fprintf(stderr, "NX2_NATIVE_DRAW_HLE accepted=%llu code_fallback=%llu state_fallback=%llu source_fallback=%llu shadow_copies=%llu shadow_reads=%llu shadow_discards=%llu snapshot_uploads=%llu snapshot_submits=%llu snapshot_deferred=%llu snapshot_cancelled=%llu snapshot_regions=%llu snapshot_commands=%llu snapshot_batches=%llu snapshot_write_conflicts=%llu\n",
++                static_cast<unsigned long long>(Hle::accepted.load()), static_cast<unsigned long long>(Hle::code_fallback.load()),
++                static_cast<unsigned long long>(Hle::state_fallback.load()), static_cast<unsigned long long>(Hle::source_fallback.load()),
++                static_cast<unsigned long long>(Hle::shadow_copies.load()), static_cast<unsigned long long>(Hle::shadow_reads.load()),
++                static_cast<unsigned long long>(Hle::shadow_discards.load()),
++                static_cast<unsigned long long>(Hle::snapshot_uploads.load()), static_cast<unsigned long long>(Hle::snapshot_submits.load()),
++                static_cast<unsigned long long>(Hle::snapshot_deferred.load()), static_cast<unsigned long long>(Hle::snapshot_cancelled.load()),
++                static_cast<unsigned long long>(Hle::snapshot_regions.load()), static_cast<unsigned long long>(Hle::snapshot_commands.load()),
++                static_cast<unsigned long long>(Hle::snapshot_batches.load()), static_cast<unsigned long long>(Hle::snapshot_write_conflicts.load()));
++
++}
++
 +}
 diff --git a/src/video_core/native_draw_memo.h b/src/video_core/native_draw_memo.h
 new file mode 100644
-index 0000000..2561179
+index 0000000..ede381f
 --- /dev/null
 +++ b/src/video_core/native_draw_memo.h
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,32 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +#pragma once
++#include <cstdio>
 +#include "video_core/native_memo_table.h"
 +namespace VideoCommon::NativeDrawMemo {
 +using Statistics = NativeMemo::Statistics;
@@ -51204,6 +51251,16 @@ index 0000000..2561179
 +public:
 +    Table() : NativeMemo::Table<std::uint64_t, T, Slots, Hash<Kind>>{statistics[Kind]} {}
 +};
++inline void Report(long long now) {
++            for (unsigned i = 0; i < VideoCommon::NativeDrawMemo::statistics.size(); ++i) {
++                const auto& stat = VideoCommon::NativeDrawMemo::statistics[i];
++                std::fprintf(stderr, "NX2_DRAW_MEMO mono_ns=%lld kind=%u requests=%llu hits=%llu\n", now, i,
++                             static_cast<unsigned long long>(stat.requests.load()),
++                             static_cast<unsigned long long>(stat.hits.load()));
++            }
++
++}
++
 +}
 diff --git a/src/video_core/native_draw_shadow.h b/src/video_core/native_draw_shadow.h
 new file mode 100644
@@ -51617,12 +51674,13 @@ index 0000000..8ac6d26
 +} // namespace VideoCommon
 diff --git a/src/video_core/native_resource_memo.h b/src/video_core/native_resource_memo.h
 new file mode 100644
-index 0000000..30b90a4
+index 0000000..da49997
 --- /dev/null
 +++ b/src/video_core/native_resource_memo.h
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,48 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +#pragma once
++#include <cstdio>
 +#include <array>
 +#include <atomic>
 +#include <cstdint>
@@ -51657,6 +51715,16 @@ index 0000000..30b90a4
 +public:
 +    Table() : NativeMemo::Table<Key, Value, Slots, Hash>{statistics[Kind]} {}
 +};
++inline void Report(long long now) {
++            for (unsigned i = 0; i < VideoCommon::NativeResourceMemo::statistics.size(); ++i) {
++                const auto& stat = VideoCommon::NativeResourceMemo::statistics[i];
++                std::fprintf(stderr, "NX2_RESOURCE_MEMO mono_ns=%lld kind=%u requests=%llu hits=%llu\n", now, i,
++                             static_cast<unsigned long long>(stat.requests.load()),
++                             static_cast<unsigned long long>(stat.hits.load()));
++            }
++
++}
++
 +}
 diff --git a/src/video_core/native_root_table.h b/src/video_core/native_root_table.h
 new file mode 100644

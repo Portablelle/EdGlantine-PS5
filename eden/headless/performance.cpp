@@ -1,21 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "performance.h"
-#include "native_gpu_profile.h"
-#include "native_cpu_profile.h"
-#include "video_core/gpu_split.h"
-#include "video_core/native_draw_memo.h"
-#include "video_core/native_resource_memo.h"
 #include "cpu_policy.h"
 #include "crash_report.h"
 #include "stall_watchdog.h"
 #include "../src/fastmem.h"
 #include "common/cpu_features.h"
 #include "common/sparse_large_vector.h"
-#ifdef EDEN_NX2_PS5_PROTO
-#include "video_core/native_wait_profile.h"
-#include "video_core/native_draw_indirect.h"
-#include "video_core/buffer_cache/readback_statistics.h"
-#endif
 #include <algorithm>
 #include <string>
 #include <set>
@@ -583,55 +573,7 @@ void GuestCoreLoads(unsigned loads[4]) {
     for (unsigned i = 0; i < 4; ++i) loads[i] = cores[i].shown;
 }
 
-ProfilingSession::ProfilingSession() : initial_deadline{NowNs() + 180'000'000'000LL} {}
-ProfilingSession::~ProfilingSession() { Stop(); }
-void ProfilingSession::Stop() {
-    detailed_until_ns.store(0, std::memory_order_relaxed);
-    dev_marks.store(false, std::memory_order_relaxed);
-    Vulkan::NativeGpuProfile::enabled.store(false, std::memory_order_relaxed);
-    timers_on.store(false, std::memory_order_relaxed);
-    vulkan_cost_enabled.store(false, std::memory_order_relaxed);
-#ifdef EDEN_NX2_PS5_PROTO
-    VideoCommon::ReadbackStatistics::enabled.store(false, std::memory_order_relaxed);
-#endif
-}
-
-void ProfilingSession::Restart() {
-    next_report = 0;
-    reports = 0;
-#ifdef EDEN_NX2_PS5_PROTO
-    const auto epoch = VideoCommon::NativeWaitProfile::Restart();
-    std::fprintf(stderr, "NX2_PROFILE_REFRESH epoch=%llu mono_ns=%lld\n",
-                 static_cast<unsigned long long>(epoch), NowNs());
-#endif
-    detailed_until_ns.store(NowNs() + 20'000'000'000LL, std::memory_order_relaxed);
-    dev_marks.store(true, std::memory_order_relaxed);
-    Vulkan::NativeGpuProfile::epoch.fetch_add(1, std::memory_order_relaxed);
-    Vulkan::NativeGpuProfile::enabled.store(true, std::memory_order_relaxed);
-}
-
-void ProfilingSession::Tick() {
-    // Diagnostic prototype: bounded aggregate sampling, no PC sampling or GPU waits added.
-    if (initial_deadline && NowNs() >= initial_deadline) {
-        initial_deadline = 0;
-        if (!detailed_until_ns.load(std::memory_order_relaxed))
-            dev_marks.store(false, std::memory_order_relaxed);
-    }
-    const auto detailed_deadline = detailed_until_ns.load(std::memory_order_relaxed);
-    if (detailed_deadline && NowNs() >= detailed_deadline) {
-        dev_marks.store(false, std::memory_order_relaxed);
-        Vulkan::NativeGpuProfile::enabled.store(false, std::memory_order_relaxed);
-        detailed_until_ns.store(0, std::memory_order_relaxed);
-    }
-    if (reports < 36) {
-#ifdef EDEN_NX2_PS5_PROTO
-        VideoCommon::ReadbackStatistics::enabled.store(true, std::memory_order_relaxed);
-#endif
-        timers_on.store(true, std::memory_order_relaxed);
-        vulkan_cost_enabled.store(true, std::memory_order_relaxed);
-        const auto now = MonotonicNs();
-        if (!next_report || now >= next_report) {
-            next_report = now + 5'000'000'000LL;
+void ReportRuntime(long long now) {
             std::fprintf(stderr, "NX2_GPU_PERF mono_ns=%lld busy_ns=%llu buffers=%llu dispatch_ns=%llu queue_wait_ns=%llu fence_drain_ns=%llu present_wait_ns=%llu guest_write_ns=%llu\n",
                          now, gpu_time_busy_ns.load(), gpu_time_results.load(), gpu_dispatch.nanoseconds.load(),
                          gpu_queue_wait.nanoseconds.load(), gpu_fence_drain.nanoseconds.load(),
@@ -647,27 +589,6 @@ void ProfilingSession::Tick() {
                          storage_gather_bytes.load(), storage_gather_calls.load(),
                          storage_scatter_bytes.load(), storage_scatter_calls.load(),
                          storage_reused_bytes.load(), storage_reused_calls.load());
-            for (unsigned i = 0; i < ::Eden::NativeCpuProfile::totals.size(); ++i) {
-                const auto& total = ::Eden::NativeCpuProfile::totals[i];
-                std::fprintf(stderr, "NX2_CPU_DETAIL mono_ns=%lld phase=%s calls=%llu ns=%llu\n",
-                             now, ::Eden::NativeCpuProfile::names[i], total.calls.load(), total.nanoseconds.load());
-            }
-            for (unsigned i = 0; i < VideoCommon::NativeDrawMemo::statistics.size(); ++i) {
-                const auto& stat = VideoCommon::NativeDrawMemo::statistics[i];
-                std::fprintf(stderr, "NX2_DRAW_MEMO mono_ns=%lld kind=%u requests=%llu hits=%llu\n", now, i,
-                             static_cast<unsigned long long>(stat.requests.load()),
-                             static_cast<unsigned long long>(stat.hits.load()));
-            }
-            for (unsigned i = 0; i < VideoCommon::NativeResourceMemo::statistics.size(); ++i) {
-                const auto& stat = VideoCommon::NativeResourceMemo::statistics[i];
-                std::fprintf(stderr, "NX2_RESOURCE_MEMO mono_ns=%lld kind=%u requests=%llu hits=%llu\n", now, i,
-                             static_cast<unsigned long long>(stat.requests.load()),
-                             static_cast<unsigned long long>(stat.hits.load()));
-            }
-            using Split = VideoCommon::SplitPerformance;
-            std::fprintf(stderr, "NX2_SPLIT_PERF mono_ns=%lld words=%llu batches=%llu drains=%llu wait_ns=%llu backend_ns=%llu sync_reads=%llu\n", now,
-                         Split::words.load(), Split::batches.load(), Split::drains.load(),
-                         Split::wait_ns.load(), Split::backend_ns.load(), Split::sync_reads.load());
             phase("draw", rasterizer_draw);
             phase("flush", draw_flush); phase("pipeline", draw_pipeline);
             phase("cache_lock", draw_lock_wait); phase("configure", draw_config);
@@ -675,34 +596,6 @@ void ProfilingSession::Tick() {
             phase("cfg_sync", cfg_sync); phase("cfg_read", cfg_read);
             phase("cfg_bind", cfg_bind); phase("cfg_desc", cfg_desc);
             phase("cfg_rt", cfg_rt); phase("cfg_draw", cfg_draw);
-#ifdef EDEN_NX2_PS5_PROTO
-            namespace Hle = Tegra::NativeDrawIndirect;
-            std::fprintf(stderr, "NX2_NATIVE_DRAW_HLE accepted=%llu code_fallback=%llu state_fallback=%llu source_fallback=%llu shadow_copies=%llu shadow_reads=%llu shadow_discards=%llu snapshot_uploads=%llu snapshot_submits=%llu snapshot_deferred=%llu snapshot_cancelled=%llu snapshot_regions=%llu snapshot_commands=%llu snapshot_batches=%llu snapshot_write_conflicts=%llu\n",
-                static_cast<unsigned long long>(Hle::accepted.load()), static_cast<unsigned long long>(Hle::code_fallback.load()),
-                static_cast<unsigned long long>(Hle::state_fallback.load()), static_cast<unsigned long long>(Hle::source_fallback.load()),
-                static_cast<unsigned long long>(Hle::shadow_copies.load()), static_cast<unsigned long long>(Hle::shadow_reads.load()),
-                static_cast<unsigned long long>(Hle::shadow_discards.load()),
-                static_cast<unsigned long long>(Hle::snapshot_uploads.load()), static_cast<unsigned long long>(Hle::snapshot_submits.load()),
-                static_cast<unsigned long long>(Hle::snapshot_deferred.load()), static_cast<unsigned long long>(Hle::snapshot_cancelled.load()),
-                static_cast<unsigned long long>(Hle::snapshot_regions.load()), static_cast<unsigned long long>(Hle::snapshot_commands.load()),
-                static_cast<unsigned long long>(Hle::snapshot_batches.load()), static_cast<unsigned long long>(Hle::snapshot_write_conflicts.load()));
-            namespace Stats = VideoCommon::ReadbackStatistics;
-            std::fprintf(stderr, "NX2_READBACK_CACHE mono_ns=%lld hits=%llu misses=%llu fills=%llu bytes=%llu evictions=%llu invalidations=%llu clears=%llu\n", now,
-                static_cast<unsigned long long>(Stats::hits.load()), static_cast<unsigned long long>(Stats::misses.load()),
-                static_cast<unsigned long long>(Stats::fills.load()), static_cast<unsigned long long>(Stats::bytes.load()),
-                static_cast<unsigned long long>(Stats::evictions.load()), static_cast<unsigned long long>(Stats::invalidations.load()),
-                static_cast<unsigned long long>(Stats::clears.load()));
-#endif
-            if (++reports == 36) {
-#ifdef EDEN_NX2_PS5_PROTO
-                VideoCommon::ReadbackStatistics::enabled.store(false, std::memory_order_relaxed);
-#endif
-                dev_marks.store(false, std::memory_order_relaxed);
-                vulkan_cost_enabled.store(false, std::memory_order_relaxed);
-                timers_on.store(false, std::memory_order_relaxed);
-            }
-        }
-    }
 }
 
 unsigned GpuBusyPercent() {

@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 
 root = Path(__file__).resolve().parents[1]
-source = (root / 'headless/performance.cpp').read_text()
+source = (root / 'headless/profiling_session.cpp').read_text()
 start = source.index('ProfilingSession::ProfilingSession()')
 end = source.index('    if (reports < 36) {', start)
 implementation = source[start:end] + '}\n'
@@ -96,8 +96,9 @@ int main(int argc,char**argv){
                     '-fsanitize=address,undefined', '-pthread', '-DEDEN_NX2_PS5_PROTO',
                     '-I', str(root / 'headless'), str(cpp), '-o', str(temp / 'test')], check=True)
     subprocess.run([str(temp / 'test'), str(temp)], check=True)
-telemetry = source[source.index('unsigned GpuBusyPercent() {'):source.index('void MemoryPool(')]
-assert 'RequestEnable' not in telemetry and 'std::fopen' not in source[start:source.index('void MemoryPool(')]
+telemetry_source = (root / 'headless/performance.cpp').read_text()
+telemetry = telemetry_source[telemetry_source.index('unsigned GpuBusyPercent() {'):telemetry_source.index('void MemoryPool(')]
+assert 'RequestEnable' not in telemetry and 'std::fopen' not in source[start:]
 main = (root / 'headless/main.cpp').read_text()
 a = main.index('std::jthread runtime_control')
 b = main.index('system.ShutdownMainProcess();', a)

@@ -48,6 +48,7 @@ struct Machine {
         return true;
     }
 };
+#include "native-draw-recording.h"
 void Compare(std::span<const W> code, std::vector<W> params,
              const std::vector<std::array<W, 3>>* captured_events = nullptr) {
     Tegra::TuringMacroInterpreter interpreter;
@@ -58,22 +59,17 @@ void Compare(std::span<const W> code, std::vector<W> params,
     assert(result.success && result.consumed == 6);
     assert(interpreter.dram == Tegra::TuringMacroInterpreter::DataRam{});
     if (captured_events) assert(native.events == *captured_events);
-    // The five indirect words generate the same indexed geometry and per-instance bases.
-    std::vector<Draw> indirect;
-    if (params[1]) for (W i = 0; i < params[2]; ++i)
-        indirect.push_back({params[1], params[3], params[4], params[5], i});
-    assert(native.draws == indirect);
-    Machine hle_final;
-    Hle::ResetBases([&](W method, W value) { hle_final.Emit(method, value); });
+    const Machine hle_final=RunProduction(code,params);
+    assert(native.draws==hle_final.draws);
     for (W method : {0x446, 0x50d, 0x50e}) assert(native.regs[method] == hle_final.regs[method]);
     assert(native.constants == hle_final.constants && native.position == hle_final.position);
 }
 int main(int argc, char** argv) {
-    assert(argc == 2);
-    const std::filesystem::path dir = argv[1];
+    assert(argc <= 2);
+    const std::filesystem::path dir = argc==2 ? argv[1] : ".";
     unsigned captures = 0;
     std::vector<W> code;
-    for (const auto& file : std::filesystem::directory_iterator(dir)) {
+    if(argc==2) for (const auto& file : std::filesystem::directory_iterator(dir)) {
         const auto path = file.path();
         if (!path.string().ends_with(".code.bin")) continue;
         code = Load<W>(path);
@@ -85,7 +81,11 @@ int main(int argc, char** argv) {
         const auto events = Load<std::array<W, 3>>(stem + ".events.bin");
         Compare(code, params, &events); ++captures;
     }
-    assert(captures);
+    if(argc==2) assert(captures);
+    else {
+        code.resize(Hle::Entry*3+Hle::Program.size());
+        std::copy(Hle::Program.begin(),Hle::Program.end(),code.begin()+Hle::Entry*3);
+    }
     // Any instruction change or entry mismatch must reject before engine side effects.
     for (size_t i = 0; i < Hle::Program.size(); ++i) {
         auto changed = code; changed[Hle::Entry * 3 + i] ^= 1;
@@ -107,5 +107,5 @@ int main(int argc, char** argv) {
         params = {4, test % 7 ? W(random()) : 0U, test % 17, W(random()), W(random()), W(random())};
         Compare(code, params);
     }
-    std::printf("PASS: %u captured trace(s), 4096 randomized native/indirect geometry+base-reset comparisons, code/source rejection guards\n", captures);
+    std::printf("PASS: %u captured trace(s), 4096 randomized interpreter/production-HLE recording comparisons, code/source rejection guards\n", captures);
 }

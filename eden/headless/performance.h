@@ -19,6 +19,7 @@ void SetSecondaryPlacement(bool enabled);
 void PlatformChecks();
 // Main thread only, between GPU readiness and guest shutdown.
 void Snapshot();
+void ReportRuntime(long long now);
 // How busy each of the four emulated cores' threads was over the last quarter of a second, as a
 // percentage of one CPU (~0u: not known). A game is limited by these four, each on a CPU of
 // its own, so the busiest of them says whether the CPU is what holds a game back; a share of

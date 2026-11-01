@@ -65,6 +65,14 @@ Draw and resource memo tables now share one implementation with explicit hash
 policies and statistics sinks. The observer regression injects ENOSPC on the first
 write to an accepted regular file, independently of the nonregular-file checks.
 
+Profiling session orchestration is now a separate translation unit and reports
+through subsystem-owned functions. Resolved shadow registers use a private direct
+application path, without a public observation-bypass flag. The indirect regression
+invokes the production HLE function against a recording backend for 4,096 randomized
+interpreter comparisons, checking command offsets, replacement attributes and state
+restoration. It does not validate Vulkan driver execution or pixels. Gathered-view
+reuse metadata now clearly labels its earlier measurements as historical.
+
 These source fixes postdate the PS5-tested .064 package and have not been installed
 on the console. The 21 FPS result applies to that previously installed package.
 

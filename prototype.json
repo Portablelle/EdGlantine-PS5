@@ -58,7 +58,7 @@
     "RET R0/R55 regression tests adapted to existing strict return linkage validation"
   ],
   "hostSuiteValidated": false,
-  "nx2PatchSha256": "2b1e5b145926725940498f1e685081ce7e89b4580ba1648df6f86746bfb075a9",
+  "nx2PatchSha256": "d3e7cd62227155655e408972b041a5b8464ffce8c9e06404e3d7791a8fe0fb59",
   "rejectedAdaptations": [
     "QMD history eviction: replays completed descriptors on action 2; regression caught by native_semaphore test"
   ],
@@ -424,15 +424,16 @@
     "hostRegression": "PASS on build-server under ASan/UBSan/LSan: staging sizing and live/deferred preservation; fragmented allocation, map failure at each piece, exhaustion, bounded scratch and invalid ranges; concurrent auto-stub deduplication and unchanged disabled policy"
   },
   "groupedStorageReadReuse": {
-    "readOnly": "Reuse gathered view until an exact source write invalidates it",
+    "readOnly": "Conservative gather per binding, including unchanged bindings",
     "writes": "Shader writes, CPU uploads/copies, fills and query output",
     "lifetime": "Gathered entries retain source owners and retire on deletion",
     "writableGroups": "Conservative gather/scatter preserved",
     "hostValidation": "ASan/UBSan build-server PASS: 200000 overlap/overflow cases plus owner retirement and range boundaries",
     "hardwareValidated": false,
     "syncContractFix": "Invalidate when SynchronizeBuffer returns false (upload); true means no upload.",
-    "hardwareObservation": ".045 user reports 18 FPS vs 8. Over 25.154 s: 92.77% gathered requests reused, gather 21.35 GB/s, scatter 11.05 GB/s, avoided gather payload 271.42 GB/s at new rate. Visual state not specified.",
-    "syncContractHostValidation": "ASan/UBSan build-server PASS using actual SynchronizeBuffer: no upload/clean reuse, upload invalidation, 10000 unchanged bindings."
+    "hardwareObservation": "Historical .045 measurement with reuse enabled, not representative of current publication sources: .045 user reports 18 FPS vs 8. Over 25.154 s: 92.77% gathered requests reused, gather 21.35 GB/s, scatter 11.05 GB/s, avoided gather payload 271.42 GB/s at new rate. Visual state not specified.",
+    "syncContractHostValidation": "Historical test of the reuse-enabled implementation: ASan/UBSan build-server PASS using actual SynchronizeBuffer: no upload/clean reuse, upload invalidation, 10000 unchanged bindings.",
+    "status": "Disabled in publication sources: gather every binding until invalidation follows producing draws."
   },
   "textureArrayCpuPreparation": {
     "rootValidation": "Once per descriptor per draw; refreshed next draw, individual handle/offset checks retained",
@@ -563,7 +564,10 @@
       "Keep initial profiling deadlines in the session owner.",
       "Move SDK draw execution and restoration into the native draw HLE module.",
       "Share memo-table storage, collision handling, loading and statistics aggregation through explicit hash policies.",
-      "Exercise observer write failure on an accepted regular file using ENOSPC injection."
+      "Exercise observer write failure on an accepted regular file using ENOSPC injection.",
+      "Move profiling orchestration out of shared performance and use subsystem-owned reports.",
+      "Apply resolved shadow registers without an externally controlled observation bypass.",
+      "Label gathered-reuse measurements as historical; reuse is disabled in current sources."
     ],
     "nativeTranslatorSalt": "0x4f554e4345a00007"
   }
