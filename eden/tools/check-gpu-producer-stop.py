@@ -26,12 +26,12 @@ using CommandData=int;
 namespace VideoCommon {
 struct GpuSplit {
  static GpuSplit& Get() { static GpuSplit split; return split; }
- void Stop() {} // Split execution is disabled in the PS5 prototype.
+ void Stop() {} // No split work is queued by this producer-only harness.
 };
 }
 struct Item { int command{}; u64 fence{}; bool block{}; };
 struct ThreadManager {
- struct { std::mutex write_lock; u64 last_fence{}; std::atomic<u64> signaled_fence{};
+ struct { std::mutex write_lock, completion_lock; u64 last_fence{}; std::atomic<u64> signaled_fence{};
           Common::SPSCQueue<Item,2> queue; std::condition_variable_any cv; } state;
  std::stop_source stop_source;
  u64 PushCommand(CommandData&&,bool,bool);

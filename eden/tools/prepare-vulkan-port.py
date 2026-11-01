@@ -19,6 +19,18 @@ def adapt(relative, destination, replacements):
 adapt('src/core/frontend/emu_window.h', 'include/core/frontend/emu_window.h',
       [('    Xcb,', '    Xcb,\n    PS5,')])
 adapt('src/video_core/renderer_vulkan/vk_rasterizer.cpp', 'vulkan_rasterizer.cpp', [
+    ('#include <atomic>', '#include <atomic>\n#include "native_gpu_profile.h"'),
+    ('    const auto& qmd{kepler_compute->launch_description};', r'''    std::shared_ptr<NativeGpuProfile::Ticket> compute_sample;
+    if (NativeGpuProfile::enabled.load(std::memory_order_relaxed)) {
+        static u64 ordinal{};
+        if (++ordinal % 8 == 0) {
+            compute_sample = std::make_shared<NativeGpuProfile::Ticket>();
+            NativeGpuProfile::Label label{2, kepler_compute->regs.code_loc.Address() + kepler_compute->launch_description.program_start, 0, 0, 0, 8};
+            scheduler.Record([compute_sample, label](vk::CommandBuffer command) { NativeGpuProfile::Begin(command, *compute_sample, label); });
+        }
+    }
+    SCOPE_EXIT { if (compute_sample) scheduler.Record([compute_sample](vk::CommandBuffer command) { NativeGpuProfile::End(command, *compute_sample); }); };
+    const auto& qmd{kepler_compute->launch_description};'''),
     # Compute synchronization (dev_vulkan.h compute_barriers): indirect
     # dispatches returned before the pre-dispatch barrier, and no barrier made a dispatch's
     # writes visible to later indirect arguments, vertex/index fetch, shaders or copies.
@@ -142,6 +154,7 @@ void RasterizerVulkan::DispatchCompute() {"""),
      """    DEBUG_ASSERT(addr != 0 || size != 0);
     // A write to the page this core's last queued write covers joins it (performance.h DeferWrite).
     if (::Eden::Performance::cpu_write_defer.load(std::memory_order_relaxed) &&
+        !::Eden::Performance::replaying_cpu_writes &&
         ::Eden::Performance::ExtendDeferredWrite(addr, size, ::Eden::Performance::cpu_write_core)) {
         return false;
     }
@@ -222,6 +235,23 @@ void RasterizerVulkan::DispatchCompute() {"""),
     # UpdateDynamicStates asked the cache for the current pipeline a second time
     # per draw, recomputing the same fixed-state key. Reuse PrepareDraw's result;
     # other callers keep the original lookup.
+    ('    draw_func();\n    ::Eden::Performance::Mark(::Eden::Performance::draw_record, phase);', r'''    std::shared_ptr<NativeGpuProfile::Ticket> gpu_sample;
+    if (NativeGpuProfile::enabled.load(std::memory_order_relaxed)) {
+        static u64 ordinal{};
+        if (++ordinal % 64 == 0) {
+            gpu_sample = std::make_shared<NativeGpuProfile::Ticket>();
+            const auto area = scheduler.ProfilingRenderArea();
+            const auto& regs = maxwell3d->regs;
+            NativeGpuProfile::Label label{1,
+                (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1],
+                (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1],
+                area.width, area.height, 64};
+            scheduler.Record([gpu_sample, label](vk::CommandBuffer command) { NativeGpuProfile::Begin(command, *gpu_sample, label); });
+        }
+    }
+    draw_func();
+    if (gpu_sample) scheduler.Record([gpu_sample](vk::CommandBuffer command) { NativeGpuProfile::End(command, *gpu_sample); });
+    ::Eden::Performance::Mark(::Eden::Performance::draw_record, phase);'''),
     ('template <typename Func>\nvoid RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {',
      '''namespace {
 // GPU thread only: the pipeline PrepareDraw refreshed for the draw in progress.
@@ -551,6 +581,69 @@ adapt('src/video_core/renderer_vulkan/vk_present_manager.cpp', 'vulkan_present_m
 # descriptor at GPU address 0; desktop kernels only log the resulting page fault, the PS5
 # kills the title (TCP read at VA 0).
 # The spec requires a null pAddressInfo (or VK_WHOLE_SIZE) for a null descriptor.
+# Staging buffers (headless/staging_buffers.h): above 16 MiB a buffer the CPU writes or reads is its
+# transfer rounded up to 16 MiB instead of the next power of two, a kept buffer is handed out again
+# only when it holds the transfer, and a refused buffer is asked for once more after the kept ones
+# the GPU is done with are let go. A Switch 2 title was refused 512 MiB for a 341 MiB transfer with
+# 480 MiB free. No Finish() when releasing: a buffer handed out earlier may not have its copy recorded.
+adapt('src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp', 'vulkan_staging_buffer_pool.cpp', [
+    ('#include "video_core/vulkan_common/vulkan_wrapper.h"\n',
+     '#include "video_core/vulkan_common/vulkan_wrapper.h"\n#include <atomic>\n#include <cstdio>\n#include "staging_buffers.h"\n'),
+    ('    const auto is_free = [this](const StagingBuffer& entry) {\n'
+     '        return !entry.deferred && scheduler.IsFree(entry.tick);\n'
+     '    };',
+     '    const auto is_free = [this, size](const StagingBuffer& entry) {\n'
+     '        return !entry.deferred && scheduler.IsFree(entry.tick) &&\n'
+     '               ::Eden::StagingBuffers::Holds(entry.mapped_span.size(), entry.log2_level) >= size;\n'
+     '    };'),
+    ('    auto const log2_size = Common::Log2Ceil<u32>(u32(size));\n',
+     '    auto const log2_size = Common::Log2Ceil<u32>(u32(size));\n'
+     '    const bool exact = ::Eden::StagingBuffers::Exact(size, usage != MemoryUsage::DeviceLocal);\n'
+     '    const VkDeviceSize made = ::Eden::StagingBuffers::Size(size, log2_size, exact);\n'
+     '    if (exact) {\n'
+     '        // Kept buffers of this power of two too small for the transfer go before it is made.\n'
+     '        ::Eden::StagingBuffers::ReleaseFrom(GetCache(usage)[log2_size], [this, size](const StagingBuffer& entry) {\n'
+     '            return !entry.deferred && scheduler.IsFree(entry.tick) &&\n'
+     '                   ::Eden::StagingBuffers::Holds(entry.mapped_span.size(), entry.log2_level) < size;\n'
+     '        });\n'
+     '    }\n'),
+    ('        .size = 1ULL << log2_size,\n', '        .size = made,\n'),
+    ('    vk::Buffer buffer = memory_allocator.CreateBuffer(buffer_ci, usage);\n',
+     '    vk::Buffer buffer;\n'
+     '    try {\n'
+     '        buffer = memory_allocator.CreateBuffer(buffer_ci, usage);\n'
+     '    } catch (const vk::Exception& refused) {\n'
+     '        if (refused.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY) {\n'
+     '            throw;\n'
+     '        }\n'
+     '        // Refused: the kept buffers the GPU is done with go, and the buffer is asked for once\n'
+     '        // more. Refused again, the error goes on as before.\n'
+     '        const auto idle = [this](const StagingBuffer& entry) {\n'
+     '            return !entry.deferred && scheduler.IsFree(entry.tick);\n'
+     '        };\n'
+     '        ::Eden::StagingBuffers::Released released;\n'
+     '        for (StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {\n'
+     '            for (StagingBuffers& level : *cache) {\n'
+     '                released += ::Eden::StagingBuffers::ReleaseFrom(level, idle);\n'
+     '            }\n'
+     '        }\n'
+     '        std::fprintf(stderr, "EDEN_STAGING_OOM asked=%zu made=%llu released=%zu buffers (%llu MiB)\\n", size,\n'
+     '                     static_cast<unsigned long long>(made), released.buffers,\n'
+     '                     static_cast<unsigned long long>(released.bytes >> 20));\n'
+     '        buffer = memory_allocator.CreateBuffer(buffer_ci, usage);\n'
+     '    }\n'
+     '    // A large buffer smaller than the power of two: the 1st, 2nd, 4th, 8th ... in the log.\n'
+     '    if (exact && made >= (VkDeviceSize{64} << 20) && made < (VkDeviceSize{1} << log2_size)) {\n'
+     '        static std::atomic<unsigned long long> large{0};\n'
+     '        const auto times = large.fetch_add(1, std::memory_order_relaxed) + 1;\n'
+     '        if ((times & (times - 1)) == 0) {\n'
+     '            std::fprintf(stderr, "EDEN_STAGING_EXACT %llu MiB made for a transfer of %llu MiB, not the %llu MiB of the "\n'
+     '                         "next power of two (%llu so far)\\n",\n'
+     '                         static_cast<unsigned long long>(made >> 20), static_cast<unsigned long long>(size >> 20),\n'
+     '                         static_cast<unsigned long long>((VkDeviceSize{1} << log2_size) >> 20), times);\n'
+     '        }\n'
+     '    }\n'),
+])
 # Development A/B switches for device features (headless/dev_vulkan.h, dev-settings).
 adapt('src/video_core/vulkan_common/vulkan_device.cpp', 'vulkan_device.cpp', [
     ('#include <algorithm>', '#include <algorithm>\n#include <cstdio>\n#include "dev_vulkan.h"\n#include "performance.h"'),
@@ -719,15 +812,15 @@ void GpuTimeCollect(const Device& device) {
 } // namespace
 '''
 adapt('src/video_core/renderer_vulkan/vk_scheduler.cpp', 'vulkan_scheduler.cpp', [
-    ('#include <memory>', '#include <memory>\n#include <array>\n#include <atomic>\n#include <chrono>\n#include <cstdio>\n#include "dev_vulkan.h"\n#include "performance.h"'),
-    ('namespace Vulkan {\n', 'namespace Vulkan {\n' + GPU_TIME_HELPERS),
+    ('#include <memory>', '#include <memory>\n#include <array>\n#include <atomic>\n#include <chrono>\n#include <cstdio>\n#include "dev_vulkan.h"\n#include "performance.h"\n#include "native_gpu_profile.h"'),
+    ('namespace Vulkan {\n', 'namespace Vulkan {\n' + GPU_TIME_HELPERS + (port / 'native_gpu_profile.inc').read_text()),
     ('        .pInheritanceInfo = nullptr,\n    });\n    current_upload_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());',
-     '        .pInheritanceInfo = nullptr,\n    });\n    GpuTimeBegin(device, current_cmdbuf);\n'
+     '        .pInheritanceInfo = nullptr,\n    });\n    GpuTimeBegin(device, current_cmdbuf);\n    NativeGpuProfile::BeginBuffer(device, current_cmdbuf);\n'
      '    current_upload_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());'),
     ('        upload_cmdbuf.End();\n        cmdbuf.End();\n',
-     '        upload_cmdbuf.End();\n        GpuTimeEnd(cmdbuf);\n        cmdbuf.End();\n'),
+     '        upload_cmdbuf.End();\n        GpuTimeEnd(cmdbuf);\n        NativeGpuProfile::EndBuffer();\n        cmdbuf.End();\n'),
     ('            vk::Check(result);\n            break;\n        }\n    });\n    chunk->MarkSubmit();',
-     '            vk::Check(result);\n            break;\n        }\n        GpuTimeCollect(device);\n    });\n    chunk->MarkSubmit();'),
+     '            vk::Check(result);\n            break;\n        }\n        GpuTimeCollect(device);\n        NativeGpuProfile::Collect(device);\n    });\n    chunk->MarkSubmit();'),
     ('    const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore);\n'
      '    AllocateNewContext();\n    return signal_value;',
      '    const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore);\n'
@@ -1232,6 +1325,23 @@ for name in ('vk_graphics_pipeline', 'vk_compute_pipeline'):
     ]
     if name == 'vk_graphics_pipeline':
         anchors += configure_phases
+        anchors += [
+            ('#include "performance.h"', '#include "performance.h"\n#include "native_cpu_profile.h"'),
+            ('        buffer_cache.SynchronizeStoragePointers(pointers);',
+             '        { ::Eden::NativeCpuProfile::Scope probe(0); buffer_cache.SynchronizeStoragePointers(pointers); }'),
+            ('    const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {',
+             '    const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {\n        ::Eden::NativeCpuProfile::Scope probe(1);'),
+            ('        if constexpr (Spec::has_storage_buffers) {',
+             '        if constexpr (Spec::has_storage_buffers) {\n            ::Eden::NativeCpuProfile::Scope probe(2);'),
+            ('    texture_cache.FillImageViews(std::span(views.data(), views.size()), false, Spec::has_images);',
+             '    { ::Eden::NativeCpuProfile::Scope probe(3); texture_cache.FillImageViews(std::span(views.data(), views.size()), false, Spec::has_images); }'),
+            ('        buffer_cache.BindHostStageBuffers(stage);',
+             '        { ::Eden::NativeCpuProfile::Scope probe(4); buffer_cache.BindHostStageBuffers(stage); }'),
+            ('        try {\n            PushImageDescriptors(',
+             '        try {\n            ::Eden::NativeCpuProfile::Scope probe(5);\n            PushImageDescriptors('),
+            ('        guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);',
+             '        { ::Eden::NativeCpuProfile::Scope probe(6); guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer); }'),
+        ]
     adapt(f'src/video_core/renderer_vulkan/{name}.cpp', name + '_cost.cpp', anchors)
 shader_costs = [
     ('#include <algorithm>', '#include <algorithm>\n#include <cstdio>\n#include <set>\n#include <unordered_set>\n'
@@ -1423,7 +1533,7 @@ pipeline_cache_writes = [
     ('PipelineCache::~PipelineCache() {\n'
      '    if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {\n'
      '        SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,\n'
-     '                                     CACHE_VERSION);\n'
+     '                                     ShaderCacheVersion());\n'
      '    }\n'
      '}\n',
      'PipelineCache::~PipelineCache() {\n'
@@ -1435,7 +1545,7 @@ pipeline_cache_writes = [
      '        const bool written = last_flush.time_since_epoch().count() != 0;\n'
      '        if (!written || pipelines_since_flush != 0) {\n'
      '            SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,\n'
-     '                                         CACHE_VERSION);\n'
+     '                                         ShaderCacheVersion());\n'
      '        }\n'
      '    }\n'
      '}\n'),
@@ -1626,6 +1736,12 @@ for name, index, expected in (
         raise RuntimeError(f'Wait-site anchors changed: {name}: {len(matches)} != {expected}')
     text = re.sub(pattern, lambda m: m[1] + '{ auto timer = Eden::Performance::VulkanTimer('
                   + str(index) + '); ' + m[2] + ' }', text)
+    if name == 'vk_buffer_cache':
+        text = '#include "native_gpu_profile.h"\n#include "native_cpu_profile.h"\n' + text
+        # Time sampled real transfer commands, including their ordering barriers.
+        text = text.replace('        if (barrier) {\n            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,', '        NativeGpuProfile::Ticket sample;\n        static u64 ordinal{};\n        if (NativeGpuProfile::enabled.load(std::memory_order_relaxed) && ++ordinal % 64 == 0) {\n            u64 bytes{};\n            for (const auto& copy : vk_copies) bytes += copy.size;\n            NativeGpuProfile::Begin(cmdbuf, sample, {3, bytes, 0, 0, 0, 64});\n        }\n        if (barrier) {\n            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,', 1)
+        anchor = '        cmdbuf.CopyBuffer(src_buffer, dst_buffer, VideoCommon::FixSmallVectorADL(vk_copies));'
+        text = text.replace(anchor, anchor + '\n        NativeGpuProfile::End(cmdbuf, sample);', 1)
     if name == 'vk_compute_pass':
         # ASTC decode has no CPU consumer. Its existing image barrier orders
         # later shaders, and staging/descriptor reuse is protected by ticks.

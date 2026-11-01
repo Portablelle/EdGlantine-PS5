@@ -15,6 +15,7 @@ code=r'''
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <cstdlib>
 #include <cstdio>
 #include <cerrno>
 #include <stdexcept>
@@ -48,6 +49,7 @@ void reset(uint64_t mask=0x1fff){
  for(unsigned i=0;i<64;++i)mock_apics[i]=i;
 }
 int main(){
+ unsetenv("EDEN_NX2_SPLIT");
  constexpr unsigned expected[]={256,96,96,96,96,96};unsigned total=0;
  for(unsigned i=0;i<6;++i){assert(CpuPolicy::JitBytes(i)==expected[i]*1024u*1024u);total+=CpuPolicy::JitBytes(i);}
  assert(total==736u*1024u*1024u && CpuPolicy::JitBytes(6)==16u*1024u*1024u);
@@ -77,6 +79,13 @@ int main(){
  reset();fail_restore=true;bool threw=false;try{CheckWorkerTopology();}catch(const std::runtime_error&){threw=true;}assert(threw);
  reset();CheckWorkerTopology();ignore_mask=0xaaa;SetSecondaryPlacement(true);assert(!placement_secondary && current==allowed_mask);
  reset();CheckWorkerTopology();SetSecondaryPlacement(true);current=1ULL<<12;PlaceSecondary("VSyncThread");assert(current==0xaaa);
+ setenv("EDEN_NX2_SPLIT","1",1);
+ reset(0xffff);CheckWorkerTopology();assert(split_back_cpus==0x4000 && secondary_cpus==0xaaa);
+ SetSecondaryPlacement(true);PlaceSecondary("GPUBack");assert(current==0x4000);
+ PlaceSecondary("VSyncThread");assert(current==0xaaa);
+ reset(0x3fff);CheckWorkerTopology();assert(split_back_cpus==2 && !(secondary_cpus&(1ULL<<13)));
+ reset(0xfff);CheckWorkerTopology();assert(!worker_topology_ready && !split_back_cpus && !secondary_cpus);
+ unsetenv("EDEN_NX2_SPLIT");
 }
 '''
 with tempfile.TemporaryDirectory() as tmp:

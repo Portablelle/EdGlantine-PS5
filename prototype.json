@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "EdGlantine-PS5",
   "titleId": "PPSA99862",
-  "contentVersion": "00.013.000",
+  "contentVersion": "00.063.000",
   "dataRoot": "/data/eden-nx2",
   "entry": "/data/eden-nx2/game/exefs/main",
   "wrapperCommit": "a26ba788222465ec7fb94dc813958fc749734e07",
@@ -13,7 +13,7 @@
   "buildHost": "build-server",
   "remoteRoot": "/tmp/ps5-nx2-prototype-20261030",
   "macroJit": true,
-  "gpuSplit": false,
+  "gpuSplit": true,
   "selfUpdate": false,
   "consoleDeployed": true,
   "hardwareValidated": false,
@@ -58,17 +58,12 @@
     "RET R0/R55 regression tests adapted to existing strict return linkage validation"
   ],
   "hostSuiteValidated": false,
-  "nx2PatchSha256": "74f89c2f8365816317ee677d19ce4d3d9b39514120b8078ebf8ac63e95eafb22",
+  "nx2PatchSha256": "343cf7a73ce0038b7fb652657a9609e4cca00e3c37d038ec0f7709b3e3de38bb",
   "rejectedAdaptations": [
     "QMD history eviction: replays completed descriptors on action 2; regression caught by native_semaphore test"
   ],
-  "archive": "Eden-NX2-PS5-prototype-00.013.000.tar.gz",
-  "archiveBytes": 43758777,
-  "archiveSha256": "101c993270a7af79826073c7934621b2757cb7121a70476bd821e71f0c22ea59",
-  "buildPatchSha256": "74f89c2f8365816317ee677d19ce4d3d9b39514120b8078ebf8ac63e95eafb22",
   "postBuildSourceChanges": [],
   "genericHostSuite": "Not validated: desktop fastmem assumptions and Catch2 abort; log retained",
-  "ebootSha256": "e36bfb35fc370f0ec7f929a8874216634d3c024e0938eb0f912a8ca1802fe4ef",
   "shaderFixes": [
     "Validate barrier cancellation paths and chains",
     "Validate active-scope loop cleanup",
@@ -101,13 +96,13 @@
   "previousDeployment": {
     "date": "2026-10-31",
     "path": "/data/homebrew/PPSA99862",
-    "rollback": "/data/ps5-diag/nx2-rollback-011-20261031",
+    "rollback": "/data/ps5-diag/nx2-rollback-041-20261031",
     "filesVerified": 70,
-    "launched": true,
-    "installedSourceVersion": "00.012.000",
-    "launchOutcome": ".012 boot/console run confirmed; user reports fewer but persistent visual defects. Previous split-RGB and mixed-bank array-depth refusals absent; next bindless array-depth, mixed-bank explicit-LOD, half texel fetch forms rejected."
+    "launched": false,
+    "installedSourceVersion": "00.042.000",
+    "launchOutcome": "Snapshots now remain pending across ordinary render-pass changes; same-scene FPS/rendering and batch/cancellation counters pending."
   },
-  "vulkanPortGeneratorSha256": "9216ccf934191abf46c721501bbdc1c0cab05412fdf5890f5b5dc5c4f1702023",
+  "vulkanPortGeneratorSha256": "243f12d5cf46f82486d267dc335cec94b592b910cf5f3437f3b99cfefd4d7f4a",
   "eglantineAstcCommit": "97ce27ab35153884d2fd05c278433928e429cd91",
   "gather": {
     "hostCases": 3,
@@ -118,15 +113,18 @@
     "hardwareObservation": "Previous rejection absent in 44.9-second .008 log; visual correctness not validated."
   },
   "videoCodecLimitation": "H264 initialization hardware-confirmed successful on Welcome Tour .009; low frame rate remains, full playback/game compatibility not established.",
-  "deploymentHandoff": ".013 installed directly after user-confirmed closure; rollback .012 retained. No full visual acceptance claimed.",
+  "deploymentHandoff": "00.063.000 rebuilt on build-server with matching embedded version, packaged and verified; full 00.062.000 rollback retained. No launch, commit or push.",
   "deployment": {
-    "date": "2026-10-31",
+    "date": "2026-11-01",
     "path": "/data/homebrew/PPSA99862",
-    "rollback": "/data/ps5-diag/nx2-rollback-012-20261031",
+    "rollback": "/data/ps5-diag/nx2-rollback-062-20261101-eb9d8c35",
+    "previousInstalledVersion": "00.062.000",
+    "installedSourceVersion": "00.063.000",
     "filesVerified": 70,
     "launched": false,
-    "installedSourceVersion": "00.013.000",
-    "launchOutcome": "Installed four Cubic follow-up fixes; .012 rendering improvement/remaining defects carry forward, .013 gameplay not yet retested."
+    "transaction": "eb9d8c3567e98466bd17bc9d59025140",
+    "journal": "/data/ps5-diag/nx2-install-063-20261101-eb9d8c35/install-journal.json",
+    "launchOutcome": "Not launched; awaiting user FPS/rendering test."
   },
   "previousTargetedTests": {
     "cases": 395,
@@ -139,8 +137,9 @@
     "remainingFailures": null
   },
   "targetedTests": {
-    "scope": "Incremental native compilation and built-in packaging checks; no extra host suite for these focused Cubic fixes",
-    "fullDesktopSuiteRebuilt": false
+    "scope": "Actual scheduler methods and upload guard ASan/UBSan; previous 262144 mixed-event cases plus 100-pass-change cancellation and 100-region single-command submission grouping. No general suite.",
+    "result": "PASS",
+    "log": "artifacts/profile-042/native042-host-test.log"
   },
   "videoPerformance": {
     "instrumentation": "Bounded cumulative video stages and existing Vulkan API/wait counters; see milestones/video-performance/ANALYSIS.md",
@@ -191,7 +190,8 @@
       "outputFpsSpeedup": 2.1256007759033713
     },
     "hardwareMeasured": true,
-    "visualValidation": "Video image correct per user; menu and following screen NOT validated, flashes/black areas/misplaced sprites reported."
+    "visualValidation": "Video image correct per user; menu and following screen NOT validated, flashes/black areas/misplaced sprites reported.",
+    "nextMeasurement": "Detailed draw/scheduler hooks disabled in .016 to isolate .015 crash; aggregate counters remain available. Do not treat .015 pre-crash data as a complete playable-phase profile."
   },
   "consoleCleanup": {
     "date": "2026-10-31",
@@ -211,17 +211,312 @@
   "menuRendering": {
     "fixedForms": [
       "Split bindless scalar 2D RGB/RGBA outputs with aliases",
-      "Array2D depth comparison using a second descriptor bank"
+      "Array2D depth comparison using a second descriptor bank",
+      "Bindless vector Array2D depth sample",
+      "Mixed-bank scalar 2D explicit LOD sample",
+      "Scalar 2D FP16 explicit-LOD texel fetch with packed output aliases",
+      "Scalar 2D FP16 texture gather with packed output pairs"
     ],
-    "translatorSalt": "0x4f554e4345a00003",
+    "translatorSalt": "0x4f554e4345a00005",
     "hardwareValidated": false,
     "details": "milestones/menu-render/ANALYSIS.md",
-    "hardwareObservation": "Partial improvement per user; additional native texture forms remain rejected."
+    "hardwareObservation": ".014 looked visually OK per user. Gather FP16 lowering added in .015; post-menu stability remains unresolved through .017."
   },
   "cubicCorrections": [
     "Reject metadata-only save imports",
     "Do not redirect HTTP uploads or modifying requests",
     "Unique device translation generations across instances",
     "Preserve signalled FFmpeg color matrix"
-  ]
+  ],
+  "lastKnownVisuallyWorkingRollback": "/data/ps5-diag/nx2-rollback-014-20261031",
+  "dmaStability": {
+    "change": "Own native command words instead of parsing a mutable direct guest view; reuse per-channel scratch across pending acquires",
+    "guard": "Stop explicitly on unbound engine, do not skip methods or fabricate fence completion",
+    "causeConfirmed": false,
+    "hardwareValidated": false,
+    "hardwareObservation": ".019 reproduced explicit GPU-worker stop, method 0xebc on unbound subchannel 6; owned/live 59-word capture retained. Submission prefix missing from old bounded history."
+  },
+  "mmeIsolation": {
+    "method": "0x18f",
+    "selection": "Interpreter chosen before execution; no replay after failed JIT",
+    "captureLimit": 4,
+    "traceLimit": 128,
+    "hardwareValidated": false
+  },
+  "dmaCapture": {
+    "mode": "Submission prefix attached to CommandList; no execution from diagnostic copies",
+    "wordsPerPrefix": 64,
+    "failureDirectory": "/data/eden-nx2/user/dump/dma-capture-026",
+    "hardwareValidated": true,
+    "validationScope": "Capture mechanism only; mutation timing observed, no stability fix established.",
+    "lastWriterTracing": "Disabled by default; .022 writer identified as synchronous DownloadBufferMemory. Prefix failure captures remain.",
+    "changedPrefixObservationLimit": 4,
+    "observationPolicy": "Diagnostic only; changed prefix does not itself reject or repair commands"
+  },
+  "cpuWriteOrdering": {
+    "deferredNotifications": true,
+    "scope": "Prototype session initialization with .032 improvements, direct DMA and targeted parameter cache",
+    "causeConfirmed": false,
+    "hardwareValidated": false,
+    "hardwareObservation": ".033 comparison pending; earlier .024 comparison preceded direct DMA and parameter cache",
+    "gpuReplay": "Thread-local synchronous replay helper retained; .025 FlushRegion drains removed"
+  },
+  "bufferReadback": {
+    "scope": "EDEN_NX2_PS5_PROTO",
+    "mode": "Exact request clipped to actual buffer; preserve remaining GPU dirty/download intervals and page flags",
+    "hardwareValidated": false,
+    "writerConfirmed": "DeviceMemory::WriteBlockUnsafe source bytes match queued-command corruption; .022 DownloadBufferMemory callsite verified",
+    "hardwareObservation": ".023 user confirms playable screen remains open; reports 6 FPS and slight physical crackling. Logs remain active through about 65s with no new unbound-DMA exception, beyond prior failure points. Limited single-trial evidence, not broad stability validation."
+  },
+  "readbackTargetedTests": {
+    "scope": "Production DownloadBufferMemory extracted into mock-runtime harness; real Common::RangeSet, simulated page tracker and GPU copies",
+    "cases": 5,
+    "passed": 5,
+    "sanitizers": "ASan/UBSan",
+    "host": "build-server",
+    "limitations": "No real Vulkan driver or PS5 execution in host harness"
+  },
+  "pointerReadbackBatch": {
+    "enabled": "Native Vulkan graphics and compute binding",
+    "requestBytesPerPointer": 8,
+    "pageCopies": false,
+    "perBindingFallback": true,
+    "hardwareValidated": false,
+    "hardwareObservation": "Playable at 6 FPS in .027; aggregate Vulkan wait volume unchanged. Dominant wait callsite not yet established."
+  },
+  "waitAttribution": {
+    "kinds": {
+      "0": "BufferCacheRuntime::Finish",
+      "1": "Scheduler::Finish",
+      "2": "MasterSemaphore::Wait",
+      "3": "MemoryManager::ReadBlock",
+      "4": "RasterizerVulkan::FlushRegion"
+    },
+    "sitesPerThread": 24,
+    "overflowBucket": true,
+    "maxSecondsPerThread": 180,
+    "reportIntervalSeconds": 5,
+    "timersOverlap": true,
+    "runtimeAnchor": true,
+    "hardwareValidated": true,
+    "validationScope": "Read-origin attribution confirmed",
+    "observedDominant": "Native DMA command-block fetch in DmaPusher::DispatchCalls/Step",
+    "requestedByteTotals": true,
+    "dmaReadWindow": {
+      "seconds": 5.000009517,
+      "calls": 218743,
+      "bytes": 31830468,
+      "wallNs": 3340242552
+    }
+  },
+  "dmaFetchPolicy": {
+    "mode": "DmaAccuracy::Unsafe",
+    "scope": "EDEN_NX2_PS5_PROTO",
+    "gpuAccuracy": "High",
+    "ownedCommandStorage": true,
+    "indirectParameterRefresh": "Retained existing high-accuracy engine path",
+    "hardwareValidated": false,
+    "limitations": "Direct command fetch accuracy tradeoff; GPU-authored command headers require actual compatibility validation",
+    "hardwareObservation": "Image correct in user trial; 8 FPS initially, 3 FPS later. Direct DMA fetch helps but does not resolve total performance cost."
+  },
+  "macroParameterReadbackCache": {
+    "windows": 4,
+    "windowBytes": 65536,
+    "scope": "Contiguous exact device-range reads in Maxwell3D::RefreshParametersImpl only",
+    "invalidate": "Each overlapping gpu_modified_ranges.Add, buffer delete, ledger reset",
+    "guestWrites": "Only requested dirty bytes",
+    "hardwareValidated": false
+  },
+  "eglantineShaderFixes": {
+    "poolCommit": "59047f0e6fd149e8187092ec0d9f419aa03e875f",
+    "amdCommit": "bb353609e6c2700014d7d1f1d50cf35e2c45a3b1",
+    "pool": "Destroy each constructed T, including owned Phi operand allocations",
+    "amd": "U1/U32 undefined SPIR-V values become false/zero by default",
+    "disableEnvironment": "EDEN_NX2_UNDEF_ZERO=0",
+    "disableMarker": "/data/eden-nx2/undef-zero-off.txt",
+    "restartRequired": true,
+    "vulkanCacheVersions": {
+      "enabled": 38,
+      "disabled": 39,
+      "previous": 37
+    },
+    "nativeTranslatorSalt": "0x4f554e4345a00006",
+    "hostRegression": "PASS on build-server: pool ownership and both AMD policy/cache modes under ASan/UBSan/LSan",
+    "hardwareValidated": false
+  },
+  "archive": "Eden-NX2-PS5-prototype-00.063.000.tar.gz",
+  "archiveBytes": 43829604,
+  "archiveSha256": "1f12be1d1fbc6a41ec16deb31b4b8a91986606466bcb5a0d5b2da2ec7bc7e810",
+  "ebootSha256": "9003d5cc3885b3f3164a4368c7cbc5723be5d6744bc5f8bee029d8be59d64657",
+  "buildPatchSha256": "af09f9b9add89cda31808afbb21c9068aa6a4281ddea59d02aa1aa6d2290e041",
+  "onDemandProfile": {
+    "requestPath": "/data/eden-nx2/profile-refresh.request",
+    "request": "Unique nonempty nonce, up to 64 bytes, consumed once; polling once per second while HUD GPU sampling runs.",
+    "windowSeconds": 180,
+    "cacheCounters": "Cumulative hits/misses/fills/bytes/evictions/invalidations/clears; use deltas.",
+    "detailedWindowSeconds": 20,
+    "gpuSampling": "Draw 1/64; compute 1/8; bounded asynchronous timestamp pairs, no new submission or query WAIT.",
+    "hardwareObservation": ".043 capture recovered: fine CPU phases emphasize resource reads/descriptors; sampled draw latencies short, GPU work outside sampled draws still unattributed. .044 adds buffer-copy samples and storage byte counters; gameplay result pending.",
+    "cpuDetail": ".047: pointer_sync, stage_resources (includes ssbo_binding), fill_views, host_stage_bind, push_images, descriptor_acquire. Same 20-second window; CPU wall times, cumulative.",
+    "lastCpuObservation": ".049 user 21 FPS, image correct. host_storage 1.625s, host_uniform 0.666s, host_texel 0.038s / 20-second fine window.",
+    "hostBindingDetail": ".049 adds host_uniform, host_storage, host_texel; included in host_stage_bind, same bounded CPU window."
+  },
+  "readbackWindowCapacity": {
+    "windows": 64,
+    "bytesPerWindow": 65536,
+    "maxRetainedBytes": 4194304,
+    "previousWindows": 4,
+    "reason": "Measured 4215 capacity evictions / 4503 fills in 5.039 seconds during actual character control. GPU invalidation and exact dirty-byte copy unchanged."
+  },
+  "nativeDrawMacroInvestigation": {
+    "phase": "Pass-end premature flush removed; deferred grouping remains pending across ordinary pass switches. Console trial pending.",
+    "entry": "0x1e7",
+    "parameters": [
+      "topology",
+      "indexCount",
+      "instanceCount",
+      "firstIndex",
+      "baseVertex",
+      "baseInstance"
+    ],
+    "sdkFingerprint": "0x5c60ba321d5e0497",
+    "guards": [
+      "Exact program and SDK fingerprint",
+      "GPU-dirty parameters and CPU-current triangle topology",
+      "Replay mode excluded; no existing HLE state or topology override",
+      "Mapped contiguous indirect arguments",
+      "Shared CB0 binding ABI and no physical alias with base constants"
+    ],
+    "fallback": "Original execution before side effects for every unsupported shape; no replay after draw starts.",
+    "disableMarker": "/data/eden-nx2/native-draw-hle-off.txt (full app restart)",
+    "hardwareValidated": false,
+    "blackScenery": "Unresolved; no graphics fix claimed.",
+    "shadowBookkeeping": {
+      "registers": [
+        "index.first",
+        "index.count",
+        "draw.begin",
+        "draw.end"
+      ],
+      "copyBytes": 20,
+      "maxSnapshotsPerOwner": 1024,
+      "maxEventsPerOwner": 8192,
+      "maxStagingOwners": 64,
+      "ordering": "Immutable GPU argument copies deferred in main, cancelled if unobserved and fully overwritten; exact source overlap drains old copies before writes. Existing observer wait and reserved staging lifetime retained.",
+      "cancellation": "Complete CPU overwrites discard pending history without a wait.",
+      "hardwareValidated": false
+    },
+    "snapshotOrdering": {
+      "requests": "Bounded queue (4096), source usage pinned at request time, cancel on full shadow overwrite/reset.",
+      "emit": "Submission, true source-range write conflict, resource release, CPU observation or bounded capacity; ordinary render-pass changes do not emit.",
+      "writes": "Shader binding ranges, raw copies/fills, query outputs; overlapping CPU uploads forced after old snapshots in main.",
+      "batching": "One copy command per source/destination pair, multiple nonoverlapping regions, one barrier pair per batch.",
+      "submissions": "No special Scheduler.Flush for snapshots; no stale whole-buffer write generations.",
+      "hardwareValidated": false
+    }
+  },
+  "eglantinePs5Adaptations": {
+    "source": "https://github.com/heydemoura/EglantinePS5",
+    "commit": "a2c5a9084c5d4c1d2a79db6d87480b0fe44b8f2b",
+    "staging": "CPU-mapped buffers above 16 MiB rounded to 16 MiB; capacity-aware reuse; release completed non-deferred caches and retry once on device OOM",
+    "autoStub": "Deduplicate reports per service/command only when the existing auto-stub setting is enabled; fallback admission unchanged",
+    "heap": "Keep virtual continuity; reduce physical chunks down to 2 MiB on allocation refusal; roll back all partial mappings on failure",
+    "hardwareValidated": false,
+    "hostRegression": "PASS on build-server under ASan/UBSan/LSan: staging sizing and live/deferred preservation; fragmented allocation, map failure at each piece, exhaustion, bounded scratch and invalid ranges; concurrent auto-stub deduplication and unchanged disabled policy"
+  },
+  "groupedStorageReadReuse": {
+    "readOnly": "Reuse gathered view until an exact source write invalidates it",
+    "writes": "Shader writes, CPU uploads/copies, fills and query output",
+    "lifetime": "Gathered entries retain source owners and retire on deletion",
+    "writableGroups": "Conservative gather/scatter preserved",
+    "hostValidation": "ASan/UBSan build-server PASS: 200000 overlap/overflow cases plus owner retirement and range boundaries",
+    "hardwareValidated": false,
+    "syncContractFix": "Invalidate when SynchronizeBuffer returns false (upload); true means no upload.",
+    "hardwareObservation": ".045 user reports 18 FPS vs 8. Over 25.154 s: 92.77% gathered requests reused, gather 21.35 GB/s, scatter 11.05 GB/s, avoided gather payload 271.42 GB/s at new rate. Visual state not specified.",
+    "syncContractHostValidation": "ASan/UBSan build-server PASS using actual SynchronizeBuffer: no upload/clean reuse, upload invalidation, 10000 unchanged bindings."
+  },
+  "textureArrayCpuPreparation": {
+    "rootValidation": "Once per descriptor per draw; refreshed next draw, individual handle/offset checks retained",
+    "scratch": "Thread-local vectors cleared each invocation; only capacity reused",
+    "hostValidation": "build-server ASan/UBSan PASS: actual reader, 1024 elements, next-draw root change and rejection guards",
+    "hardwareValidated": false,
+    "hardwareObservation": ".046 still 18 FPS; cfg_read 5.112s and cfg_desc 2.907s / 20-second fine-mark window, similar to .045. No measured benefit."
+  },
+  "drawResourceMemo": {
+    "scope": "One ConfigureImpl only; stack-owned 64-entry exact-key sampler-ID table. Handle-word memo removed in .049: zero hits.",
+    "miss": "Original typed reader, including validation/error paths",
+    "counters": "NX2_DRAW_MEMO kind=0 handles, kind=1 samplers; cumulative requests/hits",
+    "diagnostics": "Skip sampler-capture TLS access if native diagnostics disabled",
+    "hostValidation": "build-server ASan/UBSan PASS: 200000 loads, collisions, zero, exception, next-draw refresh, sampler IDs",
+    "hardwareValidated": false,
+    "hardwareObservation": ".048 user: 21 FPS, image correct. Over 25.114s: samplers 68622825 requests / 67886784 hits (98.93%); handle-word memo zero hits. Sampler memo and disabled-capture guard effects not separately isolated."
+  },
+  "preparedStorageViews": {
+    "scope": "Reuse same read-only prepared group within one storage_batch/draw; original first binding pins full source ranges",
+    "guards": "CPU source clean, exact key/total, offset/range/alignment, entry read-only and reusable",
+    "invalidation": "Exact source shader writes, copies/uploads/fills, query outputs and owner release invalidate shortcut; batch reset each draw",
+    "counters": "NX2_PREPARED_STORAGE requests/hits; CPU-dirty views go directly to full fallback",
+    "hostValidation": "build-server ASan/UBSan PASS using actual frontend/runtime methods, queue/allocation mocks; alias reuse, dirty fallback, source overlap/adjacency, writable fallback, geometry/offset/alignment and next-draw reset",
+    "hardwareValidated": false,
+    "hardwareObservation": ".050 user 21 FPS, image correct. 760925 prepared requests and zero hits over 20.099 s; host_storage 1.675s vs .049 1.625s, no gain. Shortcut unused; remove on next functional build.",
+    "enabled": false,
+    "removedIn": "00.051.000",
+    "reason": "No hits / no FPS gain in .050 controlled scene."
+  },
+  "externalSourceAudit": {
+    "repository": "https://git.eden-emu.dev/Franseven/PokeDinner-a-Eglantine-Fork",
+    "head": "c3ce9bcd5b04e5a1480ebf764ad7f1dd47b1adaa",
+    "report": "artifacts/pokedinner-source-audit.json",
+    "scope": "Read-only; candidate patches not integrated."
+  },
+  "gpuSplitPs5": {
+    "mode": 1,
+    "frontend": "Owned command decoding and puller",
+    "backend": "Engine state, PS5 MME JIT, native indirect-draw HLE, precise parameter reads, Vulkan caches/render",
+    "frontMacros": false,
+    "accuracy": "GPU High retained; existing unsafe DMA owned header snapshots retained",
+    "synchronization": "Owner-thread semaphore readback and fence operations, High GEQUAL drain, ordered normal shutdown; failures propagate to frontend",
+    "backendThread": "PS5 pthread, 1 MiB stack; EDEN_NX2_PS5_PROTO ABI/lifecycle guard",
+    "placement": "Verified topology policy uses spare physical core when available, permitted fallback otherwise; live console placement pending",
+    "measurements": "NX2_SPLIT_PERF cumulative words/batches/drains/wait/backend/sync_reads, GPUBack named worker",
+    "hostValidation": "build-server ASan/UBSan PASS: default solo startup, explicit armed pthread handoff; existing idle hook, blocking waits, owner/order/wrap/owned payload/failure/restart coverage.",
+    "hardwareValidated": false,
+    "goal": "Aim for 30 FPS; FPS and visual result not yet measured.",
+    "hardwareObservation": ".062 capture complete: channel3 current29222 required29226 for20 samples. Ordered DMA snapshots14, bytes724, dirty0, no later snapshots. This change does not resolve the observed wait; no dirty command block observed. QMD counters unchanged after activation; producer still unidentified.",
+    "waiting": ".052 uses native condition_variables for space/progress/work; startup waits for backend ready, traces entry/named/ready/first batch.",
+    "startupTrace": ".053 first 32 entries begin/end, kind/position/callback targets plus CheckOwner address anchor. Exact ELF retained for symbolization.",
+    "consoleTopology": "Captured .051 heap reports ready=0 distinct_cores=1: topology not established, OS affinity retained; no claim of dedicated physical-core placement.",
+    "completionFix": "Separate completion_lock from producer write_lock; release producer lock after enqueue before blocking completion wait.",
+    "completionHostValidation": "Actual old code full-queue lock cycle reproduced. Corrected actual SignalCommand/PushCommand ASan/UBSan PASS under full queue and 100 completion races. Generated PS5 producer cancellation test PASS.",
+    "loadingProgressFix": ".055 renderer-owner idle hook runs Eden::LoadingTick while loading; 1ms timed wait only while loading, normal indefinite work wait after first guest presentation. Frontend remains excluded.",
+    "loadingHostValidation": "build-server ASan/UBSan actual split PASS: queued initialization completed by backend idle hook without new command, owner verified; ordering/wrap/owned payload/offsets/progress/failure/restart/shutdown stress retained.",
+    "activation": "PS5 default unarmed; unique nonce in /data/eden-nx2/split-enable.request requests handoff between commands via gameplay HUD. Reset on new worker session; independent profile marker.",
+    "stallTrace": ".057 bounded 8 atomic snapshots/session after 1s frontend drain/space or backend idle; current entry, callback, published/consumed positions and anchor. DMA sync waits also log after 1s.",
+    "stallHostValidation": "build-server ASan/UBSan PASS: delayed callback reports front drain with executing callback; empty backend reports idle; completion/wakeup after timeout, stop/reset/restart.",
+    "independentObserver": ".059 dedicated O_APPEND descriptor /data/eden-nx2/logs/split-observer.log; checked open/partial writes/EINTR, prepared/entered/sample/complete/joined records and sleep errors. Native pthread, 256 KiB stack, <=20 x ~1s atomic breadcrumb samples; no renderer/worker/FILE locks. Join before backend shutdown.",
+    "observerHostValidation": "build-server ASan/UBSan PASS: actual dedicated output with fully buffered and locked stderr, samples read before unlock; open/write failure handling and recovery, early stop/join, append and restart.",
+    "observerHardwareValidated": true,
+    "semaphoreObservation": ".060 independent observer adds wait channel/ASID/GPU/CPU/current/required/operation/polls and native report events 0/1/2/3 counters/latest/matching context. Existing TraceNativeQuery CSV stays disabled; no game behavior bypass. Enabled only during observer capture; cumulative per-process counters and approximate cross-field snapshots. Not all CPU/shader/DMA producers observed.",
+    "semaphoreHostValidation": "build-server ASan/UBSan PASS: actual observer + TraceNativeQuery disabled-CSV hook, serialized fields, GPU/ASID vs physical alias matches and nonmatches, capture gate/counters, independent file and lifecycle.",
+    "producerObservation": ".061 fixed-memory atomic baseline collected from worker startup, emitted before backend activation. QMD PCAS signal/state/planned releases and matching plan; event20 native callback queued, event21 actual direct write (reduction/max), existing event1 actual increment write. No callback order/value changes; CSV disabled. Last-value snapshots approximate; other producers not all covered.",
+    "producerHostValidation": "build-server ASan/UBSan PASS: baseline before split plus serialized QMD signal/state/plan, callback queued/written, matching/counters, capture gate, independent file and lifecycle.",
+    "nativeDmaSnapshot": ".062 native split header snapshot taken on backend after preceding engine work; exact cache dirtiness check, coherent ReadBlock if dirty/safe, Unsafe owned copy if clean. Retained across pending acquire. Existing solo path and High/Unsafe settings kept. NX2_SPLIT_DMA snapshots/bytes/dirty counters during observation.",
+    "nativeDmaSnapshotHostValidation": "build-server ASan/UBSan actual GpuSplit and production helper PASS: queued write changes stale20 to coherent99; owner, exact dirty range/neighbors, clean no-readback, forced safe and owned retention."
+  },
+  "eglantinePagesTextures": {
+    "commits": [
+      "badc91ebce6b6cb44eabe67f7aa0dbbc6abd9e46",
+      "11a110898fcfe16a5b9aee98c4346265825c3178"
+    ],
+    "scope": [
+      "partial page batching",
+      "ASID ownership",
+      "texture layer and row strides"
+    ],
+    "hostTests": "PASS ASan/UBSan",
+    "nativeBuild": "PASS",
+    "package": "PASS",
+    "hardwarePerformanceValidated": false,
+    "notes": "Includes restored DMA shutdown guard and updated inherited checks."
+  }
 }

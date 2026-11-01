@@ -2584,6 +2584,15 @@ if(EDEN_PS5_OPENGL)
         string(REPLACE "#include \"gpu_failure.h\"" "#include \"${EDEN_PORT_DIR}/gpu_failure.h\""
             native_gpu_lifecycle "${native_gpu_lifecycle}")
         string(APPEND gpu_worker "\n${native_gpu_lifecycle}")
+        # The backend owns loading presentation too; its idle hook continues Vulkan submissions
+        # before the first guest frame, without sharing the scheduler with the decoder.
+        string(FIND "${gpu_worker}" "        auto& split = VideoCommon::GpuSplit::Get();" split_owner_at)
+        if(split_owner_at LESS 0)
+            message(FATAL_ERROR "Pinned split idle-hook initialization changed")
+        endif()
+        string(REPLACE "        auto& split = VideoCommon::GpuSplit::Get();"
+            "        auto& split = VideoCommon::GpuSplit::Get();\n        split.SetIdleHook([](void* owner) { return Eden::LoadingTick(*static_cast<VideoCore::RendererBase*>(owner), true); }, &renderer);"
+            gpu_worker "${gpu_worker}")
         # Animate only until guest presentation, on the renderer-owning worker.
         set(hud_wait "            state.queue.PopWait(next, stop_token);")
         string(FIND "${gpu_worker}" "${hud_wait}" hud_wait_offset)
@@ -2592,7 +2601,7 @@ if(EDEN_PS5_OPENGL)
         endif()
         string(PREPEND gpu_worker "namespace VideoCore { class RendererBase; }\nnamespace Eden { bool LoadingTick(VideoCore::RendererBase&, bool idle); }\n")
         string(REPLACE "${hud_wait}"
-            "            if (Eden::LoadingTick(renderer, false)) {\n                if (!state.queue.TryPop(next)) {\n                    Eden::LoadingTick(renderer, true);\n                    std::this_thread::sleep_for(std::chrono::milliseconds(1));\n                    continue;\n                }\n            } else {\n${hud_wait}\n            }" gpu_worker "${gpu_worker}")
+            "            if (!split.Active() && Eden::LoadingTick(renderer, false)) {\n                if (!state.queue.TryPop(next)) {\n                    Eden::LoadingTick(renderer, true);\n                    std::this_thread::sleep_for(std::chrono::milliseconds(1));\n                    continue;\n                }\n            } else {\n${hud_wait}\n            }" gpu_worker "${gpu_worker}")
         # The overlay's GPU share reads the producer-side waits from every build, so these two
         # scopes are not development-only and pass `always` to Performance::Timer, which is
         # otherwise off outside a development build because its timers sit on hot paths. Each
@@ -2641,8 +2650,20 @@ if(EDEN_PS5_OPENGL)
     # In-flight guest waits must also unwind before Stop can join the worker.
     foreach(unit dma_pusher engines/puller)
         file(READ "${PROJECT_SOURCE_DIR}/src/video_core/${unit}.cpp" command_source)
-        string(REPLACE "        sync_cv.wait(lk, [this]() { return synced; });"
-            "        while (!synced && !system.IsShuttingDown())\n            sync_cv.wait_for(lk, std::chrono::milliseconds(10));\n        if (system.IsShuttingDown()) return false;" command_source "${command_source}")
+        if(unit STREQUAL "dma_pusher")
+            # NX2 uses a timed loop with backend failure checks and bounded diagnostics.
+            # Keep that body and make shutdown terminate it; fail if its anchors change.
+            foreach(wait_anchor IN ITEMS "        while (!synced) {" "        signal_sync = false;")
+                string(FIND "${command_source}" "${wait_anchor}" wait_at)
+                if(wait_at LESS 0)
+                    message(FATAL_ERROR "Pinned DMA wait changed: ${wait_anchor}")
+                endif()
+            endforeach()
+            string(REPLACE "        while (!synced) {"
+                "        while (!synced && !system.IsShuttingDown()) {" command_source "${command_source}")
+            string(REPLACE "        signal_sync = false;"
+                "        if (system.IsShuttingDown()) return false;\n        signal_sync = false;" command_source "${command_source}")
+        endif()
         string(REPLACE "    while (word != value) {" "    while (word != value && !dma_pusher.system.IsShuttingDown()) {" command_source "${command_source}")
         if(unit STREQUAL "dma_pusher")
             # Guest writes queued while a cache lock was held (performance.h cpu_write_defer) reach the
@@ -2746,6 +2767,7 @@ string(REPLACE "${flush_caching_old}" [=[void MemoryManager::FlushCaching() {
     if (::Eden::Performance::gpu_dirty_pending.load(std::memory_order_relaxed) &&
         ::Eden::Performance::gpu_dirty_pending.exchange(false, std::memory_order_acq_rel)) {
         ::Eden::Performance::gpu_dirty_replays.fetch_add(1, std::memory_order_relaxed);
+        const ::Eden::Performance::CpuWriteReplay replay;
         for (unsigned core = 0; core < Core::Hardware::NUM_CPU_CORES; ++core) {
             for (const auto& write : ::Eden::Performance::TakeDeferredWrites(core)) {
                 if (rasterizer->OnCPUWrite(write.address, write.end - write.address)) {

@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "fastmem.h"
+#include "fragmented_commit.h"
 
 #ifdef PS5_NATIVE
 // Keep CPU heaps/tables and JIT views out of RADV's high-word-2 GPU window.
@@ -693,23 +694,61 @@ void* ReserveMemoryRange(std::size_t size) noexcept {
 #endif
 }
 
+#ifdef PS5_NATIVE
+namespace {
+// Scratch only, not a live allocation ledger: this heap keeps successful pieces
+// for the process lifetime. Static storage avoids allocation and a large stack
+// inside malloc. 8192 pieces cover up to 16 GiB at the minimum 2 MiB granule.
+std::array<FragmentedCommit::Piece, 8192> heap_commit_scratch;
+std::atomic_flag heap_commit_lock = ATOMIC_FLAG_INIT;
+struct HeapCommitOps {
+    bool Allocate(std::size_t size, std::int64_t& physical) noexcept {
+        return eden_direct_high(size, LargePage, 12, &physical) == 0;
+    }
+    bool Map(const FragmentedCommit::Piece& piece) noexcept {
+        void* at = reinterpret_cast<void*>(piece.address);
+        const int result = sceKernelMapDirectMemory(&at, piece.size, PROT_READ | PROT_WRITE,
+                                                    MAP_FIXED, piece.physical, LargePage);
+        // MAP_FIXED must never map at a different address. A live unexpected
+        // mapping cannot safely be released as an unmapped allocation.
+        if (result == 0 && at != reinterpret_cast<void*>(piece.address)) std::abort();
+        return result == 0;
+    }
+    void ReleaseUnmapped(const FragmentedCommit::Piece& piece) noexcept {
+        if (sceKernelReleaseDirectMemory(piece.physical, piece.size) != 0) std::abort();
+    }
+    void Rollback(const FragmentedCommit::Piece& piece) noexcept {
+        void* const address = reinterpret_cast<void*>(piece.address);
+        if (munmap(address, piece.size) != 0) std::abort();
+        void* again = address;
+        if (sceKernelReserveVirtualRange(&again, piece.size, MAP_FIXED, LargePage) != 0 ||
+            again != address) std::abort();
+        ReleaseUnmapped(piece);
+    }
+};
+} // namespace
+#endif
+
 bool CommitMemoryRange(void* address, std::size_t size) noexcept {
     if (address == nullptr || size == 0 || size % LargePage != 0 ||
-        reinterpret_cast<std::uintptr_t>(address) % LargePage != 0)
+        reinterpret_cast<std::uintptr_t>(address) % LargePage != 0 ||
+        size > (std::numeric_limits<std::uintptr_t>::max)() - reinterpret_cast<std::uintptr_t>(address))
         return false;
 #ifdef PS5_NATIVE
-    std::int64_t physical = -1;
-    if (eden_direct_high(size, LargePage, 12, &physical) != 0) return false;
-    void* at = address;
-    if (sceKernelMapDirectMemory(&at, size, PROT_READ | PROT_WRITE, MAP_FIXED, physical, LargePage) != 0 ||
-        at != address) {
-        (void)sceKernelReleaseDirectMemory(physical, size);
-        return false;
+    for (unsigned spins = 0; heap_commit_lock.test_and_set(std::memory_order_acquire); ++spins) {
+        if (spins < 64) sched_yield();
+        else usleep(50);
     }
+    HeapCommitOps ops;
+    std::size_t blocks = 0;
+    const bool committed = FragmentedCommit::Commit(reinterpret_cast<std::uintptr_t>(address), size,
+                                                   LargePage, heap_commit_scratch, ops, blocks);
+    heap_commit_lock.clear(std::memory_order_release);
+    if (!committed) return false;
     // The heap grows through here: no stdio (it may allocate).
-    char line[96];
-    const int length = std::snprintf(line, sizeof(line), "EDEN_HEAP_PIECE bytes=%zu va=%p pa=%llx\n", size, address,
-                                     static_cast<unsigned long long>(physical));
+    char line[112];
+    const int length = std::snprintf(line, sizeof(line), "EDEN_HEAP_PIECE bytes=%zu va=%p blocks=%zu\n",
+                                     size, address, blocks);
     if (length > 0) Note(line);
     std::memset(address, 0, size);
     return true;

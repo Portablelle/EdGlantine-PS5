@@ -44,7 +44,7 @@ dispatch_trace = ('                const auto count = ++dispatches;\n'
 # NX2 has a normal dispatch and a split-front dispatch (disabled at runtime here).
 assert worker.count(dispatch_trace) == source.count(dispatch_call) == 2
 untraced = worker.replace(dispatch_trace, dispatch_call).replace('        unsigned dispatches = 0;\n', '')
-loading_wait = """            if (Eden::LoadingTick(renderer, false)) {
+loading_wait = """            if (!split.Active() && Eden::LoadingTick(renderer, false)) {
                 if (!state.queue.TryPop(next)) {
                     Eden::LoadingTick(renderer, true);
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -55,6 +55,9 @@ loading_wait = """            if (Eden::LoadingTick(renderer, false)) {
             }"""
 assert untraced.count(loading_wait) == 1
 untraced = untraced.replace(loading_wait, '            state.queue.PopWait(next, stop_token);')
+idle_hook = '        split.SetIdleHook([](void* owner) { return Eden::LoadingTick(*static_cast<VideoCore::RendererBase*>(owner), true); }, &renderer);\n'
+assert untraced.count(idle_hook) == 1
+untraced = untraced.replace(idle_hook, '')
 assert body in untraced, 'GPU worker semantics changed beyond dispatch markers and startup animation wait'
 
 assert 'stop_source.get_token()' in worker and 'thread.get_stop_token()' not in worker

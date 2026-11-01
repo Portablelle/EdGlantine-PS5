@@ -12,7 +12,15 @@ assert 'kInstallDir = "/data/homebrew/PPSA99862"' in paths
 main=(root/'headless/main.cpp').read_text()
 assert 'setenv("EDEN_NX2_MME_JIT", "1", 1)' in main
 assert 'Settings::values.disable_macro_jit = true;' in main
-assert 'setenv("EDEN_NX2_SPLIT", "0", 1)' in main
+assert 'setenv("EDEN_NX2_SPLIT", "1", 1)' in main
+# The split is available, but PS5 sessions boot unarmed until an explicit request.
+source=Path((root/'.local/headless-cache').read_text().strip())/'source/src/video_core'
+split=(source/'gpu_split.cpp').read_text()
+header=(source/'gpu_split.h').read_text()
+assert '#ifdef EDEN_NX2_PS5_PROTO' in split.split('void GpuSplit::MaybeStart(',1)[1].split('static const char mode',1)[0]
+assert 'if (!activation_requested.load(std::memory_order_acquire)) return;' in split
+assert 'std::atomic<bool> activation_requested{};' in header
+assert 'if (!active) activation_requested.store(false, std::memory_order_release);' in header
 assert '            MigrateSandboxData();' not in main
 for folder in ('headless','src','sce_sys'):
     for p in (root/folder).rglob('*'):

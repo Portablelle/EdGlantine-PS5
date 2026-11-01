@@ -120,7 +120,8 @@ with tempfile.TemporaryDirectory(prefix='eden-startup-') as directory:
     snapshots = output.split('EDEN_PERF_SAMPLE ')[1:]
     assert len(snapshots) == 5
     for sample in snapshots:
-        assert sample.count('EDEN_PERF_WORKER ') == 9 and sample.count('EDEN_PERF_PROGRESS ') == 6
+        assert sample.count('EDEN_PERF_WORKER ') == 10 and sample.count('EDEN_PERF_PROGRESS ') == 6
+        assert 'name=GPUBack ' in sample
         assert 'name=CPUCore_5 ' in sample and 'core=5 compilations=0 ' in sample
         assert 'core=1 compilations=1 ' in sample
         assert re.search(r'name=CPUCore_2 cpu_ns=-\d+', sample)

@@ -759,6 +759,10 @@ void GraphicsWindow::OnFrameDisplayed() {
                             static_cast<uint32_t>(hud_fields.load(std::memory_order_relaxed)));
 #endif
         ++frame_total;
+        // Stop draw-phase diagnostics after three minutes even when the HUD is hidden.
+        static const double profile_started = now;
+        if (now - profile_started >= 180.0 && Eden::Performance::detailed_until_ns.load(std::memory_order_relaxed) == 0)
+            Eden::Performance::dev_marks.store(false, std::memory_order_relaxed);
         // What a recorded controller session counts frames by (gameplay_test.h): the input
         // worker runs on another thread, so it reads a copy rather than the member.
         Display::gameplay_frame.store(frame_total, std::memory_order_relaxed);

@@ -1,11 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "performance.h"
+#include "native_gpu_profile.h"
+#include "native_cpu_profile.h"
+#include "video_core/gpu_split.h"
+#include "video_core/native_draw_memo.h"
 #include "cpu_policy.h"
 #include "crash_report.h"
 #include "stall_watchdog.h"
 #include "../src/fastmem.h"
 #include "common/cpu_features.h"
 #include "common/sparse_large_vector.h"
+#ifdef EDEN_NX2_PS5_PROTO
+#include "video_core/native_wait_profile.h"
+#include "video_core/native_draw_indirect.h"
+#include "video_core/buffer_cache/readback_statistics.h"
+#endif
 #include <algorithm>
 #include <string>
 #include <set>
@@ -46,7 +55,7 @@ void SparseUsage(std::size_t* reserved, std::size_t* committed) noexcept;
 namespace Eden::Performance {
 namespace {
 constexpr std::array names{"CPUCore_0", "CPUCore_1", "CPUCore_2", "CPUCore_3", "CPUCore_4", "CPUCore_5",
-                           "GPU", "HostTiming", "VSyncThread"};
+                           "GPU", "HostTiming", "VSyncThread", "GPUBack"};
 struct Worker {
     pthread_t thread{};
     clockid_t clock{};
@@ -156,7 +165,7 @@ std::array<unsigned, CpuPolicy::PinnedWorkers> worker_cpus{};
 bool worker_topology_ready = false;
 bool worker_topology_checked = false;
 std::array<int, 64> cpu_core{};
-unsigned long long secondary_cpus = 0;
+unsigned long long split_back_cpus{}, secondary_cpus = 0;
 cpuset_t topology_allowed{};
 bool topology_allowed_valid = false;
 std::atomic<bool> placement_secondary{false};
@@ -185,6 +194,7 @@ void CheckWorkerTopology() {
     worker_topology_ready = false;
     topology_allowed_valid = false;
     secondary_cpus = 0;
+    split_back_cpus = 0;
     cpu_core.fill(-1);
     cpuset_t original{};
     if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &original)) return;
@@ -237,7 +247,11 @@ void CheckWorkerTopology() {
         }
         // Prefer unused physical cores, otherwise guest SMT siblings. Never
         // put background work on the GPU's sibling or a pinned primary CPU.
-        secondary_cpus = spare ? spare : siblings;
+        const char* split_mode = std::getenv("EDEN_NX2_SPLIT");
+        const bool split = split_mode && split_mode[0] == '1';
+        split_back_cpus = split ? (spare ? spare : siblings) : 0;
+        if (split_back_cpus) split_back_cpus &= (~split_back_cpus + 1); // one allowed logical CPU
+        secondary_cpus = split && siblings ? siblings : (spare ? spare : siblings);
         for (unsigned i = 0; i < worker_cpus.size(); ++i)
             std::printf("EDEN_WORKER_PLAN name=%s cpu=%u core=%u\n", names[i], worker_cpus[i], cores[i]);
     }
@@ -247,14 +261,15 @@ void CheckWorkerTopology() {
     // seven physical cores from a timing probe of just CPUs 0, 1 and 2.
 }
 void PlaceSecondary(const char* name) {
-    if (!placement_secondary.load(std::memory_order_relaxed) || !secondary_cpus) return;
+    const auto target = !std::strcmp(name, "GPUBack") && split_back_cpus ? split_back_cpus : secondary_cpus;
+    if (!placement_secondary.load(std::memory_order_relaxed) || !target) return;
     cpuset_t mask{}, original{};
     if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &original)) return;
     for (unsigned cpu = 0; cpu < 64; ++cpu)
-        if (secondary_cpus & (1ULL << cpu)) CPU_SET(cpu, &mask);
+        if (target & (1ULL << cpu)) CPU_SET(cpu, &mask);
     const bool applied = ApplyAffinity(mask, original);
     if (secondary_reports.fetch_add(1, std::memory_order_relaxed) < 64)
-        std::printf("EDEN_WORKER_PLACED name=%s mask=%llx verified=%d\n", name, secondary_cpus, applied);
+        std::printf("EDEN_WORKER_PLACED name=%s mask=%llx verified=%d\n", name, target, applied);
 }
 void PinWorker(unsigned index, cpuset_t& affinity) {
     if (!worker_topology_ready || index >= worker_cpus.size() ||
@@ -571,7 +586,58 @@ unsigned GpuBusyPercent() {
     // Diagnostic prototype: bounded aggregate sampling, no PC sampling or GPU waits added.
     static long long next_report = 0;
     static unsigned reports = 0;
-    if (reports < 24) {
+#ifdef EDEN_NX2_PS5_PROTO
+    static long long next_request_check = 0;
+    static std::string last_request;
+    const auto request_now = MonotonicNs();
+    if (request_now >= next_request_check) {
+        next_request_check = request_now + 1'000'000'000LL;
+        constexpr const char* enable_path = "/data/eden-nx2/split-enable.request";
+        static std::string last_enable_request;
+        if (auto* enable_file = std::fopen(enable_path, "rb")) {
+            char nonce[64];
+            const auto bytes = std::fread(nonce, 1, sizeof(nonce), enable_file);
+            std::fclose(enable_file);
+            const std::string request(nonce, bytes);
+            if (!request.empty() && request != last_enable_request) {
+                last_enable_request = request;
+                VideoCommon::GpuSplit::Get().RequestEnable();
+                std::fprintf(stderr, "NX2_SPLIT_ENABLE_REQUEST mono_ns=%lld\n", request_now);
+            }
+            std::remove(enable_path);
+        }
+        constexpr const char* path = "/data/eden-nx2/profile-refresh.request";
+        if (auto* file = std::fopen(path, "rb")) {
+            char nonce[64];
+            const auto size = std::fread(nonce, 1, sizeof(nonce), file);
+            std::fclose(file);
+            const std::string request(nonce, size);
+            if (!request.empty() && request != last_request) {
+                last_request = request;
+                reports = 0;
+                next_report = 0;
+                const auto epoch = VideoCommon::NativeWaitProfile::Restart();
+                detailed_until_ns.store(NowNs() + 20'000'000'000LL, std::memory_order_relaxed);
+                dev_marks.store(true, std::memory_order_relaxed);
+                Vulkan::NativeGpuProfile::epoch.fetch_add(1, std::memory_order_relaxed);
+                Vulkan::NativeGpuProfile::enabled.store(true, std::memory_order_relaxed);
+                std::fprintf(stderr, "NX2_PROFILE_REFRESH epoch=%llu mono_ns=%lld\n",
+                             static_cast<unsigned long long>(epoch), request_now);
+            }
+            std::remove(path);
+        }
+    }
+#endif
+    const auto detailed_deadline = detailed_until_ns.load(std::memory_order_relaxed);
+    if (detailed_deadline && NowNs() >= detailed_deadline) {
+        dev_marks.store(false, std::memory_order_relaxed);
+        Vulkan::NativeGpuProfile::enabled.store(false, std::memory_order_relaxed);
+        detailed_until_ns.store(0, std::memory_order_relaxed);
+    }
+    if (reports < 36) {
+#ifdef EDEN_NX2_PS5_PROTO
+        VideoCommon::ReadbackStatistics::enabled.store(true, std::memory_order_relaxed);
+#endif
         timers_on.store(true, std::memory_order_relaxed);
         vulkan_cost_enabled.store(true, std::memory_order_relaxed);
         const auto now = MonotonicNs();
@@ -584,7 +650,59 @@ unsigned GpuBusyPercent() {
             for (unsigned i : {2u, 3u, 4u, 5u})
                 std::fprintf(stderr, "NX2_VK_PERF api=%u calls=%llu ns=%llu\n", i,
                              vulkan_api[i].calls.load(), vulkan_api[i].nanoseconds.load());
-            if (++reports == 24) {
+            const auto phase = [&](const char* name, const Totals& total) {
+                std::fprintf(stderr, "NX2_DRAW_PERF mono_ns=%lld phase=%s calls=%llu ns=%llu\n", now,
+                             name, total.calls.load(), total.nanoseconds.load());
+            };
+            std::fprintf(stderr, "NX2_STORAGE_PERF gather_bytes=%llu gather_calls=%llu scatter_bytes=%llu scatter_calls=%llu reused_bytes=%llu reused_calls=%llu\n",
+                         storage_gather_bytes.load(), storage_gather_calls.load(),
+                         storage_scatter_bytes.load(), storage_scatter_calls.load(),
+                         storage_reused_bytes.load(), storage_reused_calls.load());
+            for (unsigned i = 0; i < ::Eden::NativeCpuProfile::totals.size(); ++i) {
+                const auto& total = ::Eden::NativeCpuProfile::totals[i];
+                std::fprintf(stderr, "NX2_CPU_DETAIL mono_ns=%lld phase=%s calls=%llu ns=%llu\n",
+                             now, ::Eden::NativeCpuProfile::names[i], total.calls.load(), total.nanoseconds.load());
+            }
+            for (unsigned i = 0; i < VideoCommon::NativeDrawMemo::statistics.size(); ++i) {
+                const auto& stat = VideoCommon::NativeDrawMemo::statistics[i];
+                std::fprintf(stderr, "NX2_DRAW_MEMO mono_ns=%lld kind=%u requests=%llu hits=%llu\n", now, i,
+                             static_cast<unsigned long long>(stat.requests.load()),
+                             static_cast<unsigned long long>(stat.hits.load()));
+            }
+            using Split = VideoCommon::SplitPerformance;
+            std::fprintf(stderr, "NX2_SPLIT_PERF mono_ns=%lld words=%llu batches=%llu drains=%llu wait_ns=%llu backend_ns=%llu sync_reads=%llu\n", now,
+                         Split::words.load(), Split::batches.load(), Split::drains.load(),
+                         Split::wait_ns.load(), Split::backend_ns.load(), Split::sync_reads.load());
+            phase("draw", rasterizer_draw);
+            phase("flush", draw_flush); phase("pipeline", draw_pipeline);
+            phase("cache_lock", draw_lock_wait); phase("configure", draw_config);
+            phase("state", draw_state); phase("record", draw_record);
+            phase("cfg_sync", cfg_sync); phase("cfg_read", cfg_read);
+            phase("cfg_bind", cfg_bind); phase("cfg_desc", cfg_desc);
+            phase("cfg_rt", cfg_rt); phase("cfg_draw", cfg_draw);
+#ifdef EDEN_NX2_PS5_PROTO
+            namespace Hle = Tegra::NativeDrawIndirect;
+            std::fprintf(stderr, "NX2_NATIVE_DRAW_HLE accepted=%llu code_fallback=%llu state_fallback=%llu source_fallback=%llu shadow_copies=%llu shadow_reads=%llu shadow_discards=%llu snapshot_uploads=%llu snapshot_submits=%llu snapshot_deferred=%llu snapshot_cancelled=%llu snapshot_regions=%llu snapshot_commands=%llu snapshot_batches=%llu snapshot_write_conflicts=%llu\n",
+                static_cast<unsigned long long>(Hle::accepted.load()), static_cast<unsigned long long>(Hle::code_fallback.load()),
+                static_cast<unsigned long long>(Hle::state_fallback.load()), static_cast<unsigned long long>(Hle::source_fallback.load()),
+                static_cast<unsigned long long>(Hle::shadow_copies.load()), static_cast<unsigned long long>(Hle::shadow_reads.load()),
+                static_cast<unsigned long long>(Hle::shadow_discards.load()),
+                static_cast<unsigned long long>(Hle::snapshot_uploads.load()), static_cast<unsigned long long>(Hle::snapshot_submits.load()),
+                static_cast<unsigned long long>(Hle::snapshot_deferred.load()), static_cast<unsigned long long>(Hle::snapshot_cancelled.load()),
+                static_cast<unsigned long long>(Hle::snapshot_regions.load()), static_cast<unsigned long long>(Hle::snapshot_commands.load()),
+                static_cast<unsigned long long>(Hle::snapshot_batches.load()), static_cast<unsigned long long>(Hle::snapshot_write_conflicts.load()));
+            namespace Stats = VideoCommon::ReadbackStatistics;
+            std::fprintf(stderr, "NX2_READBACK_CACHE mono_ns=%lld hits=%llu misses=%llu fills=%llu bytes=%llu evictions=%llu invalidations=%llu clears=%llu\n", now,
+                static_cast<unsigned long long>(Stats::hits.load()), static_cast<unsigned long long>(Stats::misses.load()),
+                static_cast<unsigned long long>(Stats::fills.load()), static_cast<unsigned long long>(Stats::bytes.load()),
+                static_cast<unsigned long long>(Stats::evictions.load()), static_cast<unsigned long long>(Stats::invalidations.load()),
+                static_cast<unsigned long long>(Stats::clears.load()));
+#endif
+            if (++reports == 36) {
+#ifdef EDEN_NX2_PS5_PROTO
+                VideoCommon::ReadbackStatistics::enabled.store(false, std::memory_order_relaxed);
+#endif
+                dev_marks.store(false, std::memory_order_relaxed);
                 vulkan_cost_enabled.store(false, std::memory_order_relaxed);
                 timers_on.store(false, std::memory_order_relaxed);
             }

@@ -1,10 +1,46 @@
 # EdGlantine-PS5
 
+**00.063.000 installée** : regroupement des pages, propriétaires mémoire et espacements
+de textures Eglantine ; compilation/tests ciblés sur build-server réussis. Rollback 00.062.000
+conservé. FPS/rendu à mesurer ; application non relancée.
+
 Ce projet dérive de ProsperoEden 1.005.000 et du fork expérimental Eden NX2.
 Il ne remplace pas Botty et ne modifie pas son moteur Switch 1.
 
-**État : 00.013.000 installée sur PS5 après corrections Cubic.**
-Le rendu reste partiellement incorrect selon le dernier essai .012.
+**État : .062 conserve l’attente après activation : 29 222 lus pour 29 226 attendus. 14 snapshots DMA / 724 octets, aucun sale ; lecture ordonnée sans effet sur cette attente. Producteur/soumission/décodage à poursuivre. Aucun gain FPS du découpage démontré.**
+La .017 arrête explicitement la session sur une commande DMA sans moteur lié,
+après une erreur FIFO du macro MME 0x18f. La copie possédée ne suffit pas à résoudre
+le problème. La .018 sélectionne l’interpréteur pour ce macro avant toute exécution,
+avec captures initiales bornées ; les autres macros conservent le JIT.
+La .019 reproduit un arrêt DMA avant ce macro. La .020 transporte les préfixes
+de soumission avec chaque lot : le bloc change après soumission avant sa lecture,
+à adresse device identique. La .021 désactive le report des notifications CPU
+pour isoler un problème possible d’ordre des écritures ; elle reproduit la mutation.
+La .022 enregistre les écritures du moteur et les notifications CPU sur les blocs
+en attente : une relecture de buffer GPU de 4 Ko écrase les commandes.
+La .023 limite les copies à la plage demandée, conserve les données GPU voisines
+encore modifiées et retire la trace lourde. Cinq cas ciblés passent sur build-server.
+La .023 reste jouable dans l’essai observé jusqu’à ~65 s, mais à 6 FPS.
+La .024 rétablit le report CPU mais reproduit l’arrêt DMA. La .025 applique
+les notifications et invalidations CPU avant la relecture, avec reprise synchrone
+sur le thread GPU, mais l’essai reste bloqué sur écran noir avec méthodes compute
+hors plage. La .026 revient aux notifications immédiates, retire ces drains et
+arrête explicitement les méthodes compute hors banque pour capturer leur bloc.
+La .026 atteint l’écran jouable à 6 FPS dans l’essai observé. La .027 groupe les
+lectures exactes des pointeurs SSBO avant liaison, avec secours individuel ;
+la .027 reste à 6 FPS et les attentes restent comparables. La .028 mesure
+les attentes par appelant : DownloadBufferMemory domine avec ~29 400 appels
+pour ~3,26 s en cinq secondes. La .029 complète l’origine ReadBlock/FlushRegion
+et les volumes : la copie des blocs DMA est le lecteur dominant (~3,34 s sur cinq).
+La .030 essaie le réglage DMA Unsafe existant, avec précision GPU haute et
+relecture des paramètres indirects conservées : image correcte, 8 FPS puis 3 FPS
+plus loin selon l’utilisateur. La .031 réutilise des fenêtres GPU déjà relues lors
+de la reprise des paramètres, invalidées à toute écriture GPU recouvrante.
+Seuls les octets demandés sont copiés vers le jeu ; gain à mesurer.
+Le correctif de gather FP16 est conservé.
+La .014 paraît correcte visuellement selon l’utilisateur, mais reste à ~14 FPS.
+Un gather FP16 encore refusé a été corrigé dans .015 ; la prochaine capture doit
+séparer le coût vidéo de celui du rendu après le menu.
 La conversion vidéo 4K est passée de 96,18 à 21,15 ms/image ; sur le même intervalle
 vidéo, la cadence est passée de 7,04 à 14,96 images/s. Le menu atteint 59,94 FPS,
 mais la .011 présentait des défauts graphiques après validation. La .012 corrige
@@ -30,13 +66,36 @@ les adaptations et les tests. `eden/tools/eden-patches/90-nx2-prototype.diff`
 s'applique après les quatre patches source d'origine au cœur Eden épinglé.
 `core/` est la copie de travail développée de ce cœur, pas un autre moteur installé.
 
+## Adaptations EglantinePS5 — 00.040.000
+
+Trois adaptations de `heydemoura/EglantinePS5` (`a2c5a908`) : buffers de transfert
+Vulkan arrondis par pas de 16 Mio au-delà de 16 Mio, réutilisation selon leur capacité
+réelle et libération des seuls buffers terminés/non différés avant une nouvelle
+tentative après manque de mémoire ; signalement unique des commandes auto-stubbées
+par service/commande, sans élargir la politique de réponse existante ; engagement
+du heap par blocs physiques décroissants jusqu’à 2 Mio, avec rollback complet en
+cas d’échec partiel et conservation de la continuité virtuelle.
+
+Les tests ciblés s’exécutent avec `bash tests-nx2/run-eglantine-three.sh` sur `build-server`.
+La validation hôte ne reproduit pas le pilote PS5. Aucun gain FPS/mémoire ni
+correctif du comptoir noir n’est revendiqué. La réduction des mips BCn n’est pas importée.
+
 ## Compilation
 
 Toutes les configurations et compilations, y compris les shaders et les tests C++,
-s'exécutent sur `build-server`, jamais sur le Mac. Le répertoire dédié est
-`/tmp/ps5-nx2-prototype-20261030`, monté comme `/work` dans le conteneur de build.
-Il contient des copies indépendantes des dépendances et du cache de compilation.
-`build-remote.sh` synchronise uniquement ce prototype vers ce répertoire.
+s'exécutent sur `build-server`, jamais sur le Mac. La destination SSH se configure dans un fichier local ignoré par Git :
+
+```sh
+mkdir -p .local
+cat > .local/remote-build.env <<'CONFIG'
+EDGLANTINE_BUILD_HOST=build-server
+EDGLANTINE_REMOTE_ROOT=/tmp/edglantine-ps5-build
+CONFIG
+```
+
+`build-server` est un alias d’exemple à remplacer par votre serveur Linux.
+Le répertoire distant doit contenir les dépendances préparées ; il est monté
+comme `/work` dans le conteneur. `build-remote.sh` y synchronise ce projet.
 Après compilation, `bash package-remote.sh` construit le dossier du titre,
 réutilise le binaire déjà compilé, vérifie l’isolation du paquet puis récupère l’archive dans
 `artifacts/`. Aucun de ces scripts ne contacte la console.
@@ -61,6 +120,22 @@ Linux, pas les API mémoire d'une PS5.
 Les journaux de la version MME sont dans `artifacts/mme-jit/`. Le jalon graphique
 précède l'activation compute ; son patch est conservé dans `milestones/graphics-mme.diff`.
 Le journal `package.log` correspond au build final graphique + compute.
+
+## Correctifs Eglantine — 00.032.000
+
+Le pool du compilateur shader détruit maintenant chaque objet construit, et non
+son union de stockage vide (`59047f0`). Les registres indéfinis SPIR-V U1/U32
+produisent par défaut faux/zéro pour éviter les couleurs parasites observées
+sur AMD dans Eglantine (`bb35360`). Les autres types restent inchangés.
+
+Pour désactiver le correctif AMD sur PS5, créer le fichier vide
+`/data/eden-nx2/undef-zero-off.txt`, puis fermer et relancer entièrement
+l’application. Le supprimer et relancer réactive le correctif. L’environnement
+`EDEN_NX2_UNDEF_ZERO=0` permet aussi sa désactivation avant le démarrage.
+Le choix est figé pour le processus et journalisé. Les versions de cache Vulkan
+38 (actif) et 39 (désactivé) remplacent la version 37 ; changer de mode rejette
+l’ancien cache. Le sel du traducteur natif passe à `0x4f554e4345a00006`.
+Aucun gain mémoire/FPS ni correctif visuel PS5 n’est encore mesuré.
 
 ## Intégration Eglantine et gather — 00.008.000
 
@@ -225,4 +300,4 @@ et ses compteurs internes ont été adaptés à six cœurs.
 Les fichiers du paquet ne doivent pas être copiés sur le titre de Botty ou de
 ProsperoEden. L'identité séparée PPSA99862 a été enregistrée sur la console. La mise à jour
 00.007.000 conserve cette inscription ; la fiche système peut encore indiquer
-00.006.000. Le paquet actif est désormais 00.013.000 ; consulter `prototype.json` pour le rollback conservé.
+00.006.000. Le paquet actif est désormais 00.031.000 ; consulter `prototype.json` pour le rollback conservé.

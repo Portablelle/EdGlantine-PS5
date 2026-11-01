@@ -32,6 +32,8 @@ and chat are deferred. Directory discovery does not fix the separately reported 
   private password isolation, existing connection/member list and leave behavior.
 - Normal native build and required audits before packaging.
 
+Addresses below are documentation placeholders, not live console endpoints.
+
 ## Hardware case G1: directory browsing on .30
 
 Goal: open Public rooms, load the live directory, scroll and refresh, return to the menu, and

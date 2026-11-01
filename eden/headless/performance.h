@@ -212,7 +212,22 @@ inline void YieldToGuests() {
 // GPU-modified data goes to that core's dirty ranges for the next fence, as upstream: so the caches
 // see the write no later than had the guest waited, and GPU-written data keeps upstream's handling.
 // dev-settings cpu_write_defer=off waits as before.
+// The NX2 prototype has hardware-confirmed mutation of queued command memory.
+// Keep CPU cache notifications synchronous while isolating that ordering failure.
+#ifdef EDEN_NX2_PS5_PROTO
+inline std::atomic<bool> cpu_write_defer{false};
+#else
 inline std::atomic<bool> cpu_write_defer{true};
+#endif
+// Replaying on the GPU thread must apply notifications, never enqueue them again.
+inline thread_local bool replaying_cpu_writes = false;
+struct CpuWriteReplay {
+    const bool previous = replaying_cpu_writes;
+    CpuWriteReplay() { replaying_cpu_writes = true; }
+    ~CpuWriteReplay() { replaying_cpu_writes = previous; }
+    CpuWriteReplay(const CpuWriteReplay&) = delete;
+    CpuWriteReplay& operator=(const CpuWriteReplay&) = delete;
+};
 // One queue per guest core (3: other threads). Writes to the page of the queue's last entry, made
 // before the GPU thread takes the queue, widen that entry instead of trying the locks again, so a
 // burst of writes to a page costs one replay.
@@ -266,7 +281,7 @@ inline std::atomic<bool> cpu_read_skip{false};
 inline std::atomic<unsigned long long> cpu_read_skipped{};
 template <typename Mutex>
 inline bool GuestCacheLockOrDefer(Mutex& mutex) {
-    if (!cpu_write_defer.load(std::memory_order_relaxed)) {
+    if (!cpu_write_defer.load(std::memory_order_relaxed) || replaying_cpu_writes) {
         GuestCacheLock(mutex);
         return true;
     }
@@ -632,11 +647,16 @@ private:
 // must read the same in every library that includes it. The waits of guest threads
 // (WaitBegin, WaitEnd, NoteRunnable) are counted under the same flag: their hooks sit under
 // the scheduler lock (headless/CMakeLists.txt, k_thread.cpp).
+inline std::atomic<unsigned long long> storage_gather_bytes{}, storage_gather_calls{};
+inline std::atomic<unsigned long long> storage_scatter_bytes{}, storage_scatter_calls{};
+inline std::atomic<unsigned long long> storage_reused_bytes{}, storage_reused_calls{};
 inline std::atomic<bool> dev_marks{false};
+inline std::atomic<long long> detailed_until_ns{0};
 inline long long MarkStart() { return dev_marks.load(std::memory_order_relaxed) ? NowNs() : 0; }
 inline void Mark(Totals& totals, long long& since) {
     if (!dev_marks.load(std::memory_order_relaxed)) return;
     const auto now = NowNs();
+    if (since == 0) { since = now; return; }
     const auto elapsed = now - since;
     since = now;
     totals.nanoseconds.fetch_add(static_cast<unsigned long long>(elapsed), std::memory_order_relaxed);

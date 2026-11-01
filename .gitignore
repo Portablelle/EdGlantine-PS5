@@ -30,3 +30,11 @@ __pycache__/
 milestones/**/build-*.diff
 milestones/graphics-mme.diff
 milestones/ns2/rejected-qmd-package/
+
+# Private local credentials and environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx

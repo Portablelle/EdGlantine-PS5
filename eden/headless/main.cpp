@@ -263,7 +263,7 @@ static void UpdateGrips(Core::System& system, Eden::Pad& pad) {
 
 int main(int argc, char** argv) {
     if (setenv("EDEN_NX2_MME_JIT", "1", 1) != 0 ||
-        setenv("EDEN_NX2_SPLIT", "0", 1) != 0) return 2;
+        setenv("EDEN_NX2_SPLIT", "1", 1) != 0) return 2;
     try {
         std::FILE* report = stdout;
         SCOPE_EXIT { if (report != stdout) std::fclose(report); };
@@ -611,6 +611,9 @@ int main(int argc, char** argv) {
         launch_error.clear();
         if (!rooms.BeginGame()) throw std::runtime_error("Join a room successfully or leave it before starting a game.");
         SCOPE_EXIT { rooms.EndGame(); };
+        // .016 isolates the .015 crash: leave detailed scheduler/draw hooks off
+        // in the ordinary build; keep the independently bounded aggregate timers.
+        Eden::Performance::dev_marks = false;
 #ifdef EDEN_DEV_VULKAN
         Eden::Performance::vulkan_cost_enabled = std::filesystem::exists(Eden::AppFile("cost-run.txt"));
         if (Eden::Performance::vulkan_cost_enabled) Eden::Performance::timers_on = true;  // a cost run
@@ -798,6 +801,19 @@ int main(int argc, char** argv) {
         Settings::values.vulkan_device = recovery_mode == "init-failure" && !recovery_opengl ?
             0xffffffffu : 0u;
 #endif
+#ifdef EDEN_NX2_PS5_PROTO
+        // Available in release builds too; read once before the first shader cache is opened.
+        if (Eden::FileExists(std::string{Eden::kDataDir} + "/undef-zero-off.txt")) {
+            if (setenv("EDEN_NX2_UNDEF_ZERO", "0", 1) != 0) return 2;
+        }
+        if (Eden::FileExists(std::string{Eden::kDataDir} + "/native-draw-hle-off.txt")) {
+            if (setenv("EDEN_NX2_NATIVE_DRAW_HLE", "0", 1) != 0) return 2;
+        }
+        const char* const undef_zero = std::getenv("EDEN_NX2_UNDEF_ZERO");
+        Eden::Report("shader", undef_zero && undef_zero[0] == '0' ?
+                     "AMD undefined-register zeroing disabled" :
+                     "AMD undefined-register zeroing enabled");
+#endif
         Settings::values.renderer_debug = false;
         // RADV presents the console's 12 GiB of direct memory as an integrated GPU, for which
         // Eden budgets 4 GiB: a game using ~4.4 GB of Vulkan memory then ran the texture GC
@@ -809,11 +825,21 @@ int main(int argc, char** argv) {
 #endif
         Settings::values.cpu_accuracy = Settings::CpuAccuracy::Auto;
         Settings::values.disable_macro_jit = true; // Prototype: interpret GPU macros.
+#ifdef EDEN_NX2_PS5_PROTO
+        // Performance comparison with direct DMA fetch and targeted parameter readback reuse.
+        Eden::Performance::cpu_write_defer.store(true, std::memory_order_relaxed);
+#endif
         // The exact GPU and DMA levels too, every session: one app run starts many games, and a
         // level the game before lowered ("performance" in the settings file, below) would stay.
         Settings::values.gpu_accuracy.SetValue(Settings::GpuAccuracy::High);
         Settings::values.current_gpu_accuracy = Settings::GpuAccuracy::High;
+#ifdef EDEN_NX2_PS5_PROTO
+        // Profiled native command fetch dominates CPU waits. GPU accuracy remains High,
+        // so dirty macro/indirect parameters keep the engine's explicit refresh path.
+        Settings::values.dma_accuracy.SetValue(Settings::DmaAccuracy::Unsafe);
+#else
         Settings::values.dma_accuracy.SetValue(Settings::DmaAccuracy::Default);
+#endif
         Settings::values.memory_layout_mode = Settings::MemoryLayout::Memory_4Gb;
         // A development run that names jit_list in dev-settings decides the block list by itself.
         [[maybe_unused]] bool dev_block_list = false;  // read where a session applies its settings

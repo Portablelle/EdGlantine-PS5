@@ -67,6 +67,15 @@ code=r'''
 #include <chrono>
 #include <mutex>
 #include <thread>
+#include <stdexcept>
+namespace VideoCommon {
+struct GpuSplit {
+ bool fail=false;
+ static GpuSplit& Get(){static GpuSplit split;return split;}
+ void CheckFailure(){if(fail)throw std::runtime_error("injected backend failure");}
+ template<class F>void Synchronize(F&& f){CheckFailure();f();}
+};
+}
 using u32=unsigned;
 struct System{std::atomic_bool stop{};bool IsShuttingDown(){return stop;}};
 struct DMA {System system;std::mutex sync_mutex;std::condition_variable sync_cv;bool synced{};
@@ -79,13 +88,16 @@ struct Raster {std::atomic_uint calls{};void ReleaseFences(){++calls;}};
 struct DmaPusher {System system;Memory memory_manager;Raster raster;Raster*rasterizer=&raster;};
 struct Puller {struct Regs {struct Address{unsigned SemaphoreAddress(){return 0;}}semaphore_address;u32 semaphore_acquire=4,acquire_value{};bool acquire_active{},acquire_mode{},acquire_source{};}regs;
 unsigned drains{};
-void DrainBack(){++drains;} // No split-back worker in this prototype configuration.
+void DrainBack(){++drains;} // Recording backend; no native renderer in this fixture.
 void ProcessSemaphoreAcquire(DmaPusher&dma_pusher){
 '''+acquire+r'''
 }};
 int main(){
  DMA d;std::thread waiter([&]{assert(!d.Wait());});d.system.stop=true;waiter.join();
  DMA normal;normal.synced=true;assert(normal.Wait());
+ VideoCommon::GpuSplit::Get().fail=true;
+ DMA failed;bool caught=false;try{failed.Wait();}catch(const std::runtime_error&){caught=true;}
+ assert(caught);VideoCommon::GpuSplit::Get().fail=false;
  DmaPusher p;Puller pull;std::thread worker([&]{pull.ProcessSemaphoreAcquire(p);});
  while(!p.raster.calls)std::this_thread::yield();p.system.stop=true;worker.join();
  p.system.stop=false;p.memory_manager.value=4;pull.ProcessSemaphoreAcquire(p);
