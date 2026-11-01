@@ -22,7 +22,9 @@ would make a real difference. See [Contributing](#contributing) below.
 - **Source fixes since the tested .064 package:** publication review identified
   Vulkan profiling-pool lifetime, remote build-directory creation and runtime
   control tied to HUD sampling issues. The source fixes these and refreshes its
-  provenance hashes. These changes are not part of the PS5-tested .064 binary.
+  provenance hashes. Follow-up fixes reserve FP16 gather scratch registers and
+  retire profiling state on session shutdown. These changes are not part of the
+  PS5-tested .064 binary.
 - **Latest gameplay result: .064 at 21 FPS**, matching the reported .063 frame
   rate, with GPU splitting disabled. No FPS improvement is observed in this user
   feedback. These results are not a compatibility benchmark or a guarantee for

@@ -58,7 +58,7 @@
     "RET R0/R55 regression tests adapted to existing strict return linkage validation"
   ],
   "hostSuiteValidated": false,
-  "nx2PatchSha256": "8e2e13c6495e3638126dbe2d0083bb9326cbec001241030d4f78560c1d71c37d",
+  "nx2PatchSha256": "6c99b1feb901a8dff12d5803e78eab76ea09d518ad7fc08aed5e92dfe160b86b",
   "rejectedAdaptations": [
     "QMD history eviction: replays completed descriptors on action 2; regression caught by native_semaphore test"
   ],
@@ -550,7 +550,10 @@
       "Create remote build root before rsync.",
       "Retire both Vulkan profiling pools after worker join and device idle.",
       "Run runtime commands and profiling deadlines in a dedicated session loop.",
-      "Refresh source fingerprints."
-    ]
+      "Refresh source fingerprints.",
+      "Reserve FP16 gather scratch registers program-wide and invalidate cached translations.",
+      "Own profiling report state and enable-flag teardown through a session-scoped object."
+    ],
+    "nativeTranslatorSalt": "0x4f554e4345a00007"
   }
 }

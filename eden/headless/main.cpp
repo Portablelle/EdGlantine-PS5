@@ -1800,6 +1800,7 @@ int main(int argc, char** argv) {
                 [[maybe_unused]] double session_seconds = 0;  // guest-fault relaunch (PS5 only)
                 // Session commands and diagnostic deadlines must progress even with no HUD.
                 std::jthread runtime_control([&](std::stop_token stop) {
+                    Eden::Performance::ProfilingSession profiling;
 #ifdef EDEN_NX2_PS5_PROTO
                     Eden::RuntimeControl commands(Eden::AppFile("split-enable.request"),
                                                   Eden::AppFile("profile-refresh.request"));
@@ -1808,9 +1809,9 @@ int main(int argc, char** argv) {
 #ifdef EDEN_NX2_PS5_PROTO
                         commands.Poll(Eden::Performance::NowNs(),
                             [] { VideoCommon::GpuSplit::Get().RequestEnable(); },
-                            [] { Eden::Performance::RestartProfiling(); });
+                            [&] { profiling.Restart(); });
 #endif
-                        Eden::Performance::TickProfiling();
+                        profiling.Tick();
                         std::this_thread::sleep_for(std::chrono::milliseconds(50));
                     }
                 });

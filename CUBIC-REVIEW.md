@@ -4,7 +4,7 @@ The complete publication diff was reviewed against the previous GitHub main tree
 using a temporary review commit with the exact publication tree. This review-only
 commit is not part of the anonymized history being published.
 
-Four findings were addressed:
+The initial four findings were addressed:
 
 - Both Vulkan profiling query pools are reset after the scheduler worker joins and
   the device becomes idle, before the device is destroyed.
@@ -21,6 +21,21 @@ pool release across two device lifetimes, failure-state reset, command consumpti
 deadline expiry without HUD sampling, and fresh control state in a new session.
 Tests: `eden/tests-nx2/native-gpu-profile-lifetime.cpp` and
 `eden/tests-nx2/check-runtime-control.py`.
+
+Further review findings were addressed as well:
+
+- Texture lowering reserves R246–R254 across the whole program, so FP16 gather
+  conversion cannot overwrite guest values live across the instruction. Register
+  shadowing preserves those values; the non-shadowing path rejects unsafe programs.
+  The native translator salt is incremented to invalidate earlier translations.
+- A session-owned `ProfilingSession` holds the report budget and retires diagnostic
+  deadlines and enable flags on destruction, including early session termination.
+
+Focused ASan/UBSan regressions passed for live R246/R247 values across a captured
+FP16 gather and for ending a session during an active profiling window. The shader
+check uses production lowering with a small execution model for register semantics;
+texture pixels and PS5 rendering are not validated by that model.
+See `eden/tests-nx2/check-texture-scratch.py` and the runtime-control test above.
 
 These source fixes postdate the PS5-tested .064 package and have not been installed
 on the console. The 21 FPS result applies to that previously installed package.

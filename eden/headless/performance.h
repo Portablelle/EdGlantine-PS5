@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include "profiling_session.h"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -36,9 +37,6 @@ void SampleGpuFrame(unsigned frame);
 // those as "--".
 unsigned HostCpuPercent();
 unsigned GpuBusyPercent();
-// Called on the session control thread, independent of HUD sampling.
-void RestartProfiling();
-void TickProfiling();
 // The GPU's own time, by timestamps the Vulkan scheduler writes at the start and the end of
 // each command buffer while the overlay asks for them (tools/prepare-vulkan-port.py): the
 // nanoseconds the GPU has spent between them, how many command buffers that is, and whether

@@ -583,16 +583,22 @@ void GuestCoreLoads(unsigned loads[4]) {
     for (unsigned i = 0; i < 4; ++i) loads[i] = cores[i].shown;
 }
 
-namespace {
-struct ProfilingState {
-    long long next_report{};
-    unsigned reports{};
-};
-thread_local ProfilingState profiling_state;
-} // namespace
+ProfilingSession::ProfilingSession() = default;
+ProfilingSession::~ProfilingSession() { Stop(); }
+void ProfilingSession::Stop() {
+    detailed_until_ns.store(0, std::memory_order_relaxed);
+    dev_marks.store(false, std::memory_order_relaxed);
+    Vulkan::NativeGpuProfile::enabled.store(false, std::memory_order_relaxed);
+    timers_on.store(false, std::memory_order_relaxed);
+    vulkan_cost_enabled.store(false, std::memory_order_relaxed);
+#ifdef EDEN_NX2_PS5_PROTO
+    VideoCommon::ReadbackStatistics::enabled.store(false, std::memory_order_relaxed);
+#endif
+}
 
-void RestartProfiling() {
-    profiling_state = {};
+void ProfilingSession::Restart() {
+    next_report = 0;
+    reports = 0;
 #ifdef EDEN_NX2_PS5_PROTO
     const auto epoch = VideoCommon::NativeWaitProfile::Restart();
     std::fprintf(stderr, "NX2_PROFILE_REFRESH epoch=%llu mono_ns=%lld\n",
@@ -604,10 +610,8 @@ void RestartProfiling() {
     Vulkan::NativeGpuProfile::enabled.store(true, std::memory_order_relaxed);
 }
 
-void TickProfiling() {
+void ProfilingSession::Tick() {
     // Diagnostic prototype: bounded aggregate sampling, no PC sampling or GPU waits added.
-    auto& next_report = profiling_state.next_report;
-    auto& reports = profiling_state.reports;
     const auto detailed_deadline = detailed_until_ns.load(std::memory_order_relaxed);
     if (detailed_deadline && NowNs() >= detailed_deadline) {
         dev_marks.store(false, std::memory_order_relaxed);
