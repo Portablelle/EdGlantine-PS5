@@ -74,28 +74,28 @@ preserving memory correctness, and to diagnose the split-mode freeze before
 considering it usable. Measurements and version history are in
 [TEST-REPORT.md](TEST-REPORT.md); planned work is in [ROADMAP.md](ROADMAP.md).
 
-The latest **installed build, Bananza rendering/performance incomplete**, adds partial uploads for large
-textures with sparse guest mappings and optional native PGO. Native build,
-ASan/UBSan texture tests, actual PGO-use checks and packaging passed on the build
-server. Bananza reaches about 10 FPS, falling to 4 with movement, with black areas
-still present; no isolated FPS improvement is established. See the
-[partial-texture/PGO integration](milestones/partial-textures-pgo/README.md). The ASTC-to-BCn
-GPU submission trial had no effect in the CPU-decoded BC3 mode. A subsequent
-CPU async-texture generation fix is installed and its activation confirmed, but
-the user reports unchanged black areas and FPS. See the
+The latest installed build includes partial uploads for large textures with sparse
+guest mappings, optional native PGO, and a CPU async-texture generation fix.
+Native build, ASan/UBSan texture tests, actual PGO-use checks and packaging
+passed on the build server. Earlier Bananza tests measured about 10 FPS,
+falling to 4 with movement. In the latest player test, **the terrain and assets
+appear after a delay; the black areas disappear once they have loaded**.
+The remaining observed issue is delayed display, rather than persistent black
+terrain. No isolated FPS improvement has been established. See the
+[partial-texture/PGO integration](milestones/partial-textures-pgo/README.md) and
 [Bananza investigation](eden/docs/BANANZA_STARTUP_INVESTIGATION.md).
 
-
-The latest installed performance update adapts ideas from nxnative and selected Eden
-nightly changes: coherent reuse of gathered SSBOs, fewer read-only binding
-allocations, a better JIT constant pool, and contained texel-buffer and
-VP9 fixes. Installation changed only eboot.bin, with rollback retained and game data preserved. Validation and
-provenance: [upstream performance adaptations](eden/docs/UPSTREAM_PERFORMANCE_ADAPTATIONS.md).
-The initial batch caused a Bananza startup crash because its compact JIT
-constant store bypassed the PS5 writable-alias adapter. A tested generator fix
-is now installed; console launch remains to be retested. See the
-[Bananza investigation](eden/docs/BANANZA_STARTUP_INVESTIGATION.md).
-No PS5 FPS or rendering gain has been established for this installed update.
+The installed performance update also adapts ideas from nxnative and selected
+Eden nightly changes: coherent reuse of gathered SSBOs, fewer read-only binding
+allocations, a better JIT constant pool, and contained texel-buffer and VP9 fixes.
+The initial batch caused a startup crash when its constant store bypassed the
+PS5 writable-alias adapter. The adapter is fixed, and the player confirms
+Bananza starts. A targeted indirect-record initialization treatment is also
+installed. Its contribution to the delayed appearance of terrain is not yet
+established: the log snapshot taken before the terrain appeared contained no
+activation marker. Installation changed only eboot.bin, with rollback retained
+and game data preserved. Validation and provenance:
+[upstream performance adaptations](eden/docs/UPSTREAM_PERFORMANCE_ADAPTATIONS.md).
 
 
 ## Contributing
@@ -425,6 +425,7 @@ for the protocol and its limitations.
 ## Bananza startup investigation
 
 See the [startup failure record](eden/docs/BANANZA_STARTUP_INVESTIGATION.md).
-The observed retries follow host file-open exhaustion, then guest null accesses.
-A bounded VFS cache and resource-error retry guard passed a focused host test;
-console validation is still required.
+The record distinguishes earlier file-open exhaustion, guest null accesses,
+CRAM write retries and the corrected JIT startup crash. Bananza now starts;
+the player confirms terrain and assets appear after a delay and the black areas
+disappear. The delay and low frame rate remain under investigation.
