@@ -421,3 +421,470 @@ vérifié du binaire ; le rendu sur console reste à tester par le joueur.
 The cumulative candidate includes core patches 90–97. The native half predicates, verified barrier cancellation, FSEL option and full generic-attribute bounds live in core patch 95, with only PS5 title/cache policy in the platform adapter. Patch 93 owns bounded VFS allocation and direct-read fallback in ordinary core builds as well as the frontend. Patch 94 gives capture state renderer lifetime and accounts for requested skipped draws in its bounded observation window. Patch 96 owns optional startup trace hooks in core. Loose-dump metadata also retains supported language flags; the non-Vulkan native configuration does not invoke Vulkan-only adapters. These structural checks do not establish an improvement in hardware rendering.
 
 Patch 97 owns unaligned GPU-written uniform readback in the canonical buffer cache. Descriptor-table metrics are independent of VFS types. Each captured draw retains its own bounded TIC/TSC snapshot, including in-place updates and table-limit changes.
+
+
+## Essai du build transferts partiels + PGO : 10 FPS, chutes à 4, zones noires
+
+2 novembre 2026, binaire `10b01c1f4135b33887b302b9d15b35a3453efe9dc8716ff9081c3a74914b373e`.
+Le joueur confirme Bananza lancé, environ **10 FPS**, avec des **zones noires
+persistantes**, puis des chutes à **4 FPS quand il y a beaucoup de mouvements**.
+Le nouveau build ne constitue donc pas une correction du rendu confirmée.
+Il n'y a pas de mesure avant/après dans la même scène permettant d'isoler PGO
+ou les transferts partiels.
+
+Relevé : `artifacts/partial-textures-pgo/bananza-retest/`, journaux récupérés
+successivement pendant la session ; `measurement.json` conserve les agrégats.
+Les FPS confirment une fenêtre de 5,064683 s à **3,554 FPS** (18 frames), ainsi
+que des fenêtres vers 8–16 FPS. Les anciens passages vers 60 FPS de cette même
+session peuvent être du chargement ou de la cinématique : ne pas les mélanger
+avec le résultat de gameplay rapporté.
+
+Réglages effectifs : Docked, résolution 1x, filtre Bilinear, sortie 1440p/60 Hz,
+ASTC recompressé en BC3, shaders async désactivés, DMA non unsafe, reactive
+flushing activé. Aucun réglage n'a été modifié pendant ce relevé.
+
+- Aucun rejet natif graphics/compute ni `VK_ERROR` dans le log moteur récupéré.
+  Les marqueurs Bananza compute indiquent `lowered=true`. Les anciens rejets
+  de traduction ne sont pas reproduits ici ; les zones noires restent distinctes.
+- **26 lignes `Unmapped Device ReadBlock`**, notamment pour des lectures de
+  36 864/69 632 octets. Leur appelant et leur lien éventuel avec les zones noires
+  ne sont pas établis. Ne pas les transformer en preuve de cause sans corrélation.
+- Un relevé `Texture cache last 600 frames` compte **3 536 uploads / 759 Mio**,
+  plus gros upload 18 Mio, zéro par couche. C'est un compteur d'intervalle du
+  moteur, pas une mesure d'utilisation GPU ou un débit sur cinq secondes.
+  Les logs courants n'identifient pas séparément l'activation du nouveau chemin
+  sparse-partiel : ne pas lui attribuer un gain ou un défaut sur ce seul chiffre.
+- Pas de `bad_alloc` ni de `Too many open files` dans les fichiers récupérés.
+  Cache VFS environ 23,7 Mo, pic 41,1 Mo, limite 64 Mio, zéro fallback ; tables
+  de descripteurs 13 026 816 octets dans les derniers échantillons. Aucune preuve
+  de retour de l'ancienne saturation de fichiers ou du tas.
+- Les compteurs de temps par phase draw/configuration sont nuls dans le relevé,
+  et le contrôle d'horloge CPU worker est invalide. Ces données ne permettent
+  pas de départager CPU, GPU et transferts dans les chutes de FPS.
+
+Prochaine investigation utile : mesurer les phases sur une scène active qui
+reproduit la chute et attribuer les lectures non mappées à leur appelant avant
+un nouveau correctif. Aucun essai négatif ancien répété, aucun nouveau build ni
+changement de réglage appliqué à partir de ce seul retour.
+
+
+## Candidat ciblé : soumettre le décodage ASTC avant l'encodage BCn
+
+Nouvel indice du 2 novembre : [Eglantine a407703f](https://github.com/Djihads80/Eglantine/commit/a407703f6d29a5ab73328b4ededb12cf29b2758d),
+postérieur à notre premier audit, rapporte du flashing en BC3 sur RADV. Le chemin
+`TranscodeAstcToBcn` était le seul à passer `Target.wait=false` et à sortir du
+décodeur avant sa politique de soumission. L'amont constate que la soumission
+avant encodage supprime son défaut visuel, tout en précisant que cela masque
+une race dont la cause profonde n'est pas identifiée. Ce résultat AMD desktop
+n'est pas une validation sur le pilote PS5.
+
+Le binaire testé par le joueur possède exactement cette omission. Le relevé
+Bananza utilise BC3 ; cela justifie un essai ciblé, contrairement à une répétition
+sans nouvel indice des anciens réglages globaux de synchronisation shader.
+Les 26 lectures non mappées ne sont pas attribuées à cette omission : leur
+appelant et leur responsabilité éventuelle restent ouverts.
+
+Patch `99-nx2-bcn-decode-submit.diff` : demande la politique normale du décodeur
+avant l'encodage BC1/BC3 (`wait=true`). Le port utilisait déjà `scheduler.Flush()`
+par défaut pour les textures natives ; ce patch ne remplace pas ce comportement
+par un `Finish()` bloquant. Les barrières, la copie finale et la conservation du
+temporaire jusqu'au tick après encodage sont préservées. Un marqueur unique
+`NX2_BCN_DECODE_SUBMIT before_encode=1 policy=decoder-default` permettra de
+confirmer l'utilisation de ce chemin au prochain essai.
+
+Le test `tests-nx2/check-bcn-decode-submit.py` compile sur dedie la vraie méthode
+`TranscodeAstcToBcn` et la vraie fin de `ASTCDecoderPass::AssembleInto`, avec un
+scheduler enregistreur, sous ASan/UBSan. Il compare l'ancien appel sans soumission
+au nouveau : décodage/barrière → soumission → encodage → copie finale, avec le
+tick de conservation après encodage. BC1 et BC3, natif et ancien layout, deux
+mips conservés après trimming, deux couches, réglage ASTC_FLUSH absent/0/1 : PASS.
+Le chemin natif par défaut n'appelle pas Finish. Ce test vérifie l'orchestration,
+pas les pixels ni la race du GPU réel.
+
+Build dédié incrémental isolé : `/tmp/edglantine-partial-pgo-20261102`,
+`bananza-astc-submit.log`. PGO, patches précédents, réglages et données du jeu
+conservés. Artefacts prévus : `artifacts/bananza-astc-submit/`.
+Compilation, packaging et résultat console consignés après achèvement. Le joueur
+a confirmé la fermeture d'EdGlantine pour préparer ce correctif ; aucun résultat
+FPS ou rendu nouveau n'est encore établi.
+
+
+### Installation du candidat ASTC → BCn
+
+Compilation native et packaging réussis sur dedie, ainsi que les tests ciblés
+sous ASan/UBSan et les contrôles des headers/isolation PPSA99862. PGO conservé.
+Les 69 fichiers d’accompagnement correspondent à ceux installés : seul eboot.bin
+a été remplacé, avec staging vérifié et backup. Journal :
+`artifacts/bananza-astc-submit/install-journal.json`.
+Binaire installé : `6a9ac5c1454466eccb58ba3a6258543466c11d889ac05585daf5fdd726e7cdcc`.
+Backup précédent : `/data/ps5-diag/edglantine-bananza-astc-29e2b3ad6fec/eboot.bin`.
+
+Le joueur avait confirmé EdGlantine fermé. Aucun lancement automatique ni
+modification de réglages, de sauvegardes ou de données de jeu. Prochain essai
+Bananza à faire par le joueur, dans une scène comparable avec mouvements :
+confirmer le marqueur, l’état des zones noires et les FPS. Aucun gain ni rendu
+corrigé sur PS5 n’est annoncé à ce stade.
+
+La revue Cubic n’a pas relevé de défaut dans ce lot BCn ; elle propose une
+séparation de responsabilités dans le bookkeeping du patch 98 (restauration des
+références de pages / consommation des plages dirty). C’est un point structurel
+du lot précédent, sans défaut fonctionnel reproduit par ce retour ; il n’est pas
+mélangé à cet essai d’ordonnancement ASTC. Aucun push effectué.
+
+
+## Retour « tout pareil » et profilage de la scène active
+
+Le joueur ne constate aucun changement après le candidat ASTC→BCn. Relevé :
+`artifacts/bananza-astc-submit/retest/`. Les logs montrent encore des fenêtres
+vers 3–12 FPS, dont 3,257 FPS sur 5,219683 s ; zones noires toujours rapportées.
+Aucun rejet natif shader ni `VK_ERROR` dans les snapshots récupérés.
+
+**Rectification de l'essai précédent :** `main.cpp` force
+`AstcDecodeMode::CpuAsynchronous` en Vulkan lorsque les textures sont gardées en
+BC3. Le chemin GPU modifié dans le patch 99 n'est donc pas le chemin utilisé par
+ce mode. Le marqueur `NX2_BCN_DECODE_SUBMIT` est absent, et les logs comptent des
+décodages asynchrones CPU. Il fallait vérifier cette sélection avant l'installation.
+L'essai ne démontre pas une amélioration et ne justifie pas de répéter le patch
+GPU sans changement du chemin effectivement utilisé.
+
+Une demande runtime unique `profile-refresh.request` a déclenché la capture
+bornée existante. Activation confirmée :
+`NX2_PROFILE_REFRESH epoch=2 mono_ns=2269628166989`.
+Les durées détaillées et timestamps GPU sont activés pendant 20 s ; les rapports
+agrégés reprennent leur fenêtre bornée normale. Aucun réglage graphique modifié,
+aucun nouveau binaire installé pour cette capture.
+
+Sur 20,044195876 s entre les premiers et derniers rapports retenus :
+
+- configuration CPU des dessins : **4,563161674 s** ;
+- callback CPU-write/cohérence : **3,888683586 s** ;
+- timestamps de buffers GPU terminés : **1,945259480 s**, 55 059 buffers ;
+- attente de queue : 0,619863655 s ; drainage des fences : 0,621245007 s.
+
+Ces mesures ne sont pas des contributions exclusives : les phases peuvent être
+imbriquées et les threads se recouvrir. Ne pas les additionner, ni convertir les
+timestamps de buffers en taux d'utilisation GPU global. Les fenêtres de gameplay
+et de mouvement ne sont pas appariées à un ancien build. Les fichiers
+`stderr-profile.log`, `heap-profile.log`, `engine-profile.log` et
+`profile-measurement.json` conservent les limites et données.
+
+## Défaut reproduit dans le vrai chemin CPU asynchrone
+
+Le test sur dedie de la vraie orchestration QueueAsyncDecode / WriteMemory /
+TickAsyncDecode reproduit un résultat périmé qui écrase du contenu plus récent :
+une conversion A reste en attente, la texture est mise à jour et publiée avec B,
+puis A termine et est uploadée sans vérifier que l'image a changé. Le worker
+unique ne protège pas contre une mise à jour synchrone CPU ou un write GPU entre
+la mise en file et la publication. Il ne s'agit pas d'une preuve que ce défaut
+explique toutes les zones noires du joueur.
+
+Patch `99a-nx2-async-decode-generation.diff` :
+
+- génération de conversion par image, détenue sous le verrou du cache ; chaque
+  job emporte seulement sa valeur et sa copie d'entrée, jamais une référence à
+  l'image lue par le worker ;
+- invalidation de la génération sur write CPU, remap, nouvelle préparation de
+  contenu, modification GPU ou invalidation complète ;
+- nouvelle conversion : annule les jobs précédents pour cette même identité
+  d'image. Le worker peut sauter un job remplacé avant allocation/conversion ;
+- publication : refuse une génération dépassée, et ne retire pas le flag de
+  décodage appartenant à un job plus récent ; la vérification de cancellation
+  reste avant l'accès à une image potentiellement supprimée ;
+- cancellation atomique parce qu'elle est maintenant aussi lue par le worker.
+  Les résultats et contextes restent détenus jusqu'à la publication de completion
+  avec la synchronisation existante.
+
+Test `tests-nx2/check-async-decode-generation.py`, sur dedie ASan/UBSan : ancien
+écrasement reproduit ; version corrigée préserve une mise à jour synchrone et une
+modification GPU, rejette un résultat déjà calculé devenu périmé, garde le flag du
+job courant, supporte suppression et cancellation concurrente, et ne convertit
+que le dernier de 200 jobs successivement remplacés. Le test de suivi sparse et
+ses 192 comparaisons avec le vrai décodeur passent aussi. Ces tests utilisent une
+file contrôlée et un backend mémoire enregistreur ; ils ne valident pas les pixels
+PS5. Le marqueur `NX2_ASYNC_DECODE_VERSIONING active=1` identifiera le vrai chemin
+CPU lors du prochain essai.
+
+Build/package : en préparation sur dedie dans le répertoire isolé existant ;
+artefacts `artifacts/bananza-async-generation/`. Pas de nouvelle installation
+pendant la session active. Résultat console encore inconnu.
+
+
+Compilation native et packaging du lot génération asynchrone : **PASS** sur dedie.
+Contrôles des headers et isolation PPSA99862 : PASS. Les tests des 200 jobs et
+des transferts partiels passent sous ASan/UBSan. La revue Cubic ne relève pas de
+nouveau défaut dans ce lot ; la note structurelle déjà consignée sur le patch 98
+reste distincte. Aucun push effectué. Paquet et ELF récupérés dans
+`artifacts/bananza-async-generation/`. Installation en attente de confirmation
+de fermeture de l’application active ; aucun résultat de rendu/FPS nouveau.
+
+
+### Installation du lot génération CPU asynchrone
+
+Le joueur a confirmé la fermeture complète après la session de profilage. Les
+69 fichiers d’accompagnement sont identiques au paquet : seul eboot.bin a été
+remplacé via staging vérifié, préservation des permissions et rename.
+Journal : `artifacts/bananza-async-generation/install-journal.json`.
+Binaire installé : `613bdc159e8a584defe03f0daf555af097e3ce6b687fbe1c80216deae7fb6fec`.
+Ancien binaire : `6a9ac5c1454466eccb58ba3a6258543466c11d889ac05585daf5fdd726e7cdcc`, conservé dans
+`/data/ps5-diag/edglantine-bananza-async-63435ca74e68/eboot.bin`.
+
+Réglages, PGO, données, sauvegardes et caches conservés. Aucun lancement
+automatique. Le défaut de publication périmée est reproduit/corrigé dans le test
+hôte ; son impact sur les zones noires et les FPS Bananza reste à confirmer par
+le prochain essai.
+
+
+## Retour après génération CPU asynchrone : noir et FPS inchangés
+
+Le joueur rapporte « c’est pareil pour le noir et fps ». Relevé :
+`artifacts/bananza-async-generation/retest-20261102-125359/`, avec `measurement.json`. Le marqueur
+`NX2_ASYNC_DECODE_VERSIONING active=1` apparaît à 69,175415 s : cette fois, le
+chemin corrigé est effectivement utilisé. Les derniers agrégats vont de 4,603 à
+15,519 FPS selon les intervalles ; le joueur ne perçoit pas d’amélioration et
+aucune comparaison de scène identique ne permet d’en déduire un gain isolé.
+
+Aucun rejet natif shader, `VK_ERROR`, `bad_alloc` ou saturation de fichiers dans
+les logs récupérés. 27 lignes `Unmapped Device ReadBlock`, toujours sans appelant
+attribué. Réglages effectifs inchangés : 1x, Bilinear, 1440p/60 Hz, BC3 CPU
+asynchrone ; shaders async off, DMA non unsafe, reactive flushing on.
+
+Le défaut de publication périmée reste reproduit/corrigé dans le test hôte ;
+cet essai console ne confirme aucune correction du noir ni des performances.
+Ne pas répéter ce même lot en attendant un résultat différent. Aucun nouveau
+build, réglage ou remplacement appliqué pendant ce relevé. La prochaine
+localisation doit distinguer surfaces/ombres noires et géométrie absente, puis
+corréler les ressources ou l’état de dessin avec une zone réellement incorrecte.
+
+## Crash natif après capture de quatre dessins (2 novembre)
+
+Le joueur précise que les surfaces sont présentes mais noires. Pour examiner
+leurs constantes, demande bornée `position-capture.request` : `512 4 0`.
+Quatre dessins 1440 × -810 récupérés, 360 fichiers / 12 019 485 octets, dans
+`artifacts/bananza-async-generation/retest-20261102-125359/draw-capture/`.
+Cette capture effectue des téléchargements synchrones des constant buffers ;
+sa proximité avec le crash interdit de la considérer comme passive ou de
+conclure à un crash spontané du jeu. Aucun nouvel essai de capture lancé.
+
+Le joueur signale ensuite un retour au lanceur. Rapport exact
+`crash-20261102-140849.txt` (MLSD UTC 13:08:49), récupéré avec ses logs dans
+`artifacts/bananza-async-generation/crash-20261102-130010/` :
+SIGSEGV code 2, trap 12 / error 0x7 (écriture sur page protégée), thread
+GPUFencingThread, destination 0x8186200000, copie 4096 octets. Le backing invité
+est 0x8000000000 sur 12 GiB, CRAM actif, scan on, fine/dedup off. Pas d’EMFILE
+ni d’échec d’allocation CRAM dans le relevé. Dernière capture journalisée à
+507,479 s ; crash vers 510 s. Le redémarrage du frontend vient du handler natif.
+
+Symbolisation avec l’ELF exact du binaire 613bdc… sur dedie : premier candidat
+0x2fa30 = BufferCache::PopAsyncFlushes ; désassemblage confirme une instruction
+call indirecte de copie immédiatement avant ce retour. Les autres candidats
+sont MasterSemaphore::Wait, proxy FenceManager et thread_start ; une recherche
+sur pile reste une liste de candidats, pas une pile déroulée certifiée.
+Le chemin PopAsyncBuffers écrit les résultats GPU via WriteBlockUnsafe.
+
+Nouvel indice et défaut reproduit : HandleGuestWriteFault comptait toutes les
+fautes consécutives à la même adresse dans la durée de vie du thread, même quand
+la promotion précédente avait réussi. Après 16 promotions/libérations valides,
+la 17e est refusée avant même de consulter l’état du slot. Un scanner qui rend
+un slot nul peut donc transformer une écriture valide ultérieure en SIGSEGV.
+Le rapport ne conserve ni l’état du slot ni son compteur par thread : cette
+cause précise du crash console reste à confirmer, malgré la compatibilité du
+site et de l’adresse.
+
+Correction : compter seulement les retours sans transition depuis SlotOwn ;
+remise à zéro lors d’une promotion ou d’une attente d’un autre propriétaire.
+Le refus après 16 essais sans progrès reste actif, verrou libéré avant refus.
+Test `check-guest-write-retries.py` exécuté sur dedie : vraie fonction extraite,
+signal SIGSEGV réel sur mmap/mprotect, backend de promotion simulé. Ancienne
+fonction : refus reproduit à la 17e écriture valide. Correction : 100 écritures
+protégées à la même adresse passent ; refus sans progrès, attentes,
+Shared/Fine et échec de promotion sont vérifiés sous UBSan. Ce test ne reproduit
+pas les appels de mapping PS5. Compilation native/package en cours ; aucune
+nouvelle installation ni validation des zones noires/FPS à ce stade.
+
+Compilation native et packaging du correctif CRAM : **PASS** sur dedie, PGO
+conservé. Contrôles headers et isolation PPSA99862 : PASS. Artefacts :
+`artifacts/bananza-cram-retries/`, ELF exact conservé pour symbolisation.
+SHA256 du nouvel eboot :
+`2fc612464e198872837d483308ca3d5c9332014080ee87af61686560ab7e3db1`.
+Le joueur confirme ensuite la fermeture complète, lanceur compris ; installation
+par remplacement vérifié avec sauvegarde de l’ancien exécutable.
+
+Installation CRAM terminée : 69 fichiers d’accompagnement identiques ; seul
+`/data/homebrew/PPSA99862/eboot.bin` remplacé. Journal
+`artifacts/bananza-cram-retries/install-journal.json`, status installed.
+Ancien binaire 613bdc… conservé dans
+`/data/ps5-diag/edglantine-bananza-cram-8c01bce6536b/eboot.bin`.
+Données, sauvegardes, paramètres et caches conservés. Aucun lancement automatique.
+Stabilité console et rendu/FPS encore non validés par le joueur.
+
+## Crash au lancement après le lot nxnative/nightly : constantes JIT
+
+Rapport `crash-20261102-155047.txt`, MLSD UTC 14:50:47, 22 s après le début
+de l'application, Bananza 040074A01BF12000. Binaire installé
+`04859f5b6a06bda8724e43c5174229d92c4d57cf0870e98c512e5f2d33e7e8d5`.
+Preuves : `artifacts/upstream-opt-20261102/bananza-startup-crash/`.
+
+SIGSEGV code 2, trap 12 / erreur 0x7, thread **CPUCore_0**, destination
+`0x1150000010`. `EDEN_JIT_MEMORY code=1150000000` place cette adresse dans le
+cache JIT, hors du backing guest CRAM. Environ 10 052 Mio encore libres ; pas
+d'EMFILE ni de bad_alloc dans ce relevé. Compteurs draw/gather à zéro avant le
+crash. Ne pas l'assimiler au précédent défaut de retry CRAM ou à un crash GPU.
+
+Symbolisation avec l'ELF exact `b17cac…` : `eboot+0x558ed` est
+`Dynarmic::Backend::X64::ConstantPool::GetConstant`. L'instruction fautive
+`movq %rdi,(%rdx,%rax)` écrit le premier mot de la constante, avec
+rdx=0x1150000010 et rax=0. La suivante écrit le second mot. Le code de la
+nouvelle optimisation n'a pas été redirigé vers l'alias writable : l'ancien
+`jit-alias.cmake` remplaçait seulement `target_constant = constant;` et ne
+reconnaissait plus `pool[it->second] = u128{lower, upper};`. La substitution
+silencieuse laissait donc une écriture directe dans la vue protégée.
+
+Correction : `jit-constant-pool.cmake`, inclus par le vrai générateur natif,
+reconnaît les deux écritures connues et les redirige par `writableAddress` sans
+changer les adresses des opérandes dans la vue RX. Un store absent, inconnu ou
+dupliqué fait maintenant échouer CMake au lieu de produire un binaire incorrect.
+Les optimisations de hash/indices et la vérification explicite de capacité sont
+conservées ; aucune protection mémoire n'est relâchée.
+
+Le test antérieur utilisait le source brut et une allocation writable simulée,
+et manquait donc cette adaptation spécifique PS5. Le test est remplacé sur ce
+point : il exécute le véritable helper CMake puis les méthodes générées, sur deux
+vues partagées réellement RW/RX. Sous ASan/UBSan sur dedie : ancienne écriture
+SIGSEGV reproduite, alias corrigé et valeurs 128 bits exactes, adresses RX
+conservées, écriture directe RX toujours refusée, capacité et doublons vérifiés.
+Les formes CMake inconnue/dupliquée sont refusées. Les régressions texel/VP9 et la
+continuité viewport passent aussi. Aucun succès de lancement PS5 encore établi.
+
+L'utilisateur a confirmé EdGlantine fermé. Compilation/package sur dedie :
+**PASS**, PGO conservé, headers sparse/multiplayer et isolation PPSA99862 vérifiés.
+Cubic : zéro signalement, sans erreur. Les 69 fichiers d'accompagnement sont
+identiques ; seul eboot.bin a été remplacé par staging vérifié et rename.
+Artefacts et journal : `artifacts/upstream-opt-jit-alias-fix/`.
+SHA256 installé : `022b4cecd994f0a918a90cef05ba46788e8a42202df28770e64960c5efa9b526`.
+Backup : `/data/ps5-diag/edglantine-jit-alias-fix-4e7040e21045/eboot.bin`.
+Pas de changement de jeu, sauvegarde, paramètres ni cache, ni de lancement
+automatique. Le défaut est reproduit/corrigé sur hôte ; le lancement et les FPS
+sur PS5 restent à retester.
+
+## Retest JIT : lancement confirmé, vidéo du tunnel noir
+
+Le joueur confirme le lancement avec l'eboot `022b4cec…`, puis signale toujours
+des assets noirs et peu de FPS. Sa vidéo PS5 a été récupérée sans modification
+de la console : `artifacts/upstream-opt-jit-alias-fix/gameplay-retest/`, fichier
+`20261102_160710_00938730.webm` (8,71 s). Dans « Explorez le tunnel minier ! »,
+Donkey Kong, les objets dorés et la fumée s'affichent, alors que de grandes
+parties du sol et des parois sont noires. Un rectangle beige sans contenu est
+également visible en bas à droite. Le HUD varie approximativement de 8 à
+20 FPS dans la vidéo. Cette capture ne permet pas de distinguer à elle seule
+une passe couleur absente d'une surface rendue noire.
+
+Les logs récupérés lors de cette session, avant la vidéo, donnent 135 images
+sur les cinq derniers intervalles (25,474388 s), soit **5,299 FPS**. Ce n'est
+pas une comparaison à scène identique. Dans cette fenêtre : 87 524 submits
+(2,220 s), 79 942 semaphore_wait (5,017 s), 75 378 buffer_sync (4,529 s),
+8 555 guest_fence (0,894 s). Ces durées peuvent se recouvrir : ne pas les
+additionner. Pas de compilation de pipeline/shader dans cette fenêtre ; les
+marques CPU détaillées sont désactivées. Les compteurs gather/scatter/reuse
+restent tous nuls : le nouveau cache de gathers n'est pas sollicité dans ce
+relevé. Aucun gain de performances n'est établi.
+
+Nouvel indice pour le rendu : nxnative, commit
+`e5620b1a05a5b7374e0135d6312d3e90994eab81`, décrit dans
+`docs/reference/shaders.md` / « Global memory at an address loaded from memory »
+un tunnel Bananza noir, avec objets/personnage visibles, causé par les stores
+indirects manquants du vertex shader `c9a56f796ea4a4cd` qui réinitialise les
+commandes du terrain. Notre log contient aussi des avertissements
+`Storage buffer failed to track, using global memory fallbacks` au chargement
+du cache. Notre fallback SPIR-V parcourt seulement les SSBO suivis, avec les
+bases/tailles NVN lues en cbuf ; il ne fournit pas la table générale de pools
+utilisée par nxnative pour les pointeurs chargés depuis la mémoire. C'est une
+piste concrète, **pas une cause reproduite sur notre shader de terrain**.
+Les clés nxnative incluent contrôle et code via SHA256, contrairement à notre
+clé FNV du code : ne pas comparer directement ces identifiants. Les anciens
+quatre draws capturés ne suffisent pas à identifier le draw de reset de
+96 points décrit en amont. Aucun nouveau readback GPU, réglage, cache effacé
+ou binaire déployé lors de cette collecte.
+
+## Candidat ciblé : réinitialisation des commandes indirectes
+
+Après autorisation de correction, le joueur ferme EdGlantine. Le cache
+`/data/eden-nx2/user/cache/shader/040074a01bf12000/vulkan.bin` est récupéré en
+lecture seule (17 422 988 octets). Le lecteur hors console suit les 752 entrées
+jusqu'à la fin exacte ; il relève 743 codes distincts, majoritairement déjà
+abaissés en Maxwell et conservant la table d'adresses native (native_count=0).
+Ne pas prendre ce champ nul pour une absence de shaders natifs.
+
+Un seul vertex program contient exactement cinq STG : code abaissé complet
+384 octets, index FNV privé `511f87db997612db`, présent dans quatre pipelines
+(vertex + fragment). Il charge VertexID, calcule `c0[0x110] + VertexID * 8`,
+charge le pointeur 64 bits à cette adresse et écrit les cinq mots
+`{0,1,0,0,0}`. Le cache conserve c0[0x110/114] comme pointeur de storage,
+mais pas de descripteur direct pour les pointeurs chargés depuis cette table.
+C'est bien la forme de reset décrite par nxnative ; l'identité avec sa clé
+SHA256 contrôle+code n'est pas établie par comparaison de hashes.
+
+Le patch `99d-native-indirect-reset.diff` ajoute un traitement **ciblé**, pas
+une table générale de mémoire globale : reconnaissance des 48 mots exacts
+(header sans sortie position, code, exit et address map inclus) à la création
+du ShaderInfo, puis rétablissement cohérent des stores avant le draw normal.
+Le draw Vulkan et ses queries restent exécutés. Pas de saut fondé sur un
+hash, une adresse du jeu ou son title ID. Le chemin est réservé au prototype
+PS5 natif, draw direct non indexé, une instance, first vertex=0, points, sans
+autre étage pré-raster, transform feedback ou rendu conditionnel. La
+rasterization peut rester activée : les quatre pipelines du cache incluent
+un fragment shader et le draw normal est conservé.
+
+Le traitement lit le cbuf et la table par ReadBlock cohérent puis prévalide
+**toutes** les destinations avant le premier WriteBlock cohérent de 20 octets.
+Limite 1 024 records ; plages non mappées, wrap, pointeur nul/non aligné,
+chevauchements partiels entre records et alias avec table/cbuf sont refusés.
+Les doublons exacts sont permis. Aucune invalidation globale ni exploration de
+tous les pools ; seuls les records adressés sont touchés. Les shaders
+arbitraires à pointeurs indirects restent une limite du fallback général.
+
+Tests dédiés sur dedie ASan/UBSan : match du code récupéré, mutation de chaque
+bit des 48 mots refusée, 96 records remis à zéro avec instanceCount=1 et
+voisins inchangés, remise à zéro après un résultat de culling simulé,
+prévalidation sans écriture partielle et lecture cohérente plutôt qu'un
+shadow CPU périmé : PASS. La compilation native vérifie aussi le code après
+adaptation PS5 ; les anciennes substitutions monolithiques du profiler sont
+scindées pour conserver le nouveau bloc. Artefacts de travail :
+`artifacts/bananza-global-memory/`. Ces tests ne confirment pas encore le rendu
+ni un gain de FPS sur console.
+
+Validation finale : tests 96 et 1 024 records, pointeurs 64 bits traversant une
+frontière de 4 Gio et code après adaptation PS5 : PASS. La validation de mapping
+vérifie explicitement les deux bornes de l'espace GPU avant IsFullyMappedRange.
+Compilation/package sur dedie, headers sparse/multiplayer et isolation : PASS,
+PGO conservé. Deux revues Cubic locales sans signalement ni erreur ; contexte
+dépôt distant indisponible, revue locale effectuée.
+
+Installation après confirmation de fermeture : 69 fichiers d'accompagnement
+identiques, remplacement du seul eboot par staging vérifié/rename, status
+`installed`. SHA256 :
+`8e5bcad01289df27f98934ce75abab1cf46504eb0260ccc990b85061722c64b7`.
+Ancien binaire 022b4cec… conservé sous
+`/data/ps5-diag/edglantine-indirect-reset-47dc5a87e960/eboot.bin`.
+Journal, paquet et ELF exact : `artifacts/bananza-global-memory/`.
+Sauvegardes, réglages, caches et app distincte Botty préservés. Pas de lancement
+automatique. Au prochain passage dans le tunnel, vérifier le marqueur
+`NX2_INDIRECT_RESET draws=1 records=96 coherent=1`, puis l'évolution du terrain
+et des FPS. **Rendu et performances console restent non validés** ; la présence
+du marqueur seule ne constitue pas une correction visuelle confirmée.
+
+## Retest suivant : apparition différée du terrain
+
+Le joueur rapporte d'abord aucun changement, puis précise : « ils ont apparus
+ d'un coup, plus de noir ». La disparition visuelle du noir est donc confirmée
+par le joueur **après un délai**, sans nouveau déploiement entre ces deux
+retours. Un gain de FPS n'est pas confirmé. Ne pas attribuer encore toute la
+transition au traitement ciblé sans relever son activation : le snapshot de
+logs récupéré juste avant le second retour ne contient aucun
+`NX2_INDIRECT_RESET`, ni succès ni rejet.
+
+Snapshot : `artifacts/bananza-global-memory/retest/`. Le lancement indique
+`Resolution 1x, Bilinear, output 1440p`, mais les images réellement présentées
+par Bananza sont **2880x1620**, et `wsi/videoout` enregistre des framebuffers
+**3840x2160**. Le libellé de configuration 1440p ne décrit donc pas à lui seul
+les dimensions effectives de cette session. L'image présentée peut inclure
+l'upscaler du jeu : la résolution 3D interne avant cette passe n'est pas établie.

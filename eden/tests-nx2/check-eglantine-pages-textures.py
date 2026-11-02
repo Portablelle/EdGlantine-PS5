@@ -94,7 +94,7 @@ ImageFlagBits& operator|=(ImageFlagBits& a,ImageFlagBits b){return a=a|b;}
 bool False(ImageFlagBits x){return u32(x)==0;}bool True(ImageFlagBits x){return !False(x);}
 enum class ImageType{e2D};struct ImageId{};
 struct ImageBase{ImageFlagBits flags=ImageFlagBits::Tracked;struct{ImageType type=ImageType::e2D;}info;
- u64 cpu_addr=4096,gpu_addr=4096,guest_size_bytes=64_MiB;std::vector<u32> partial_dirty_pages,partial_remapped;};
+ u64 cpu_addr=4096,gpu_addr=4096,guest_size_bytes=64_MiB;std::vector<u32> partial_dirty_pages,partial_remapped;std::vector<std::pair<u64,u32>> sparse_dirty_pages;};
 template<class P>struct TextureCache {
  struct Device{std::vector<std::tuple<u64,size_t,int>> calls;void UpdatePagesCachedCount(u64 a,size_t n,int d){calls.emplace_back(a,n,d);}}device_memory;
  bool UploadsByLayer(ImageBase&){return false;}bool IsWatchedImage(u64){return false;}
@@ -131,54 +131,8 @@ int main(){
 '''
 run('partial-page-batches',code)
 text = (source/'video_core/texture_cache/util.cpp').read_text()
-code = common + r'''
-namespace Common {
- template<class T> constexpr T DivCeil(T a,T b){return (a+b-1)/b;}
- template<class T> constexpr T DivCeilLog2(T a,u32 b){return (a+((T{1}<<b)-1))>>b;}
- template<class T> constexpr T AlignUp(T a,T b){return DivCeil(a,b)*b;}
- template<class T> constexpr T AlignUpLog2(T a,u32 b){return DivCeilLog2(a,b)<<b;}
- template<class T>using ScratchBuffer=std::vector<T>;
-}
-namespace boost::container{template<class T,size_t N>using small_vector=std::vector<T>;}
-struct Extent2D{u32 width,height;};
-struct Extent3D{u32 width,height,depth;bool operator==(const Extent3D&)const=default;};
-struct Offset3D{s32 x,y,z;};
-struct SubresourceExtent{s32 levels=1,layers=2;};
-struct Subresource{s32 base_level,base_layer,num_layers;};
-enum class PixelFormat{RGBA};
-constexpr u32 BytesPerBlock(PixelFormat){return 4;}
-constexpr u32 DefaultBlockWidth(PixelFormat){return 1;}
-constexpr u32 DefaultBlockHeight(PixelFormat){return 1;}
-enum class ImageType{e2D,Linear};
-struct ImageInfo{PixelFormat format=PixelFormat::RGBA;ImageType type=ImageType::e2D;
- Extent3D size{80,33,1},block{0,2,0};SubresourceExtent resources;
- u32 tile_width_spacing=2,layer_stride=65536,num_samples=1,pitch=0;};
-struct BufferImageCopy{size_t buffer_offset,buffer_size;u32 buffer_row_length,buffer_image_height;
- Subresource image_subresource;Offset3D image_offset;Extent3D image_extent;};
-constexpr u32 GOB_SIZE=512,GOB_SIZE_SHIFT=9,GOB_SIZE_X=64,GOB_SIZE_X_SHIFT=6,GOB_SIZE_Y=8,GOB_SIZE_Y_SHIFT=3,GOB_SIZE_Z=1;
-constexpr u32 MAX_MIP_LEVELS=16;using LevelArray=std::array<u32,MAX_MIP_LEVELS>;
-namespace Tegra {
- struct MemoryManager{
-  std::vector<u8> bytes=std::vector<u8>(1024*1024);std::vector<std::pair<u64,size_t>> reads,writes;
-  bool UsesNativeTiling(){return true;}
-  void ReadBlockUnsafe(u64 a,void* p,size_t n){assert(a+n<=bytes.size());reads.emplace_back(a,n);std::memcpy(p,bytes.data()+a,n);}
- };
- namespace Memory{
- enum class GuestMemoryFlags{UnsafeReadWrite};
- template<class T,GuestMemoryFlags>struct GpuGuestMemoryScoped{
-  std::span<T> data;
-  GpuGuestMemoryScoped(MemoryManager& m,u64 a,size_t n,Common::ScratchBuffer<u8>*){assert(a+n<=m.bytes.size());m.writes.emplace_back(a,n);data={m.bytes.data()+a,n};}
-  operator std::span<T>(){return data;}
- };
- }
- namespace Texture{
- struct Call{const u8* src;u8* dst;u32 width,height,alignment;};inline std::vector<Call> calls;
- void UnswizzleTexture(std::span<u8> dst,std::span<const u8> src,u32 bpp,u32 w,u32 h,u32 d,u32,u32,u32 alignment,bool){assert(dst.size()>=size_t(w)*h*d*bpp);calls.push_back({src.data(),dst.data(),w,h,alignment});}
- void SwizzleTexture(std::span<u8> dst,std::span<const u8> src,u32 bpp,u32 w,u32 h,u32 d,u32,u32,u32 alignment,bool){assert(src.size()>=size_t(w)*h*d*bpp);calls.push_back({src.data(),dst.data(),w,h,alignment});}
- }
-}
-using Tegra::Texture::UnswizzleTexture;using Tegra::Texture::SwizzleTexture;
-'''
+code = common + '#define EDEN_TEXTURE_RECORD_DECODER\n#include \"' + str(root/'tests-nx2/texture-transfer-fixture.h') + '\"\n'
+code += 'using Tegra::Texture::UnswizzleTexture;using Tegra::Texture::SwizzleTexture;\n'
 helpers = text[text.index('struct LevelInfo {'):text.index('[[nodiscard]] constexpr u32 CalculateLevelOffset(')]
 helpers = helpers.replace(function(helpers,'[[nodiscard]] Extent3D AdjustSamplesSize('),'')
 code += helpers

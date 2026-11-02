@@ -1,3 +1,49 @@
+# Bananza startup hotfix — JIT constant writable alias, November 2, 2026
+
+Initial nxnative/nightly package crashes after 22 seconds, CPUCore_0, before any
+draw. Exact ELF: ConstantPool::GetConstant writes protected JIT memory. The port's
+CMake alias substitution only recognized the old store and missed the compact one.
+The new adapter handles both known forms and fails on missing/duplicate anchors.
+
+ASan/UBSan: original SIGSEGV reproduced with real shared RW/RX mappings; actual
+CMake-generated fixed method preserves constant values, RX operand addresses and
+protection, plus explicit capacity failure. Native PS5 build/package and header/
+isolation checks: PASS on dedie. Cubic: zero findings. User confirmed full closure;
+69 companions matched, only eboot.bin replaced with backup. No automatic launch.
+Artifacts/journal/exact ELF: `artifacts/upstream-opt-jit-alias-fix/`.
+**Installed; console launch, rendering and FPS retest pending.**
+
+---
+
+# nxnative / Eden nightly performance candidate — November 2, 2026
+
+Native PS5 build and package: **PASS** on `dedie`, in an isolated build root.
+Coherent reuse of gathered SSBOs and removal of read-only scatter-source
+allocations; improved JIT constant-pool lookup; selected texel-buffer
+and VP9 backports. Existing PGO, title identity and gameplay settings preserved.
+
+Focused production-method ASan/UBSan tests pass, including real constructed hash
+collisions, same-tick post-producer invalidation, read-to-write binding promotion,
+constant-pool capacity, viewport boundary continuity, null texel buffers and delayed VP9
+metadata. The read-only two-group fixture needs 2 gathers over 1,000 draws;
+conservative mode needs 2,000. These are synthetic counts, not a game FPS gain.
+The existing real scheduler/upload-guard test passes 262,144 mixed events.
+Native sparse/multiplayer header checks and package isolation pass.
+
+Package and exact ELF: `artifacts/upstream-opt-20261102/`.
+**Installed after the user confirmed full application closure; no console rendering/FPS result.**
+All 69 companion files matched, so only eboot.bin was replaced through verified
+staging, preserved permissions and rename, with the prior binary retained.
+Journal: `artifacts/upstream-opt-20261102/install-journal.json`. Cubic retry completed without
+a subscription error. Its constant-pool finding was addressed with explicit
+exhaustion handling and a returning-assertion regression. Its second finding
+removed the unvalidated viewport backport because it introduced a coordinate
+discontinuity; baseline conversion and a boundary regression are retained. Final
+local review: zero findings, no error; repository context unavailable. No push.
+[Provenance, limits and deferred candidates](eden/docs/UPSTREAM_PERFORMANCE_ADAPTATIONS.md).
+
+---
+
 # 00.064.000 — CPU resource and descriptor preparation
 
 Incremental build on build-server and PS5 installation succeeded. Base .063

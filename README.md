@@ -74,6 +74,30 @@ preserving memory correctness, and to diagnose the split-mode freeze before
 considering it usable. Measurements and version history are in
 [TEST-REPORT.md](TEST-REPORT.md); planned work is in [ROADMAP.md](ROADMAP.md).
 
+The latest **installed build, Bananza rendering/performance incomplete**, adds partial uploads for large
+textures with sparse guest mappings and optional native PGO. Native build,
+ASan/UBSan texture tests, actual PGO-use checks and packaging passed on the build
+server. Bananza reaches about 10 FPS, falling to 4 with movement, with black areas
+still present; no isolated FPS improvement is established. See the
+[partial-texture/PGO integration](milestones/partial-textures-pgo/README.md). The ASTC-to-BCn
+GPU submission trial had no effect in the CPU-decoded BC3 mode. A subsequent
+CPU async-texture generation fix is installed and its activation confirmed, but
+the user reports unchanged black areas and FPS. See the
+[Bananza investigation](eden/docs/BANANZA_STARTUP_INVESTIGATION.md).
+
+
+The latest installed performance update adapts ideas from nxnative and selected Eden
+nightly changes: coherent reuse of gathered SSBOs, fewer read-only binding
+allocations, a better JIT constant pool, and contained texel-buffer and
+VP9 fixes. Installation changed only eboot.bin, with rollback retained and game data preserved. Validation and
+provenance: [upstream performance adaptations](eden/docs/UPSTREAM_PERFORMANCE_ADAPTATIONS.md).
+The initial batch caused a Bananza startup crash because its compact JIT
+constant store bypassed the PS5 writable-alias adapter. A tested generator fix
+is now installed; console launch remains to be retested. See the
+[Bananza investigation](eden/docs/BANANZA_STARTUP_INVESTIGATION.md).
+No PS5 FPS or rendering gain has been established for this installed update.
+
+
 ## Contributing
 
 Please help make EdGlantine-PS5 faster and more stable. Contributions can be code,

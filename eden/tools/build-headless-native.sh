@@ -41,7 +41,8 @@ ffmpeg="$scratch/ffmpeg-native/install"
 test -f "$ffmpeg/lib/libavcodec.a" || { echo 'Run tools/build-headless-ffmpeg.sh first.' >&2; exit 1; }
 cmake -S "$scratch/source" -B "$scratch/native-local" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$root/headless/ps5.cmake" -DPS5_NATIVE=ON -DEDEN_DEVICE_FRONTEND="$devices" \
-    -DCMAKE_BUILD_TYPE=Release -DENABLE_LTO=OFF \
+    -DCMAKE_BUILD_TYPE=Release -DENABLE_LTO=OFF -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+    -DEDEN_PGO_PROFILE="${EDEN_PGO_PROFILE:-}" \
     -DEDEN_PS5_VULKAN="${EDEN_PS5_VULKAN:-OFF}" \
     -DEDEN_VULKAN_DRIVER="${EDEN_VULKAN_DRIVER:-CUSTOM}" \
     -DEDEN_DEV_VULKAN="${EDEN_DEV_VULKAN:-OFF}" \

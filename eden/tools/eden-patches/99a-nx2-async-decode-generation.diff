@@ -1,0 +1,138 @@
+diff --git a/src/video_core/texture_cache/image_base.h b/src/video_core/texture_cache/image_base.h
+--- a/src/video_core/texture_cache/image_base.h
++++ b/src/video_core/texture_cache/image_base.h
+@@ -120,6 +120,9 @@
+     VAddr cpu_addr = 0;
+     VAddr cpu_addr_end = 0;
+ 
++    // GPU-cache lock owns this version; workers carry a value and never read the image.
++    // Zero means this image has not used the CPU async decoder (e.g. async unswizzle).
++    u64 async_decode_generation = 0;
+     u64 modification_tick = 0;
+     size_t lru_index = SIZE_MAX;
+ 
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -66,11 +66,13 @@
+ 
+ struct AsyncDecodeContext {
+     ImageId image_id;
++    u64 generation{};
+     Common::ScratchBuffer<u8> decoded_data;
+     boost::container::small_vector<BufferImageCopy, 16> copies;
+     std::mutex mutex;
+     std::atomic_bool complete;
+-    bool cancelled{}; ///< The image was deleted meanwhile: drop the result (GPU thread only).
++    // Cache mutations set cancellation; the worker can skip superseded work before converting.
++    std::atomic_bool cancelled{};
+ };
+ 
+ using TextureCacheGPUMap = ::Common::unordered_map<u64, std::vector<ImageId>, Common::IdentityHash<u64>>;
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -57,6 +57,14 @@
+     }
+ }
+ 
++
++// The cache lock serializes image mutations and publication. A CPU worker only
++// owns its input and context; an old completion must not overwrite newer pixels.
++inline void InvalidateAsyncDecode(ImageBase& image) noexcept {
++    if (image.async_decode_generation == 0) return;
++    ++image.async_decode_generation;
++    image.flags &= ~ImageFlagBits::IsDecoding;
++}
+ 
+ using Tegra::Texture::TICEntry;
+ using Tegra::Texture::TSCEntry;
+@@ -756,6 +764,7 @@
+ template <class P>
+ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
+     ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size](ImageId image_id, Image& image) {
++        InvalidateAsyncDecode(image);
+         if (MarkSparseWrite(image_id, image, cpu_addr, size) ||
+             MarkPartialWrite(image, cpu_addr, size)) {
+             return;
+@@ -929,6 +938,7 @@
+                             [&](ImageId id, Image&) { deleted_images.push_back(id); });
+     for (const ImageId id : deleted_images) {
+         Image& image = slot_images[id];
++        InvalidateAsyncDecode(image);
+         if (MarkPartialRemap(image, gpu_addr, size)) {
+             continue;
+         }
+@@ -1412,6 +1422,7 @@
+         // Only upload modified images
+         return;
+     }
++    InvalidateAsyncDecode(image);
+     if (IsWatchedImage(image.gpu_addr)) {
+         LOG_INFO(HW_GPU, "watch: refresh, flags {:#x}, {} dirty pages, {} remapped ranges",
+                  static_cast<u32>(image.flags), image.partial_dirty_pages.size(), image.partial_remapped.size());
+@@ -1867,12 +1878,23 @@
+ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
+     UNIMPLEMENTED_IF(False(image.flags & ImageFlagBits::Converted));
+     LOG_DEBUG(HW_GPU, "Queuing async texture decode {:#x}", image.gpu_addr);
+-
++    static const bool versioning_reported = [] {
++        LOG_INFO(HW_GPU, "NX2_ASYNC_DECODE_VERSIONING active=1");
++        return true;
++    }();
++    (void)versioning_reported;
++
++    // New snapshots supersede earlier jobs for this image, even on the single
++    // worker: a synchronous refresh or GPU write can occur while it is queued.
++    for (const auto& pending : async_decodes) {
++        if (pending->image_id == image_id) pending->cancelled.store(true, std::memory_order_relaxed);
++    }
+     image.flags |= ImageFlagBits::IsDecoding;
+     ++async_decodes_queued;
+     auto decode = std::make_unique<AsyncDecodeContext>();
+     auto* decode_ptr = decode.get();
+     decode->image_id = image_id;
++    decode->generation = ++image.async_decode_generation;
+     async_decodes.push_back(std::move(decode));
+ 
+     std::vector<u8> local_unswizzle_data_buffer(image.unswizzled_size_bytes, 0);
+@@ -1895,6 +1917,11 @@
+     auto func = [out_size, copies, info = image.info,
+                  input = std::move(local_unswizzle_data_buffer),
+                  async_decode = decode_ptr]() mutable {
++        if (async_decode->cancelled.load(std::memory_order_relaxed)) {
++            std::unique_lock lock{async_decode->mutex};
++            async_decode->complete = true;
++            return;
++        }
+         async_decode->decoded_data.resize_destructive(out_size);
+         std::span copies_span{copies.data(), copies.size()};
+         ConvertImage(input, info, async_decode->decoded_data, copies_span);
+@@ -1941,6 +1968,11 @@
+             continue;
+         }
+         Image& image = slot_images[async_decode->image_id];
++        if (async_decode->generation != image.async_decode_generation) {
++            // A newer snapshot/CPU update/GPU write owns the image and its flag.
++            i = async_decodes.erase(i);
++            continue;
++        }
+         if (async_decode->decoded_data.size() > MapSizeBytes(image)) {
+             LOG_ERROR(HW_GPU, "Async decode of {} bytes for a {}-byte image at {:#x}, dropped",
+                       async_decode->decoded_data.size(), MapSizeBytes(image), image.gpu_addr);
+@@ -3402,6 +3434,7 @@
+ 
+ template <class P>
+ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
++    InvalidateAsyncDecode(image);
+     image.flags |= ImageFlagBits::GpuModified;
+     image.modification_tick = ++modification_tick;
+ }
+@@ -3464,6 +3497,7 @@
+     Image& image = slot_images[image_id];
+     if (image.sparse_mappings_changed) RebuildSparseMappings(image_id, image);
+     if (invalidate) {
++        InvalidateAsyncDecode(image);
+         RestorePartialPages(image);
+         image.flags &= ~(ImageFlagBits::CpuModified | ImageFlagBits::GpuModified);
+         if (False(image.flags & ImageFlagBits::Tracked)) {

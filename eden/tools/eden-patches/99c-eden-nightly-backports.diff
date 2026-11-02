@@ -1,0 +1,240 @@
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/constant_pool.cpp b/src/dynarmic/src/dynarmic/backend/x64/constant_pool.cpp
+--- a/src/dynarmic/src/dynarmic/backend/x64/constant_pool.cpp
++++ b/src/dynarmic/src/dynarmic/backend/x64/constant_pool.cpp
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <cstring>
++#include <stdexcept>
+ 
+ #include "common/assert.h"
+ 
+@@ -15,26 +16,25 @@
+ 
+ namespace Dynarmic::Backend::X64 {
+ 
+-ConstantPool::ConstantPool(BlockOfCode& code, size_t size)
+-    : insertion_point(0)
+-{
++ConstantPool::ConstantPool(BlockOfCode& code, size_t size) {
+     code.EnsureMemoryCommitted(align_size + size);
+     code.int3();
+     code.align(align_size);
+-    pool = std::span<ConstantT>(reinterpret_cast<ConstantT*>(code.AllocateFromCodeSpace(size)), size / align_size);
++    pool = std::span<u128>(static_cast<u128*>(code.AllocateFromCodeSpace(size)), size / sizeof(u128));
+ }
+ 
+ Xbyak::Address ConstantPool::GetConstant(BlockOfCode& code, const Xbyak::AddressFrame& frame, u64 lower, u64 upper) {
+     const auto constant = ConstantT(lower, upper);
+-    auto it = constant_info.find(constant);
+-    if (it == constant_info.end()) {
+-        ASSERT(insertion_point < pool.size());
+-        ConstantT& target_constant = pool[insertion_point];
+-        target_constant = constant;
+-        it = constant_info.insert({constant, &target_constant}).first;
+-        ++insertion_point;
++    // Preserve the full-pool guard: a duplicate is still valid at capacity,
++    // but a new constant must not be inserted or written out of bounds.
++    if (constant_info.size() == pool.size()) {
++        const auto it = constant_info.find(constant);
++        if (it == constant_info.end()) throw std::length_error("JIT constant pool exhausted");
++        return frame[code.rip + std::addressof(pool[it->second])];
+     }
+-    return frame[code.rip + it->second];
++    const auto [it, inserted] = constant_info.try_emplace(constant, u32(constant_info.size()));
++    if (inserted) pool[it->second] = u128{lower, upper};
++    return frame[code.rip + std::addressof(pool[it->second])];
+ }
+ 
+ }  // namespace Dynarmic::Backend::X64
+diff --git a/src/dynarmic/src/dynarmic/backend/x64/constant_pool.h b/src/dynarmic/src/dynarmic/backend/x64/constant_pool.h
+--- a/src/dynarmic/src/dynarmic/backend/x64/constant_pool.h
++++ b/src/dynarmic/src/dynarmic/backend/x64/constant_pool.h
+@@ -8,7 +8,7 @@
+ 
+ #pragma once
+ 
+-#include <bit>
++#include <boost/functional/hash.hpp>
+ #include <cstddef>
+ #include <span>
+ #include <utility>
+@@ -37,15 +37,8 @@
+     using ConstantT = std::pair<u64, u64>;
+     static_assert(sizeof(ConstantT) == align_size);
+ 
+-    struct ConstantHash {
+-        std::size_t operator()(const ConstantT& constant) const noexcept {
+-            return constant.first ^ std::rotl<u64>(constant.second, 1);
+-        }
+-    };
+-
+-    ::Common::unordered_map<ConstantT, void*, ConstantHash> constant_info;
+-    std::span<ConstantT> pool;
+-    std::size_t insertion_point;
++    ::Common::unordered_map<ConstantT, u32, boost::hash<ConstantT>> constant_info;
++    std::span<u128> pool;
+ };
+ 
+ }  // namespace Dynarmic::Backend::X64
+diff --git a/src/video_core/host1x/codec_types.h b/src/video_core/host1x/codec_types.h
+--- a/src/video_core/host1x/codec_types.h
++++ b/src/video_core/host1x/codec_types.h
+@@ -312,6 +312,10 @@
+     bool allow_high_precision_mv;
+     bool segment_enabled;
+     bool mode_ref_delta_enabled;
++
++    Segmentation segmentation;
++    std::array<u8, 7> seg_tree_probs;
++    std::array<u8, 3> seg_pred_probs;
+ };
+ 
+ struct Vp9FrameContainer {
+@@ -377,6 +381,10 @@
+             .allow_high_precision_mv = allow_high_precision_mv != 0,
+             .segment_enabled = segmentation.enabled != 0,
+             .mode_ref_delta_enabled = loop_filter.mode_ref_delta_enabled != 0,
++
++            .segmentation = segmentation,
++            .seg_tree_probs = {},
++            .seg_pred_probs = {},
+         };
+     }
+ };
+diff --git a/src/video_core/host1x/codecs/vp9.cpp b/src/video_core/host1x/codecs/vp9.cpp
+--- a/src/video_core/host1x/codecs/vp9.cpp
++++ b/src/video_core/host1x/codecs/vp9.cpp
+@@ -331,19 +331,16 @@
+ }
+ 
+ void VP9::WriteSegmentation(VpxBitStreamWriter& writer) {
+-    bool enabled = current_picture_info.segmentation.enabled != 0;
++    bool enabled = current_frame_info.segmentation.enabled != 0;
+     writer.WriteBit(enabled);
+     if (!enabled) {
+         return;
+     }
+ 
+-    auto update_map = current_picture_info.segmentation.update_map != 0;
++    auto update_map = current_frame_info.segmentation.update_map != 0;
+     writer.WriteBit(update_map);
+ 
+     if (update_map) {
+-        EntropyProbs entropy_probs{};
+-        host1x.gmmu_manager.ReadBlock(regs.vp9_prob_tab_buffer_offset.Address(), &entropy_probs, sizeof(entropy_probs));
+-
+         auto WriteProb = [&](u8 prob) {
+             bool coded = prob != 255;
+             writer.WriteBit(coded);
+@@ -352,55 +349,55 @@
+             }
+         };
+ 
+-        for (size_t i = 0; i < entropy_probs.mb_segment_tree_probs.size(); i++) {
+-            WriteProb(entropy_probs.mb_segment_tree_probs[i]);
+-        }
+-
+-        auto temporal_update = current_picture_info.segmentation.temporal_update != 0;
++        for (size_t i = 0; i < current_frame_info.seg_tree_probs.size(); i++) {
++            WriteProb(current_frame_info.seg_tree_probs[i]);
++        }
++
++        auto temporal_update = current_frame_info.segmentation.temporal_update != 0;
+         writer.WriteBit(temporal_update);
+ 
+         if (temporal_update) {
+             for (s32 i = 0; i < 3; i++) {
+-                WriteProb(entropy_probs.segment_pred_probs[i]);
+-            }
+-        }
+-    }
+-
+-    if (last_segmentation == current_picture_info.segmentation) {
++                WriteProb(current_frame_info.seg_pred_probs[i]);
++            }
++        }
++    }
++
++    if (last_segmentation == current_frame_info.segmentation) {
+         writer.WriteBit(false);
+         return;
+     }
+ 
+-    last_segmentation = current_picture_info.segmentation;
++    last_segmentation = current_frame_info.segmentation;
+     writer.WriteBit(true);
+-    writer.WriteBit(current_picture_info.segmentation.abs_delta != 0);
++    writer.WriteBit(current_frame_info.segmentation.abs_delta != 0);
+ 
+     constexpr s32 MAX_SEGMENTS = 8;
+     constexpr std::array SegmentationFeatureBits = {8, 6, 2, 0};
+ 
+     for (s32 i = 0; i < MAX_SEGMENTS; i++) {
+-        auto q_enabled = current_picture_info.segmentation.feature_enabled[i][0] != 0;
++        auto q_enabled = current_frame_info.segmentation.feature_enabled[i][0] != 0;
+         writer.WriteBit(q_enabled);
+         if (q_enabled) {
+-            writer.WriteS(current_picture_info.segmentation.feature_data[i][0],
++            writer.WriteS(current_frame_info.segmentation.feature_data[i][0],
+                           SegmentationFeatureBits[0]);
+         }
+ 
+-        auto lf_enabled = current_picture_info.segmentation.feature_enabled[i][1] != 0;
++        auto lf_enabled = current_frame_info.segmentation.feature_enabled[i][1] != 0;
+         writer.WriteBit(lf_enabled);
+         if (lf_enabled) {
+-            writer.WriteS(current_picture_info.segmentation.feature_data[i][1],
++            writer.WriteS(current_frame_info.segmentation.feature_data[i][1],
+                           SegmentationFeatureBits[1]);
+         }
+ 
+-        auto ref_enabled = current_picture_info.segmentation.feature_enabled[i][2] != 0;
++        auto ref_enabled = current_frame_info.segmentation.feature_enabled[i][2] != 0;
+         writer.WriteBit(ref_enabled);
+         if (ref_enabled) {
+-            writer.WriteU(current_picture_info.segmentation.feature_data[i][2],
++            writer.WriteU(current_frame_info.segmentation.feature_data[i][2],
+                           SegmentationFeatureBits[2]);
+         }
+ 
+-        auto skip_enabled = current_picture_info.segmentation.feature_enabled[i][3] != 0;
++        auto skip_enabled = current_frame_info.segmentation.feature_enabled[i][3] != 0;
+         writer.WriteBit(skip_enabled);
+     }
+ }
+@@ -409,7 +406,13 @@
+     host1x.gmmu_manager.ReadBlock(regs.picture_info_offset.Address(), &current_picture_info, sizeof(PictureInfo));
+     Vp9PictureInfo vp9_info = current_picture_info.Convert();
+ 
+-    InsertEntropy(regs.vp9_prob_tab_buffer_offset.Address(), vp9_info.entropy);
++    EntropyProbs entropy_probs{};
++    host1x.gmmu_manager.ReadBlock(regs.vp9_prob_tab_buffer_offset.Address(),
++                                  &entropy_probs, sizeof(entropy_probs));
++
++    entropy_probs.Convert(vp9_info.entropy);
++    vp9_info.seg_tree_probs = entropy_probs.mb_segment_tree_probs;
++    vp9_info.seg_pred_probs = entropy_probs.segment_pred_probs;
+ 
+     // surface_luma_offset[0:3] contains the address of the reference frame offsets in the following
+     // order: last, golden, altref, current.
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.h b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.h
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+@@ -235,9 +235,13 @@
+ 
+     void BindTextureBuffer(Buffer& buffer, u32 offset, u32 size,
+                            VideoCore::Surface::PixelFormat format) {
+-        guest_descriptor_queue.AddTexelBuffer(buffer.View(offset, size, format),
+-                                              buffer.DeviceAddress(), offset, size,
+-                                              TexelBufferFormat(format));
++        if (guest_descriptor_queue.UsesDescriptorBuffer()) {
++            const VkDeviceAddress address = buffer.DeviceAddress();
++            const VkFormat vk_format = address == 0 ? VK_FORMAT_UNDEFINED : TexelBufferFormat(format);
++            guest_descriptor_queue.AddTexelBuffer(VK_NULL_HANDLE, address, offset, size, vk_format);
++        } else {
++            guest_descriptor_queue.AddTexelBuffer(buffer.View(offset, size, format));
++        }
+     }
+ 
+     bool ShouldLimitDynamicStorageBuffers() const {

@@ -1,0 +1,271 @@
+diff --git a/src/video_core/native_indirect_reset.h b/src/video_core/native_indirect_reset.h
+--- /dev/null
++++ b/src/video_core/native_indirect_reset.h
+@@ -0,0 +1,105 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++#include <algorithm>
++#include <array>
++#include <limits>
++#include <span>
++#include <vector>
++#include "common/common_types.h"
++
++namespace VideoCommon::NativeIndirectReset {
++// Exact lowered SDK program, including the header (no position outputs), exit
++// and source-address map. No title, guest address or hash is used as identity.
++inline constexpr std::array<u64, 48> Program{
++    0x00000000020d0481ULL,
++    0x0000000000000000ULL,
++    0x0000000000000000ULL,
++    0x0000000000000000ULL,
++    0x0000000000000000ULL,
++    0x0000000080000000ULL,
++    0x0000000000000000ULL,
++    0x0000000000000000ULL,
++    0x0000000000000000ULL,
++    0x0000000000000000ULL,
++    0xefd87f802fc7ff00ULL,
++    0x4c980780044700fbULL,
++    0x0000000000000000ULL,
++    0x5c1801800fb70000ULL,
++    0x5b6203800fb70007ULL,
++    0x4c980780045700fcULL,
++    0x0000000000000000ULL,
++    0x010000000017f0faULL,
++    0x5ca000000ff7fafaULL,
++    0x5c1000000fa7fc01ULL,
++    0x0000000000000000ULL,
++    0xef98000000070100ULL,
++    0xeed5200000070000ULL,
++    0xef98000000070100ULL,
++    0x0000000000000000ULL,
++    0x010000000017f003ULL,
++    0xeedc200000470003ULL,
++    0xeedc2000000700ffULL,
++    0x0000000000000000ULL,
++    0xeedc2000008700ffULL,
++    0xeedc200000c700ffULL,
++    0xeedc2000010700ffULL,
++    0x0000000000000000ULL,
++    0xe30000000007000fULL,
++    0x0000000000000000ULL,
++    0x0000000000000050ULL,
++    0x0000000000000058ULL,
++    0x0000000000000078ULL,
++    0x00000000000000a8ULL,
++    0x00000000000000c8ULL,
++    0x00000000000000d0ULL,
++    0x00000000000000d8ULL,
++    0x00000000000000e8ULL,
++    0x00000000000000f0ULL,
++    0x00000000000000f8ULL,
++    0x0000000000000108ULL,
++    0x000000000000000bULL,
++    0x50414d4e4544454eULL,
++};
++inline bool Matches(std::span<const u64> code) {
++    return std::ranges::equal(code, Program);
++}
++
++// This program loads table[VertexID] and stores {0,1,0,0,0} there. The caller
++// admits only direct, single-instance point draws without additional shader stages,
++// additional pre-raster stages, transform feedback or conditional rendering.
++// Preflight the complete operation before any store. Coherent reader/writer
++// callbacks must retain ordering against previous GPU work and future draws.
++template <class Mapped, class Read, class Write>
++bool Execute(u64 cbuf, u32 cbuf_size, u32 count, Mapped&& mapped, Read&& read, Write&& write) {
++    constexpr u64 RecordSize = 20;
++    const auto valid = [&](u64 address, u64 size) {
++        return address != 0 && size <= std::numeric_limits<u64>::max() - address &&
++               mapped(address, size);
++    };
++    if (count == 0 || count > 1024 || cbuf_size < 0x118 ||
++        !valid(cbuf, cbuf_size)) return false;
++    u64 table{};
++    read(cbuf + 0x110, &table, sizeof(table));
++    const u64 bytes = u64{count} * sizeof(u64);
++    if (!valid(table, bytes)) return false;
++    std::vector<u64> targets(count);
++    read(table, targets.data(), bytes);
++    const auto overlaps = [](u64 a, u64 as, u64 b, u64 bs) {
++        return a < b + bs && b < a + as;
++    };
++    for (u64 target : targets) {
++        if (!valid(target, RecordSize) || (target & 3) ||
++            overlaps(target, RecordSize, table, bytes) ||
++            overlaps(target, RecordSize, cbuf, cbuf_size)) return false;
++    }
++    auto ordered = targets;
++    std::ranges::sort(ordered);
++    for (size_t i = 1; i < ordered.size(); ++i) {
++        if (ordered[i] != ordered[i - 1] && ordered[i] - ordered[i - 1] < RecordSize)
++            return false;
++    }
++    constexpr std::array<u32, 5> record{0, 1, 0, 0, 0};
++    for (u64 target : targets) write(target, record.data(), sizeof(record));
++    return true;
++}
++} // namespace VideoCommon::NativeIndirectReset
+diff --git a/src/video_core/shader_environment.h b/src/video_core/shader_environment.h
+--- a/src/video_core/shader_environment.h
++++ b/src/video_core/shader_environment.h
+@@ -75,6 +75,8 @@
+     [[nodiscard]] const std::vector<Shader::Ampere::Instruction>& NativeTrapPrefix() const noexcept {
+         return native_trap_prefix;
+     }
++
++    [[nodiscard]] bool IsNativeIndirectReset() const;
+ 
+     [[nodiscard]] bool CanBeSerialized() const noexcept;
+ 
+diff --git a/src/video_core/shader_environment.cpp b/src/video_core/shader_environment.cpp
+--- a/src/video_core/shader_environment.cpp
++++ b/src/video_core/shader_environment.cpp
+@@ -39,6 +39,7 @@
+ #include "video_core/engines/kepler_compute.h"
+ #include "video_core/memory_manager.h"
+ #include "video_core/shader_environment.h"
++#include "video_core/native_indirect_reset.h"
+ #include "video_core/texture_cache/format_lookup_table.h"
+ #include "video_core/textures/texture.h"
+ 
+@@ -243,6 +244,11 @@
+ 
+ size_t GenericEnvironment::ReadSizeBytes() const noexcept {
+     return read_highest - read_lowest + INST_SIZE;
++}
++
++bool GenericEnvironment::IsNativeIndirectReset() const {
++    return stage == Shader::Stage::VertexB && HasNativeRegisterCopies() &&
++           NativeIndirectReset::Matches(code);
+ }
+ 
+ bool GenericEnvironment::CanBeSerialized() const noexcept {
+diff --git a/src/video_core/shader_cache.h b/src/video_core/shader_cache.h
+--- a/src/video_core/shader_cache.h
++++ b/src/video_core/shader_cache.h
+@@ -38,6 +38,7 @@
+ struct ShaderInfo {
+     u64 unique_hash{};
+     size_t size_bytes{};
++    bool native_indirect_reset{};
+     std::vector<Shader::Ampere::Instruction> native_trap_prefix;
+ };
+ 
+diff --git a/src/video_core/shader_cache.cpp b/src/video_core/shader_cache.cpp
+--- a/src/video_core/shader_cache.cpp
++++ b/src/video_core/shader_cache.cpp
+@@ -353,6 +353,7 @@
+         info->size_bytes = env.ReadSizeBytes();
+     }
+     info->native_trap_prefix = env.NativeTrapPrefix();
++    info->native_indirect_reset = env.IsNativeIndirectReset();
+     const size_t size_bytes{env.SourceSizeBytes() ? env.SourceSizeBytes() : info->size_bytes};
+     const ShaderInfo* const result{info.get()};
+     Register(std::move(info), cpu_addr, size_bytes);
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -114,6 +114,10 @@
+ 
+     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
+ 
++    [[nodiscard]] bool IsNativeIndirectReset() const {
++        return shader_infos[1] && shader_infos[1]->native_indirect_reset;
++    }
++
+     [[nodiscard]] ComputePipeline* CurrentComputePipeline();
+ 
+     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -166,7 +166,7 @@
+     static constexpr VkDeviceSize DEFAULT_BUFFER_SIZE = 4 * sizeof(float);
+ 
+     template <typename Func>
+-    void PrepareDraw(bool is_indexed, Func&&);
++    void PrepareDraw(bool is_indexed, Func&&, u32 direct_instances = 0);
+ 
+     void FlushWork();
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -30,6 +30,7 @@
+ 
+ #include "common/assert.h"
+ #include "shader_recompiler/exception.h"
++#include "video_core/native_indirect_reset.h"
+ #include "common/logging.h"
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
+@@ -324,7 +325,7 @@
+ #endif
+ 
+ template <typename Func>
+-void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
++void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, u32 direct_instances) {
+ 
+     SCOPE_EXIT {
+         gpu.TickWork();
+@@ -368,6 +369,49 @@
+         submitted = pipeline_cache.TakeDeferredDraw();
+         return;
+     }
++#ifdef EDEN_NX2_PS5_PROTO
++    // The native raw-global fallback cannot resolve a pointer loaded from the
++    // SDK's indirect-record table. Restore this exact program's stores before
++    // the ordinary draw; retain its normal pipeline, queries and bookkeeping.
++    const auto& reset_regs = maxwell3d->regs;
++    const auto& reset_draw = maxwell3d->draw_manager.draw_state;
++    const bool unconditional =
++        reset_regs.render_enable_override == Maxwell::RenderEnable::Override::AlwaysRender ||
++        (reset_regs.render_enable_override == Maxwell::RenderEnable::Override::UseRenderEnable &&
++         reset_regs.render_enable.mode == Maxwell::RenderEnable::Mode::True);
++    if (maxwell3d->GetNativeMacroEngine().native_turing && !is_indexed &&
++        direct_instances == 1 && reset_draw.vertex_buffer.first == 0 &&
++        reset_draw.topology == Maxwell::PrimitiveTopology::Points &&
++        !reset_regs.transform_feedback_enabled && unconditional &&
++        reset_regs.IsShaderConfigEnabled(1) && !reset_regs.IsShaderConfigEnabled(0) &&
++        !reset_regs.IsShaderConfigEnabled(2) &&
++        !reset_regs.IsShaderConfigEnabled(3) && !reset_regs.IsShaderConfigEnabled(4) &&
++        pipeline_cache.IsNativeIndirectReset()) {
++        const auto& cbuf = maxwell3d->state.shader_stages[0].const_buffers[0];
++        if (cbuf.enabled) {
++            const bool restored = VideoCommon::NativeIndirectReset::Execute(
++                cbuf.address, cbuf.size, reset_draw.vertex_buffer.count,
++                [&](u64 address, u64 size) {
++                    return gpu_memory->IsWithinGPUAddressRange(address) &&
++                           gpu_memory->IsWithinGPUAddressRange(address + size - 1) &&
++                           gpu_memory->IsFullyMappedRange(address, size);
++                },
++                [&](u64 address, void* dest, u64 size) { gpu_memory->ReadBlock(address, dest, size); },
++                [&](u64 address, const void* src, u64 size) { gpu_memory->WriteBlock(address, src, size); });
++            static u64 reset_count{};
++            if (restored && (++reset_count == 1 || reset_count % 600 == 0)) {
++                LOG_INFO(HW_GPU, "NX2_INDIRECT_RESET draws={} records={} coherent=1",
++                         reset_count, reset_draw.vertex_buffer.count);
++            }
++            if (!restored) {
++                static u32 rejected{};
++                if (++rejected <= 4) LOG_WARNING(HW_GPU,
++                    "NX2_INDIRECT_RESET rejected unsafe table/range (records={})",
++                    reset_draw.vertex_buffer.count);
++            }
++        }
++    }
++#endif
+     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+     buffer_cache.runtime.BeginStorageBatch(maxwell3d->GetNativeMacroEngine().native_turing);
+     // update engine as channel may be different.
+@@ -908,7 +952,7 @@
+             GPU::Logging::GPULogger::GetInstance().LogVulkanCall(
+                 is_indexed ? "vkCmdDrawIndexed" : "vkCmdDraw", params, VK_SUCCESS);
+         }
+-    });
++    }, instance_count);
+ }
+ 
+ void RasterizerVulkan::DrawIndirect() {

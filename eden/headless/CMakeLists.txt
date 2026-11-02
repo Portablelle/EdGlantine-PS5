@@ -84,6 +84,7 @@ target_include_directories(dynarmic BEFORE PRIVATE "${PORT_BUILD_DIR}/jit-checks
 # Let the existing compiler inline across the JIT's translation units. Keep the
 # rest of the native application on its qualified non-LTO build path.
 target_compile_options(dynarmic PRIVATE -flto=thin)
+include("${CMAKE_CURRENT_LIST_DIR}/pgo.cmake")
 if(PS5_NATIVE)
     # The GPU thread's per-draw work (command processing, buffer/texture caches) spans
     # video_core's translation units, and the console's CPU is a Zen 2 (AVX2, BMI2, LZCNT/TZCNT).

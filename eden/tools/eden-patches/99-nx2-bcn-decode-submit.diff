@@ -1,0 +1,27 @@
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -3427,6 +3427,14 @@
+         pending.views.push_back(
+             MakeStorageView(device.GetLogical(), level, *pending.image, DecodeFormat));
+     }
++    // The BCn encode consumes this temporary image. Use the decoder's normal
++    // submission policy here too; native textures default to Flush, without a
++    // CPU/GPU idle wait. Previously this path bypassed the submission entirely.
++    static const bool submission_reported = [] {
++        LOG_INFO(Render_Vulkan, "NX2_BCN_DECODE_SUBMIT before_encode=1 policy=decoder-default");
++        return true;
++    }();
++    (void)submission_reported;
+     astc_decoder_pass->AssembleInto(
+         info, skip, image.guest_size_bytes,
+         ASTCDecoderPass::Target{
+@@ -3434,7 +3442,7 @@
+             .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+             .initialized = false,
+             .level_view = [&pending](s32 level) { return *pending.views[level]; },
+-            .wait = false,
++            .wait = true,
+         },
+         map, swizzles);
+ 

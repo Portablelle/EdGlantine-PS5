@@ -415,15 +415,10 @@ bool HandleGuestWriteFault(void* fault) noexcept {
     }
     SparseRange* const range = WriteRangeOf(address);
     if (range == nullptr) return false;
-    // The same address faulting again and again is not a slot to promote but a real fault.
+    // Only count retries that make no progress. Successful promotions can legitimately
+    // revisit the same address after the scanner returns its slot to the zero block.
     static thread_local std::uintptr_t last = 0;
     static thread_local unsigned repeats = 0;
-    repeats = address == last ? repeats + 1 : 1;
-    last = address;
-    if (repeats > 16) {
-        repeats = 0;
-        return false;
-    }
     counters.faults.fetch_add(1, std::memory_order_relaxed);
     const std::size_t slot = (address - range->begin.load(std::memory_order_relaxed)) / SparseSlot;
     const bool waited = LockSlot(*range, slot, true);
@@ -431,8 +426,20 @@ bool HandleGuestWriteFault(void* fault) noexcept {
     if (waited) {
         // Someone changed the slot meanwhile (or is mapping it again): the access may now succeed,
         // and a read must never make a Fine slot whole. It faults again if it was a write.
+        repeats = 0;
         UnlockSlot(*range, slot, state);
         return true;
+    }
+    if (state == SlotOwn) {
+        repeats = address == last ? repeats + 1 : 1;
+        last = address;
+        if (repeats > 16) {
+            repeats = 0;
+            UnlockSlot(*range, slot, state);
+            return false;
+        }
+    } else {
+        repeats = 0;
     }
     bool ok = true;
     if (state == SlotFine) {

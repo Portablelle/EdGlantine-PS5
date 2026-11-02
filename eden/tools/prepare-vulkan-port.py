@@ -164,7 +164,13 @@ void RasterizerVulkan::DispatchCompute() {"""),
     # so a draw that returns early is charged for its unmarked tail and the sum of the six falls
     # short by that amount plus two clock reads per phase. control/scheduler.cpp aside, this is the
     # only place the dispatch's time can be spent - so its six numbers should add up to it.
-    ('    namespace Profile = VideoCommon::Nx2Profile;\n    {\n        Profile::Scope scope{Profile::Zone::FlushWork};\n        FlushWork();\n        gpu_memory->FlushCaching();\n    }\n\n    const auto report_failure = [&](std::string_view reason) {\n        static std::set<std::tuple<u64, u64, std::string_view>> seen;\n        const auto& regs = maxwell3d->regs;\n        const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];\n        const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];\n        if (seen.size() < 64 && seen.emplace(vs, ps, reason).second) {\n            LOG_WARNING(HW_GPU, "Draw skipped ({}): vs={:#x} ps={:#x} rt0={:#x} {}x{}", reason, vs, ps,\n                        regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height);\n        }\n    };\n    GraphicsPipeline* const pipeline{[&] {\n        Profile::Scope scope{Profile::Zone::PipelineLookup};\n        return pipeline_cache.CurrentGraphicsPipeline();\n    }()};\n    if (!pipeline) {\n        // A draw withheld for an asynchronous pipeline build is not a failure of the native work.\n        submitted = pipeline_cache.TakeDeferredDraw();\n        return;\n    }\n    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};\n    buffer_cache.runtime.BeginStorageBatch(maxwell3d->GetNativeMacroEngine().native_turing);\n    // update engine as channel may be different.\n    pipeline->SetEngine(maxwell3d, gpu_memory);\n    try {\n        if (!pipeline->Configure(is_indexed)) return;\n    } catch (const Shader::Exception& exception) {\n        LOG_ERROR(Render_Vulkan, "Graphics descriptor binding failed: {}", exception.what());\n        return;\n    }\n\n    {\n        Profile::Scope scope{Profile::Zone::DynamicState};\n        UpdateDynamicStates();\n    }\n\n    query_cache.NotifySegment(true);\n    HandleTransformFeedback();\n    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);\n    draw_func();\n', '    const ::Eden::Performance::Timer rasterizer_draw_timer(::Eden::Performance::rasterizer_draw);\n    auto phase = ::Eden::Performance::MarkStart();\n    namespace Profile = VideoCommon::Nx2Profile;\n    {\n        Profile::Scope scope{Profile::Zone::FlushWork};\n        FlushWork();\n        gpu_memory->FlushCaching();\n        ::Eden::Performance::Mark(::Eden::Performance::draw_flush, phase);\n    }\n\n    const auto report_failure = [&](std::string_view reason) {\n        static std::set<std::tuple<u64, u64, std::string_view>> seen;\n        const auto& regs = maxwell3d->regs;\n        const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];\n        const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];\n        if (seen.size() < 64 && seen.emplace(vs, ps, reason).second) {\n            LOG_WARNING(HW_GPU, "Draw skipped ({}): vs={:#x} ps={:#x} rt0={:#x} {}x{}", reason, vs, ps,\n                        regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height);\n        }\n    };\n    GraphicsPipeline* const pipeline{[&] {\n        Profile::Scope scope{Profile::Zone::PipelineLookup};\n        return pipeline_cache.CurrentGraphicsPipeline();\n    }()};\n    ::Eden::Performance::Mark(::Eden::Performance::draw_pipeline, phase);\n    if (!pipeline) {\n        // A draw withheld for an asynchronous pipeline build is not a failure of the native work.\n        submitted = pipeline_cache.TakeDeferredDraw();\n        return;\n    }\n    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};\n    buffer_cache.runtime.BeginStorageBatch(maxwell3d->GetNativeMacroEngine().native_turing);\n    // update engine as channel may be different.\n    pipeline->SetEngine(maxwell3d, gpu_memory);\n    ::Eden::Performance::Mark(::Eden::Performance::draw_lock_wait, phase);\n    try {\n        if (!pipeline->Configure(is_indexed)) return;\n    } catch (const Shader::Exception& exception) {\n        LOG_ERROR(Render_Vulkan, "Graphics descriptor binding failed: {}", exception.what());\n        return;\n    }\n\n    ::Eden::Performance::Mark(::Eden::Performance::draw_config, phase);\n    {\n        Profile::Scope scope{Profile::Zone::DynamicState};\n        UpdateDynamicStates();\n    }\n\n    query_cache.NotifySegment(true);\n    HandleTransformFeedback();\n    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);\n    ::Eden::Performance::Mark(::Eden::Performance::draw_state, phase);\n    draw_func();\n    ::Eden::Performance::Mark(::Eden::Performance::draw_record, phase);\n'),
+    # Keep phase anchors independent so native pre-draw work survives adaptation.
+    ('    namespace Profile = VideoCommon::Nx2Profile;\n    {\n        Profile::Scope scope{Profile::Zone::FlushWork};', '    const ::Eden::Performance::Timer rasterizer_draw_timer(::Eden::Performance::rasterizer_draw);\n    auto phase = ::Eden::Performance::MarkStart();\n    namespace Profile = VideoCommon::Nx2Profile;\n    {\n        Profile::Scope scope{Profile::Zone::FlushWork};'),
+    ('        gpu_memory->FlushCaching();\n    }\n\n    const auto report_failure', '        gpu_memory->FlushCaching();\n        ::Eden::Performance::Mark(::Eden::Performance::draw_flush, phase);\n    }\n\n    const auto report_failure'),
+    ('    if (!pipeline) {\n        // A draw withheld', '    ::Eden::Performance::Mark(::Eden::Performance::draw_pipeline, phase);\n    if (!pipeline) {\n        // A draw withheld'),
+    ('    pipeline->SetEngine(maxwell3d, gpu_memory);\n    try {', '    pipeline->SetEngine(maxwell3d, gpu_memory);\n    ::Eden::Performance::Mark(::Eden::Performance::draw_lock_wait, phase);\n    try {'),
+    ('    {\n        Profile::Scope scope{Profile::Zone::DynamicState};', '    ::Eden::Performance::Mark(::Eden::Performance::draw_config, phase);\n    {\n        Profile::Scope scope{Profile::Zone::DynamicState};'),
+    ('    draw_func();\n', '    ::Eden::Performance::Mark(::Eden::Performance::draw_state, phase);\n    draw_func();\n    ::Eden::Performance::Mark(::Eden::Performance::draw_record, phase);\n'),
     # Development: where OnCPUWrite spends its time (performance.h CpuWriteDetail).
     ("""    DEBUG_ASSERT(addr != 0 || size != 0);
     {
@@ -283,14 +289,14 @@ void RasterizerVulkan::DispatchCompute() {"""),
     draw_func();
     if (gpu_sample) scheduler.Record([gpu_sample](vk::CommandBuffer command) { NativeGpuProfile::End(command, *gpu_sample); });
     ::Eden::Performance::Mark(::Eden::Performance::draw_record, phase);'''),
-    ('template <typename Func>\nvoid RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {',
+    ('template <typename Func>\nvoid RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, u32 direct_instances) {',
      '''namespace {
 // GPU thread only: the pipeline PrepareDraw refreshed for the draw in progress.
 GraphicsPipeline* prepared_pipeline = nullptr;
 } // namespace
 
 template <typename Func>
-void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {'''),
+void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, u32 direct_instances) {'''),
     ('    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};\n    buffer_cache.runtime.BeginStorageBatch(maxwell3d->GetNativeMacroEngine().native_turing);\n    // update engine as channel may be different.', '    ::Eden::Performance::YieldToGuests();  // a guest thread asleep on a cache lock goes first\n    ::Eden::AstcPolicy::Draw();\n    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};\n    prepared_pipeline = pipeline;\n    SCOPE_EXIT {\n        prepared_pipeline = nullptr;\n    };\n    buffer_cache.runtime.BeginStorageBatch(maxwell3d->GetNativeMacroEngine().native_turing);\n    // update engine as channel may be different.'),
     ('        if (auto* gp = pipeline_cache.CurrentGraphicsPipeline(); gp && gp->HasDynamicVertexInput()) {',
      '        if (auto* gp = prepared_pipeline ? prepared_pipeline : pipeline_cache.CurrentGraphicsPipeline();\n            gp && gp->HasDynamicVertexInput()) {'),
@@ -326,8 +332,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {'''),
      '    SCOPE_EXIT {\n'
      '        if (hold_start != 0) ::Eden::Performance::AddSince(::Eden::Performance::draw_cache_hold, hold_start);\n'
      '    };\n'),
-    ('        }\n    });\n}\n\nvoid RasterizerVulkan::DrawIndirect() {',
-     '        }\n    });\n    SyncProbe(scheduler, "draw", probe_pipeline);\n}\n\nvoid RasterizerVulkan::DrawIndirect() {'),
+    ('        }\n    }, instance_count);\n}\n\nvoid RasterizerVulkan::DrawIndirect() {',
+     '        }\n    }, instance_count);\n    SyncProbe(scheduler, "draw", probe_pipeline);\n}\n\nvoid RasterizerVulkan::DrawIndirect() {'),
     ('void RasterizerVulkan::DrawTexture() {', 'void RasterizerVulkan::DrawTexture() {\n    SCOPE_EXIT { SyncProbe(scheduler, "draw_texture", nullptr); };'),
     ('void RasterizerVulkan::Clear(u32 layer_count) {', 'void RasterizerVulkan::Clear(u32 layer_count) {\n    SCOPE_EXIT { SyncProbe(scheduler, "clear", nullptr); };'),
     ('    ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline()};\n    if (!pipeline) {\n        if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");\n        return;\n    }', '    ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline()};\n    if (!pipeline) {\n        if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");\n        return;\n    }\n    SCOPE_EXIT { SyncProbe(scheduler, "dispatch", pipeline); };'),
@@ -1196,6 +1202,16 @@ VULKAN_CACHE = 'if constexpr (std::is_same_v<Runtime, Vulkan::TextureCacheRuntim
 # NX2 owns partial dirty-page tracking, remaps and bounded uploads. Do not install
 # the older PS5 tracker as well: both decrement the same cached-page counts.
 texture_partial = []
+anchor = 'bool TextureCache<P>::CanUploadSparsePartial(const ImageBase& image) const {\n'
+texture_partial.append((anchor, anchor +
+    '    ' + VULKAN_CACHE + '\n'
+    '        if (!::Eden::Performance::tex_partial.load(std::memory_order_relaxed) ||\n'
+    '            image.guest_size_bytes < ::Eden::Performance::tex_partial_min.load(std::memory_order_relaxed)) return false;\n'
+    '    }\n'))
+# New sparse CPU views must also participate in the PS5 buffer/texture coherence query.
+anchor = '        const auto map_id = slot_map_views.insert(gpu_addr, cpu_addr, size, image_id);'
+texture_partial.append((anchor,
+    '        ::Eden::ImagePages::Mark(cpu_addr, size);\n' + anchor))
 for method, address_type in (('MarkPartialWrite', 'DAddr'), ('MarkPartialRemap', 'GPUVAddr')):
     address = 'cpu_addr' if method == 'MarkPartialWrite' else 'gpu_addr'
     anchor = f'bool TextureCache<P>::{method}(ImageBase& image, {address_type} {address}, size_t size) {{\n'

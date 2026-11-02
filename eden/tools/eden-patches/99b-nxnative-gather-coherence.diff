@@ -1,0 +1,267 @@
+diff --git a/src/video_core/renderer_vulkan/vk_multi_range_buffer.h b/src/video_core/renderer_vulkan/vk_multi_range_buffer.h
+--- a/src/video_core/renderer_vulkan/vk_multi_range_buffer.h
++++ b/src/video_core/renderer_vulkan/vk_multi_range_buffer.h
+@@ -57,6 +57,9 @@
+ 
+     void Invalidate(u64 key);
+ 
++    // Invalidates every alias without walking the cache on each source write.
++    void InvalidateAll();
++
+     void DropOwner(Scheduler& scheduler, VkBuffer owner);
+ 
+     VkDeviceSize block_size{DEFAULT_BLOCK_SIZE};
+@@ -72,11 +75,12 @@
+     struct Entry {
+         vk::Buffer gathered;
+         SparseBuffer sparse_handle;
+-        std::vector<VkBuffer> owners;
++        std::vector<MultiRangeSource> sources;
+         VkDeviceAddress address{};
+         VkDeviceSize size{};
+         u64 geometry{};
+         u64 content{};
++        u64 gather_epoch{};
+         bool dirty{true};
+     };
+ 
+@@ -98,6 +102,7 @@
+ 
+     ::Common::unordered_map<u64, Entry> entries;
+     boost::container::static_vector<Retired, MAX_RETIRED> retired;
++    u64 write_epoch{1};
+     u32 sparse_memory_type_bits{};
+     VkBufferUsageFlags sparse_usage{};
+ };
+diff --git a/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp b/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp
+--- a/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp
++++ b/src/video_core/renderer_vulkan/vk_multi_range_buffer.cpp
+@@ -2,6 +2,8 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
+ #include <algorithm>
++#include <cstdlib>
++#include "common/logging.h"
+ #include <mutex>
+ #include <utility>
+ 
+@@ -219,10 +221,20 @@
+     const u64 geometry = HashSources(sources);
+     const u64 content = HashContent(sources);
+     const auto it = entries.find(key);
+-    if (it != entries.end() && it->second.geometry == geometry && it->second.size == total) {
++    if (it != entries.end() && it->second.geometry == geometry && it->second.size == total &&
++        it->second.sources.size() == sources.size() &&
++        std::equal(sources.begin(), sources.end(), it->second.sources.begin(),
++                   [](const auto& a, const auto& b) {
++                       return a.handle == b.handle && a.offset == b.offset && a.size == b.size;
++                   })) {
+         Entry& entry = it->second;
+-        if (entry.content != content) {
++        // Hashes are only a fast filter: exact stamps and source geometry
++        // prevent a collision from reusing bytes from another snapshot.
++        if (entry.content != content ||
++            !std::equal(sources.begin(), sources.end(), entry.sources.begin(),
++                        [](const auto& a, const auto& b) { return a.write_tick == b.write_tick; })) {
+             entry.content = content;
++            std::copy(sources.begin(), sources.end(), entry.sources.begin());
+             entry.dirty = true;
+         }
+         MultiRangeRef ref{
+@@ -235,7 +247,7 @@
+         if (!entry.sparse_handle) {
+             ref.handle = *entry.gathered;
+             ref.sparse = false;
+-            ref.needs_gather = entry.dirty;
++            ref.needs_gather = entry.dirty || entry.gather_epoch != write_epoch;
+         }
+         return ref;
+     }
+@@ -250,12 +262,6 @@
+     entry.size = total;
+     if (CanBindSparse(sources)) {
+         entry.sparse_handle = CreateSparse(device, scheduler, sources, total);
+-        if (entry.sparse_handle) {
+-            entry.owners.reserve(sources.size());
+-            for (const MultiRangeSource& source : sources) {
+-                entry.owners.push_back(source.handle);
+-            }
+-        }
+     }
+     if (!entry.sparse_handle) {
+         VkBufferUsageFlags flags = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+@@ -277,10 +283,8 @@
+         entry.gathered = memory_allocator.CreateBuffer(gather_ci, MemoryUsage::DeviceLocal);
+         entry.dirty = true;
+     }
+-    // Gathered entries need the same owner lifetime and write tracking as sparse views.
+-    if (entry.owners.empty()) {
+-        for (const auto& source : sources) entry.owners.push_back(source.handle);
+-    }
++    // Keep exact geometry and owner identities for reuse and retirement.
++    entry.sources.assign(sources.begin(), sources.end());
+     if (device.IsBufferDeviceAddressSupported()) {
+         VkBuffer address_handle = *entry.sparse_handle;
+         if (!entry.sparse_handle) {
+@@ -306,10 +310,29 @@
+ }
+ 
+ void MultiRangeBufferCache::MarkGathered(u64 key) {
+-    // Binding-time invalidation precedes GPU writes and may overlap this gather.
+-    // Until invalidation is ordered after each producing draw, conservatively
+-    // gather every binding on all platforms, including PS5.
++#ifdef EDEN_NX2_PS5_PROTO
++    static const bool enabled = [] {
++        const char* value = std::getenv("EDEN_NX2_GATHER_REUSE");
++        const bool reuse = value == nullptr || value[0] != '0';
++        LOG_INFO(Render_Vulkan, "NX2_GATHER_REUSE active={} invalidation=post_producer", reuse);
++        return reuse;
++    }();
++    if (!enabled) return;
++    if (const auto it = entries.find(key); it != entries.end()) {
++        it->second.dirty = false;
++        it->second.gather_epoch = write_epoch;
++    }
++#else
+     (void)key;
++#endif
++}
++
++void MultiRangeBufferCache::InvalidateAll() {
++    if (++write_epoch == 0) {
++        // A wrapped generation must never match an old clean entry.
++        for (auto& [key, entry] : entries) entry.dirty = true;
++        write_epoch = 1;
++    }
+ }
+ 
+ void MultiRangeBufferCache::DropOwner(Scheduler& scheduler, VkBuffer owner) {
+@@ -319,8 +342,8 @@
+     for (auto it = entries.begin(); it != entries.end();) {
+         Entry& entry = it->second;
+         bool owned = false;
+-        for (const VkBuffer handle : entry.owners) {
+-            if (handle == owner) {
++        for (const auto& source : entry.sources) {
++            if (source.handle == owner) {
+                 owned = true;
+                 break;
+             }
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.h b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.h
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+@@ -141,7 +141,7 @@
+ 
+     void CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
+                     std::span<const VideoCommon::BufferCopy> copies, bool barrier,
+-                    bool can_reorder_upload = false);
++                    bool can_reorder_upload = false, bool is_gather = false);
+ 
+ #ifdef EDEN_NX2_PS5_PROTO
+     void MarkBufferWritten(const Buffer& buffer, u64 offset, u64 size);
+@@ -284,6 +284,9 @@
+         bool written{};
+     };
+     std::vector<StorageBatchEntry> storage_batch;
++    // Bind-time notifications precede the shader. Publish invalidation again
++    // after the producing draw/dispatch, even if a gather happened meanwhile.
++    bool pending_storage_writes{};
+     bool grouped_storage{};
+ #ifdef EDEN_NX2_PS5_PROTO
+     long long host_binding_started{};
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+@@ -454,6 +454,8 @@
+ #ifdef EDEN_NX2_PS5_PROTO
+ void BufferCacheRuntime::MarkBufferWritten(const Buffer& buffer, u64 offset, u64 size) {
+     scheduler.BeforeNativeBufferWrite(buffer.Handle(), offset, size);
++    multi_range_buffers.InvalidateAll();
++    pending_storage_writes = true;
+ }
+ #endif
+ 
+@@ -466,10 +468,13 @@
+ 
+ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
+                                     std::span<const VideoCommon::BufferCopy> copies, bool barrier,
+-                                    bool can_reorder_upload) {
++                                    bool can_reorder_upload, bool is_gather) {
+     if (dst_buffer == VK_NULL_HANDLE || src_buffer == VK_NULL_HANDLE) {
+         return;
+     }
++    // Gather destinations are private cache buffers, never guest source buffers.
++    // Other copies may update any overlapping guest alias, even in the same tick.
++    if (!is_gather) multi_range_buffers.InvalidateAll();
+ #ifdef EDEN_NX2_PS5_PROTO
+     bool overlaps_snapshot = false;
+     for (const auto& copy : copies)
+@@ -554,6 +559,7 @@
+     if (dest_buffer == VK_NULL_HANDLE) {
+         return;
+     }
++    multi_range_buffers.InvalidateAll();
+     static constexpr VkMemoryBarrier READ_BARRIER{
+         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+         .pNext = nullptr,
+@@ -617,6 +623,9 @@
+         }
+         PostCopyBarrier();
+     }
++    if (std::exchange(pending_storage_writes, false)) {
++        multi_range_buffers.InvalidateAll();
++    }
+     storage_batch.clear();
+ }
+ 
+@@ -631,9 +640,11 @@
+             const MultiRangeRef ref = multi_range_buffers.Get(device, scheduler, memory_allocator,
+                 key, multi_range_sources, multi_range_total);
+             if (ref.handle == VK_NULL_HANDLE) throw Shader::RuntimeError("Grouped storage allocation failed");
+-            storage_batch.push_back({key, ref,
+-                std::vector<MultiRangeSource>(multi_range_sources.begin(), multi_range_sources.end()), is_written});
++            storage_batch.push_back({key, ref, {}, is_written});
+             entry = std::prev(storage_batch.end());
++            // Only a group written by the shader needs a scatter snapshot.
++            // Read-only groups use the current sources directly for their gather.
++            if (is_written) entry->sources.assign(multi_range_sources.begin(), multi_range_sources.end());
+             // Written groups retain their conservative gather/scatter behavior. A read-only
+             // group can reuse its immutable copy until an exact source write invalidates it.
+             if (!ref.sparse && (is_written || ref.needs_gather)) {
+@@ -641,13 +652,13 @@
+                 ::Eden::Performance::storage_gather_calls.fetch_add(1, std::memory_order_relaxed);
+                 PreCopyBarrier();
+                 VkDeviceSize destination_offset = 0;
+-                for (const auto& source : entry->sources) {
++                for (const auto& source : multi_range_sources) {
+                     const std::array<VideoCommon::BufferCopy, 1> copy{{{
+                         .src_offset = static_cast<u64>(source.offset),
+                         .dst_offset = static_cast<u64>(destination_offset),
+                         .size = static_cast<size_t>(source.size),
+                     }}};
+-                    CopyBuffer(ref.handle, source.handle, copy, false);
++                    CopyBuffer(ref.handle, source.handle, copy, false, false, true);
+                     destination_offset += source.size;
+                 }
+                 PostCopyBarrier();
+@@ -656,8 +667,9 @@
+                 ::Eden::Performance::storage_reused_bytes.fetch_add(multi_range_total, std::memory_order_relaxed);
+                 ::Eden::Performance::storage_reused_calls.fetch_add(1, std::memory_order_relaxed);
+             }
+-        } else {
+-            entry->written |= is_written;
++        } else if (is_written && !entry->written) {
++            entry->sources.assign(multi_range_sources.begin(), multi_range_sources.end());
++            entry->written = true;
+         }
+         guest_descriptor_queue.AddBuffer(entry->ref.handle, entry->ref.address, offset, size);
+         return true;
+@@ -683,7 +695,7 @@
+                 .dst_offset = u64(dst_offset),
+                 .size = size_t(source.size),
+             }};
+-            CopyBuffer(ref.handle, source.handle, copy, false);
++            CopyBuffer(ref.handle, source.handle, copy, false, false, true);
+             dst_offset += source.size;
+         }
+         PostCopyBarrier();

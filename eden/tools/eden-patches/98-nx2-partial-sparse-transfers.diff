@@ -1,0 +1,323 @@
+diff --git a/src/video_core/texture_cache/image_base.h b/src/video_core/texture_cache/image_base.h
+--- a/src/video_core/texture_cache/image_base.h
++++ b/src/video_core/texture_cache/image_base.h
+@@ -105,6 +105,10 @@
+     std::vector<u32> partial_dirty_pages;
+     /// Byte ranges (from the image start) whose GPU mapping changed; re-uploaded like the pages.
+     std::vector<std::pair<u64, u64>> partial_remapped;
++    /// Physical cached-page references temporarily removed by sparse CPU writes.
++    std::vector<std::pair<DAddr, u32>> sparse_dirty_pages;
++    /// GPU mappings changed; refresh physical map views before the next image use.
++    bool sparse_mappings_changed = false;
+     u64 scale_tick = 0;
+     bool has_scaled = false;
+ 
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -424,6 +424,11 @@
+     /// Returns false when the image does not qualify (the caller marks it modified as usual).
+     bool MarkPartialWrite(ImageBase& image, DAddr cpu_addr, size_t size);
+ 
++    bool CanUploadSparsePartial(const ImageBase& image) const;
++    bool AddSparseDirtyRange(ImageBase& image, u64 begin, u64 end);
++    bool MarkSparseWrite(ImageId image_id, Image& image, DAddr cpu_addr, size_t size);
++    void RebuildSparseMappings(ImageId image_id, Image& image);
++
+     /// Uploads a large plain 2D image in chunks; false if it does not qualify.
+     bool UploadInChunks(Image& image);
+ 
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -756,7 +756,8 @@
+ template <class P>
+ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
+     ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size](ImageId image_id, Image& image) {
+-        if (MarkPartialWrite(image, cpu_addr, size)) {
++        if (MarkSparseWrite(image_id, image, cpu_addr, size) ||
++            MarkPartialWrite(image, cpu_addr, size)) {
+             return;
+         }
+         if (True(image.flags & ImageFlagBits::CpuModified)) {
+@@ -1454,6 +1455,7 @@
+         }
+     }
+ 
++    if (!image.sparse_dirty_pages.empty()) RestorePartialPages(image);
+     image.flags &= ~ImageFlagBits::CpuModified;
+ 
+     // Images uploaded by layer stay tracked while some of their layers are dirty.
+@@ -1743,6 +1745,14 @@
+         return false;
+     };
+     ForEachImageInRegion(*cpu_addr, CalculateGuestSizeInBytes(info), lambda);
++    // A sparse image's first physical page may have moved (or become a hole).
++    // Its stable GPU indices still identify the retained host image before its
++    // CPU map views are rebuilt by PrepareImage.
++    ForEachSparseImageInRegion(channel_state->gpu_memory.GetID(), gpu_addr,
++        CalculateGuestSizeInBytes(info), [&](ImageId id, ImageBase& image) {
++            if (std::ranges::find(image_ids, id) != image_ids.end()) return false;
++            return lambda(id, image);
++        });
+     if (image_ids.size() <= 1) [[likely]] {
+         return image_id;
+     }
+@@ -2463,6 +2473,14 @@
+         return false;
+     };
+     ForEachImageInRegion(*cpu_addr, CalculateGuestSizeInBytes(info), lambda);
++    // A sparse image's first physical page may have moved (or become a hole).
++    // Its stable GPU indices still identify the retained host image before its
++    // CPU map views are rebuilt by PrepareImage.
++    ForEachSparseImageInRegion(channel_state->gpu_memory.GetID(), gpu_addr,
++        CalculateGuestSizeInBytes(info), [&](ImageId id, ImageBase& image) {
++            if (std::ranges::find(image_ids, id) != image_ids.end()) return false;
++            return lambda(id, image);
++        });
+     if (image_ids.size() <= 1) [[likely]] {
+         return image_id;
+     }
+@@ -2897,6 +2915,115 @@
+ }
+ 
+ template <class P>
++bool TextureCache<P>::CanUploadSparsePartial(const ImageBase& image) const {
++    // Adapted from Eglantine's large single-layer SparseTiles path. Host images
++    // stay fully allocated: no unbound sampling or sparseResidencyAliased needed.
++    constexpr auto excluded = ImageFlagBits::Converted | ImageFlagBits::AcceleratedUpload |
++        ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels |
++        ImageFlagBits::AsynchronousDecode | ImageFlagBits::Rescaled |
++        ImageFlagBits::Remapped | ImageFlagBits::GpuModified;
++    return True(image.flags & ImageFlagBits::Sparse) && False(image.flags & excluded) &&
++        !image.HasScaled() && image.guest_size_bytes >= 32_MiB &&
++        image.info.type == ImageType::e2D && image.info.resources.layers == 1 &&
++        image.info.size.depth == 1 && image.info.block.depth == 0 &&
++        image.info.num_samples == 1 &&
++        GetFormatType(image.info.format) == SurfaceType::ColorTexture &&
++        DefaultBlockWidth(image.info.format) == 1 && DefaultBlockHeight(image.info.format) == 1;
++}
++
++template <class P>
++bool TextureCache<P>::AddSparseDirtyRange(ImageBase& image, u64 begin, u64 end) {
++    auto& ranges = image.partial_remapped;
++    auto first = std::lower_bound(ranges.begin(), ranges.end(), begin,
++        [](const auto& range, u64 value) { return range.second < value; });
++    auto last = first;
++    while (last != ranges.end() && last->first <= end) {
++        begin = (std::min)(begin, last->first);
++        end = (std::max)(end, last->second);
++        ++last;
++    }
++    const auto index = ranges.erase(first, last) - ranges.begin();
++    ranges.insert(ranges.begin() + index, {begin, end});
++    u64 bytes = 0;
++    for (const auto& range : ranges) bytes += range.second - range.first;
++    if (bytes > image.guest_size_bytes / 4 || ranges.size() > 4096) {
++        ranges.clear(); // A bounded full refresh; subsequent writes must not narrow it.
++        return false;
++    }
++    return true;
++}
++
++template <class P>
++bool TextureCache<P>::MarkSparseWrite(ImageId image_id, Image& image, DAddr cpu_addr, size_t size) {
++    if (!CanUploadSparsePartial(image) || False(image.flags & ImageFlagBits::Tracked)) return false;
++    if (True(image.flags & ImageFlagBits::CpuModified) && image.partial_remapped.empty()) {
++        UntrackImage(image, image_id);
++        return true;
++    }
++    // Map views, rather than image.cpu_addr, describe discontinuous and aliased
++    // guest memory. Remove each physical-page reference once, including aliases.
++    for (const auto map_id : sparse_views.at(image_id)) {
++        const auto& map = slot_map_views[map_id];
++        const DAddr begin = (std::max)(cpu_addr, map.cpu_addr);
++        if (begin - cpu_addr >= size || begin - map.cpu_addr >= map.size) continue;
++        const u64 length = (std::min<u64>)(size - (begin - cpu_addr), map.size - (begin - map.cpu_addr));
++        const DAddr first_page = begin & ~DAddr{Core::DEVICE_PAGEMASK};
++        const DAddr last_page = (begin + length - 1) & ~DAddr{Core::DEVICE_PAGEMASK};
++        // Once a physical page is untracked, later writes anywhere in that page
++        // need not notify us. Upload the entire intersection with this map view.
++        const DAddr dirty_begin = (std::max)(first_page, map.cpu_addr);
++        const DAddr dirty_end = (std::min)(last_page + Core::DEVICE_PAGESIZE, map.cpu_addr + map.size);
++        const u64 offset = map.gpu_addr - image.gpu_addr + dirty_begin - map.cpu_addr;
++        if (!AddSparseDirtyRange(image, offset, offset + dirty_end - dirty_begin)) {
++            UntrackImage(image, image_id);
++            break;
++        }
++        for (DAddr page = first_page;; page += Core::DEVICE_PAGESIZE) {
++            const auto key = std::pair{page, map_id.index};
++            auto it = std::lower_bound(image.sparse_dirty_pages.begin(), image.sparse_dirty_pages.end(), key);
++            if (it == image.sparse_dirty_pages.end() || *it != key) {
++                image.sparse_dirty_pages.insert(it, key);
++                device_memory.UpdatePagesCachedCount(page, Core::DEVICE_PAGESIZE, -1);
++            }
++            if (page == last_page) break;
++        }
++    }
++    image.flags |= ImageFlagBits::CpuModified;
++    return true;
++}
++
++template <class P>
++void TextureCache<P>::RebuildSparseMappings(ImageId image_id, Image& image) {
++    // Called after mapping notifications, before all PrepareImage paths including
++    // full render-target clears. Preserve GPU indices, LRU, allocation and budget.
++    auto& maps = sparse_views.at(image_id);
++    // Old map IDs and physical pages must still exist when restoring their refs.
++    auto pending_ranges = std::move(image.partial_remapped);
++    RestorePartialPages(image);
++    image.partial_remapped = std::move(pending_ranges);
++    const bool tracked = True(image.flags & ImageFlagBits::Tracked);
++    for (const auto map_id : maps) {
++        const auto& map = slot_map_views[map_id];
++        if (tracked) device_memory.UpdatePagesCachedCount(map.cpu_addr, map.size, -1);
++        ForEachCPUPage(map.cpu_addr, map.size, [this, map_id](u64 page) {
++            auto& views = page_table.at(page);
++            const auto it = std::ranges::find(views, map_id);
++            ASSERT(it != views.end());
++            views.erase(it);
++        });
++        slot_map_views.erase(map_id);
++    }
++    maps.clear();
++    ForEachSparseSegment(image, [this, image_id, &maps, tracked](GPUVAddr gpu_addr, DAddr cpu_addr, size_t size) {
++        const auto map_id = slot_map_views.insert(gpu_addr, cpu_addr, size, image_id);
++        ForEachCPUPage(cpu_addr, size, [this, map_id](u64 page) { page_table[page].push_back(map_id); });
++        maps.push_back(map_id);
++        if (tracked) device_memory.UpdatePagesCachedCount(cpu_addr, size, 1);
++    });
++    image.sparse_mappings_changed = false;
++}
++
++template <class P>
+ bool TextureCache<P>::MarkPartialWrite(ImageBase& image, DAddr cpu_addr, size_t size) {
+     // Games stream small updates into very large textures (lookup tables, virtual texture pages)
+     // every frame; re-uploading the whole image for each costs hundreds of milliseconds.
+@@ -2989,6 +3116,21 @@
+ 
+ template <class P>
+ bool TextureCache<P>::MarkPartialRemap(ImageBase& image, GPUVAddr gpu_addr, size_t size) {
++    if (CanUploadSparsePartial(image)) {
++        // Keep the host image. Physical CPU map views are rebuilt after the guest's
++        // map/unmap finishes, before either sampling or rendering into it again.
++        const u64 begin = (std::max)(gpu_addr, image.gpu_addr) - image.gpu_addr;
++        const u64 end = gpu_addr >= image.gpu_addr
++            ? gpu_addr - image.gpu_addr + (std::min<u64>)(size, image.guest_size_bytes)
++            : (size > image.gpu_addr - gpu_addr ? size - (image.gpu_addr - gpu_addr) : 0);
++        if (begin >= image.guest_size_bytes || begin >= end) return true;
++        image.sparse_mappings_changed = true;
++        if (False(image.flags & ImageFlagBits::CpuModified) || !image.partial_remapped.empty()) {
++            AddSparseDirtyRange(image, begin, (std::min<u64>)(end, image.guest_size_bytes));
++        }
++        image.flags |= ImageFlagBits::CpuModified;
++        return true;
++    }
+     // Virtual textures remap a few 64 KiB pages of a huge sparse texture every frame.
+     constexpr size_t min_size = 16_MiB;
+     constexpr ImageFlagBits excluded = ImageFlagBits::Sparse | ImageFlagBits::Converted |
+@@ -3031,6 +3173,10 @@
+ 
+ template <class P>
+ void TextureCache<P>::RestorePartialPages(ImageBase& image) {
++    for (const auto& [page, map_index] : image.sparse_dirty_pages) {
++        device_memory.UpdatePagesCachedCount(page, Core::DEVICE_PAGESIZE, 1);
++    }
++    image.sparse_dirty_pages.clear();
+     const DAddr base_page = image.cpu_addr >> Core::DEVICE_PAGEBITS;
+     const auto& pages = image.partial_dirty_pages;
+     for (size_t index = 0; index < pages.size();) {
+@@ -3079,6 +3225,9 @@
+     if (copies.empty()) {
+         return false;
+     }
++    ++images_uploaded;
++    uploaded_bytes += data.size();
++    largest_upload = (std::max<u64>)(largest_upload, data.size());
+     auto staging = runtime.UploadStagingBuffer(data.size());
+     std::memcpy(staging.mapped_span.data(), data.data(), data.size());
+     image.UploadMemory(staging, copies);
+@@ -3313,6 +3462,7 @@
+ template <class P>
+ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool invalidate) {
+     Image& image = slot_images[image_id];
++    if (image.sparse_mappings_changed) RebuildSparseMappings(image_id, image);
+     if (invalidate) {
+         RestorePartialPages(image);
+         image.flags &= ~(ImageFlagBits::CpuModified | ImageFlagBits::GpuModified);
+diff --git a/src/video_core/texture_cache/util.cpp b/src/video_core/texture_cache/util.cpp
+--- a/src/video_core/texture_cache/util.cpp
++++ b/src/video_core/texture_cache/util.cpp
+@@ -957,7 +957,7 @@
+     const u32 gob_tiles = 1U << (GOB_SIZE_X_SHIFT - bpp_log2);
+     const u32 run_alignment = GOB_SIZE_X_SHIFT - bpp_log2;
+     std::vector<u8> run;
+-    std::vector<bool> dirty_blocks;
++    std::vector<std::pair<u64, u64>> dirty_blocks;
+     u32 level_offset = 0;
+     for (s32 level = 0; level < num_levels; ++level) {
+         const Extent3D level_size = AdjustMipSize(info.size, level);
+@@ -991,34 +991,38 @@
+                     continue;
+                 }
+                 if (!any) {
+-                    dirty_blocks.assign(size_t{num_bands} * blocks_per_band, false);
++                    dirty_blocks.clear();
+                     any = true;
+                 }
+                 const u64 low = std::max(begin, segment_begin) - segment_begin;
+                 const u64 high = std::min(end, segment_end) - segment_begin;
+                 const u64 last = Common::DivCeil(high, u64{block_bytes});
+-                for (u64 index = low / block_bytes; index < last; ++index) {
+-                    dirty_blocks[index] = true;
+-                }
++                dirty_blocks.emplace_back(low / block_bytes, last);
+             }
+             if (!any) {
+                 continue;
+             }
+-            for (u32 band = 0; band < num_bands; ++band) {
+-                const u32 first_row = band * rows_per_band;
+-                const u32 tile_rows = std::min(rows_per_band, num_tiles.height - first_row);
+-                for (u32 first = 0; first < blocks_per_band;) {
+-                    if (!dirty_blocks[size_t{band} * blocks_per_band + first]) {
+-                        ++first;
+-                        continue;
+-                    }
+-                    u32 last = first;
+-                    while (last < blocks_per_band && dirty_blocks[size_t{band} * blocks_per_band + last]) {
+-                        ++last;
+-                    }
++            std::ranges::sort(dirty_blocks);
++            size_t merged = 0;
++            for (const auto range : dirty_blocks) {
++                if (merged != 0 && dirty_blocks[merged - 1].second >= range.first) {
++                    dirty_blocks[merged - 1].second = (std::max)(dirty_blocks[merged - 1].second, range.second);
++                } else {
++                    dirty_blocks[merged++] = range;
++                }
++            }
++            dirty_blocks.resize(merged);
++            for (const auto [begin, end] : dirty_blocks) {
++                for (u64 current = begin; current < end;) {
++                    const u32 band = static_cast<u32>(current / blocks_per_band);
++                    const u32 first = static_cast<u32>(current % blocks_per_band);
++                    const u32 last = static_cast<u32>((std::min<u64>)(end - u64{band} * blocks_per_band, blocks_per_band));
++                    current = u64{band} * blocks_per_band + last;
++                    const u32 first_row = band * rows_per_band;
++                    const u32 tile_rows = std::min(rows_per_band, num_tiles.height - first_row);
+                     const u32 first_tile = first * gob_tiles;
+                     if (first_tile >= num_tiles.width) {
+-                        break; // padding blocks past the image's width
++                        continue; // padding blocks past the image's width
+                     }
+                     // A run of consecutive blocks is laid out like an image that many GOBs wide.
+                     const u32 run_tiles = (last - first) * gob_tiles;
+@@ -1051,7 +1055,6 @@
+                         .image_extent = {std::min(run_tiles * tile_size.width, level_size.width - x),
+                                          std::min(tile_rows * tile_size.height, level_size.height - y), 1},
+                     });
+-                    first = last;
+                 }
+             }
+         }
