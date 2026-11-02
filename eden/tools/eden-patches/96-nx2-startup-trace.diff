@@ -1,0 +1,197 @@
+diff --git a/src/core/core.cpp b/src/core/core.cpp
+--- a/src/core/core.cpp
++++ b/src/core/core.cpp
+@@ -1,3 +1,4 @@
++#include "core/load_trace.h"
+ // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
+@@ -328,6 +329,8 @@
+     }
+ 
+     SystemResultStatus Load(System& system, Frontend::EmuWindow& emu_window, const std::string& filepath, Service::AM::FrontendAppletParameters& params) {
++
++    ::Eden::LoadTrace::Step("core.begin");
+         if (params.launch_type == Service::AM::LaunchType::FrontendInitiated) {
+             fs_controller.InitTempStorage();
+         }
+@@ -345,7 +348,10 @@
+             Settings::values.memory_layout_mode.SetValue(Settings::MemoryLayout::Memory_12Gb);
+         }
+ 
++
++    ::Eden::LoadTrace::Step("kernel.begin");
+         InitializeKernel(system);
++    ::Eden::LoadTrace::Step("kernel.end");
+ 
+         if (params.applet_type == Service::AM::AppletType::Application) {
+             current_application_filepath = filepath;
+@@ -356,7 +362,10 @@
+         // Create the application process
+         Loader::ResultStatus load_result{};
+         std::vector<u8> control;
++
++    ::Eden::LoadTrace::Step("application.begin");
+         auto process = Service::AM::CreateApplicationProcess(control, app_loader, load_result, system, file, params.program_id, params.program_index);
++    ::Eden::LoadTrace::Step("application.end");
+         if (load_result != Loader::ResultStatus::Success) {
+             LOG_CRITICAL(Core, "Failed to load ROM (Error {})!", load_result);
+             ShutdownMainProcess();
+@@ -389,7 +398,10 @@
+         kernel.SetApplicationProcess(process->GetHandle());
+ 
+         // Set up the rest of the system.
++
++    ::Eden::LoadTrace::Step("renderer.begin");
+         SystemResultStatus init_result{SetupForApplicationProcess(system, emu_window)};
++    ::Eden::LoadTrace::Step("renderer.end");
+         if (init_result != SystemResultStatus::Success) {
+             LOG_CRITICAL(Core, "Failed to initialize system (Error {})!", int(init_result));
+             ShutdownMainProcess();
+diff --git a/src/core/hle/kernel/kernel.cpp b/src/core/hle/kernel/kernel.cpp
+--- a/src/core/hle/kernel/kernel.cpp
++++ b/src/core/hle/kernel/kernel.cpp
+@@ -1,3 +1,4 @@
++#include "core/load_trace.h"
+ // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
+@@ -89,6 +90,8 @@
+     }
+ 
+     void Initialize(KernelCore& kernel) {
++
++    ::Eden::LoadTrace::Step("kernel.timer");
+         hardware_timer.emplace(kernel);
+         hardware_timer->Initialize();
+ 
+@@ -96,16 +99,34 @@
+         global_scheduler_context.emplace(kernel);
+ 
+         // Derive the initial memory layout from the emulated board
++
++    ::Eden::LoadTrace::Step("kernel.slab_counts");
+         Init::InitializeSlabResourceCounts(kernel);
++
++    ::Eden::LoadTrace::Step("kernel.derive_memory");
+         DeriveInitialMemoryLayout();
++
++    ::Eden::LoadTrace::Step("kernel.slab_heaps");
+         Init::InitializeSlabHeaps(system, *memory_layout);
+ 
+         // Initialize kernel memory and resources.
++
++    ::Eden::LoadTrace::Step("kernel.resource_limit");
+         InitializeSystemResourceLimit(kernel, system.CoreTiming());
++
++    ::Eden::LoadTrace::Step("kernel.memory_layout");
+         InitializeMemoryLayout();
++
++    ::Eden::LoadTrace::Step("kernel.shutdown_threads");
+         InitializeShutdownThreads();
++
++    ::Eden::LoadTrace::Step("kernel.physical_cores");
+         InitializePhysicalCores();
++
++    ::Eden::LoadTrace::Step("kernel.preemption");
+         InitializePreemption(kernel);
++
++    ::Eden::LoadTrace::Step("kernel.global_data");
+         InitializeGlobalData(kernel);
+ 
+         // Initialize the Dynamic Slab Heaps.
+@@ -115,7 +136,11 @@
+             InitializeResourceManagers(kernel, pt_heap_region.GetAddress(), pt_heap_region.GetSize());
+         }
+ 
++
++    ::Eden::LoadTrace::Step("kernel.shared_memory");
+         InitializeHackSharedMemory(kernel);
++
++    ::Eden::LoadTrace::Step("kernel.register_host");
+         RegisterHostThread(nullptr);
+     }
+ 
+diff --git a/src/core/loader/deconstructed_rom_directory.cpp b/src/core/loader/deconstructed_rom_directory.cpp
+--- a/src/core/loader/deconstructed_rom_directory.cpp
++++ b/src/core/loader/deconstructed_rom_directory.cpp
+@@ -1,3 +1,4 @@
++#include "core/load_trace.h"
+ // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
+@@ -141,6 +142,8 @@
+     : AppLoader(std::move(file_))
+     , override_update(override_update_)
+ {
++
++    ::Eden::LoadTrace::Step("dump.constructor");
+     const auto file_dir = file->GetContainingDirectory();
+     const auto sidecar_dirs = FindSidecarDirs(file_dir);
+ 
+@@ -258,6 +261,8 @@
+     if (result2 != ResultStatus::Success) {
+         return {result2, {}};
+     }
++
++    ::Eden::LoadTrace::Step("dump.metadata");
+     metadata.Print();
+ 
+     // Extended ACID programs currently require the Dynarmic compatibility path.
+@@ -278,6 +283,7 @@
+     // Use the NSO module loader to figure out the code layout
+     for (size_t i = 0; i < static_modules.size(); i++) {
+         const auto& module = static_modules[i];
++        ::Eden::LoadTrace::Step("dump.module", module);
+         const FileSys::VirtualFile module_file{dir->GetFile(module)};
+         if (!module_file) {
+             continue;
+@@ -318,6 +324,8 @@
+     }
+ 
+     // Load NSO modules
++
++    ::Eden::LoadTrace::Step("dump.map_modules");
+     modules.clear();
+     const VAddr base_address{GetInteger(process.GetEntryPoint())};
+     VAddr next_load_addr{base_address};
+@@ -325,6 +333,7 @@
+                                    system.GetContentProvider()};
+     for (size_t i = 0; i < static_modules.size(); i++) {
+         const auto& module = static_modules[i];
++        ::Eden::LoadTrace::Step("dump.module", module);
+         const FileSys::VirtualFile module_file{dir->GetFile(module)};
+         if (!module_file) {
+             continue;
+@@ -381,7 +390,10 @@
+                 }
+             }
+             if (loose) {
++
++    ::Eden::LoadTrace::Step("dump.romfs.begin");
+                 romfs = FileSys::CreateRomFS(std::move(loose));
++    ::Eden::LoadTrace::Step("dump.romfs.end");
+             }
+         }
+     }
+diff --git a/src/core/load_trace.h b/src/core/load_trace.h
+new file mode 100644
+--- /dev/null
++++ b/src/core/load_trace.h
+@@ -0,0 +1,16 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++// Optional frontend hook; ordinary core builds need no tracing provider.
++#if defined(__GNUC__) || defined(__clang__)
++extern "C" void eden_load_step(const char*, const char*) __attribute__((weak));
++#endif
++namespace Eden::LoadTrace {
++inline void Step(const char* stage, const char* detail = "") {
++#if defined(__GNUC__) || defined(__clang__)
++    if (eden_load_step) eden_load_step(stage, detail);
++#else
++    (void)stage;
++    (void)detail;
++#endif
++}
++}

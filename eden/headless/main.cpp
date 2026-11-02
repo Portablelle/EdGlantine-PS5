@@ -11,6 +11,8 @@
 #include "gpu_failure.h"
 #include "guest_fault.h"
 #include "runtime_control.h"
+#include "host_file_pressure.h"
+#include "host_memory_budget.h"
 #ifdef EDEN_NX2_PS5_PROTO
 #include "video_core/gpu_split.h"
 #endif
@@ -265,6 +267,10 @@ static void UpdateGrips(Core::System& system, Eden::Pad& pad) {
     }
 }
 
+extern "C" void eden_load_step(const char* stage, const char* detail) {
+    Eden::BootTrace::Line("load: %s %s", stage, detail);
+}
+
 int main(int argc, char** argv) {
     if (setenv("EDEN_NX2_MME_JIT", "1", 1) != 0 ||
         setenv("EDEN_NX2_SPLIT", "1", 1) != 0) return 2;
@@ -343,6 +349,7 @@ int main(int argc, char** argv) {
         Eden::BootTrace::Line("app folder: %s", Eden::AppDir().c_str());
         std::set_new_handler([] {
             ps5_opengl_heap_snapshot("allocation_failure", 0);
+            Eden::HostMemory::Report("allocation_failure");
             std::fflush(stdout);
             Eden::Report("allocation failure", "operator new: heap exhausted");
             throw std::bad_alloc{};
@@ -410,6 +417,21 @@ int main(int argc, char** argv) {
                 Eden::Report("driver shader cache", line.c_str());
             }
         }
+#if defined(PS5_NATIVE) && defined(EDEN_NX2_PS5_PROTO)
+        // Read before any Vulkan instance: RADV caches its debug flags at initialization.
+        // A separate opt-in file keeps this rendering diagnostic out of normal settings.
+        {
+            std::ifstream request(std::string{Eden::kDataDir} + "/gpu-sync-diagnostic.txt");
+            std::string mode;
+            if (request >> mode; mode == "syncshaders" || mode == "fullsync") {
+                const char* previous = std::getenv("RADV_DEBUG");
+                const std::string flags = std::string{previous ? previous : ""} + "," + mode;
+                const int result = setenv("RADV_DEBUG", flags.c_str(), 1);
+                std::fprintf(stderr, "NX2_GPU_SYNC_DIAGNOSTIC mode=%s applied=%u\n",
+                             mode.c_str(), unsigned(result == 0));
+            }
+        }
+#endif
         // Whether Eden's large tables can be sparse on this console (src/memory_pages.cpp),
         // decided now: every session's log says it, with or without a game.
         (void)Common::SparseTablesAvailable();
@@ -475,9 +497,7 @@ int main(int argc, char** argv) {
         const Eden::ForwardedArgs forwarded = Eden::ParseForwardedArgs(argc, argv);
         std::string forwarded_game;
         bool forwarded_session = false;
-        // Fixed prototype-only entry; no lookup in Botty or the Switch 1 library.
-        const std::string nx2_main = "/data/eden-nx2/game/exefs/main";
-        if (last_crash.report.empty() && Eden::FileExists(nx2_main)) forwarded_game = nx2_main;
+        // Default to the controller library; --rom remains an explicit launch override.
 
         if (!forwarded.rom.empty() && last_crash.report.empty()) {
             const std::string path = Eden::ResolveForwardedRom(forwarded.rom, Eden::AssetsPath("roms"));
@@ -613,6 +633,10 @@ int main(int argc, char** argv) {
         }
         try {
         launch_error.clear();
+        Eden::HostFiles::Reset();
+        Eden::HostMemory::Report("session_start");
+        std::fprintf(stderr, "EDEN_HOST_FILE_POLICY cached_per_vfs=%zu\n",
+                     Eden::HostFiles::MaxCachedOpenFiles);
         if (!rooms.BeginGame()) throw std::runtime_error("Join a room successfully or leave it before starting a game.");
         SCOPE_EXIT { rooms.EndGame(); };
         // .016 isolates the .015 crash: leave detailed scheduler/draw hooks off
@@ -830,20 +854,14 @@ int main(int argc, char** argv) {
         Settings::values.cpu_accuracy = Settings::CpuAccuracy::Auto;
         Settings::values.disable_macro_jit = true; // Prototype: interpret GPU macros.
 #ifdef EDEN_NX2_PS5_PROTO
-        // Performance comparison with direct DMA fetch and targeted parameter readback reuse.
-        Eden::Performance::cpu_write_defer.store(true, std::memory_order_relaxed);
+        // Reset between games; deferred writes follow the explicit per-game DMA choice below.
+        Eden::Performance::cpu_write_defer.store(false, std::memory_order_relaxed);
 #endif
         // The exact GPU and DMA levels too, every session: one app run starts many games, and a
         // level the game before lowered ("performance" in the settings file, below) would stay.
         Settings::values.gpu_accuracy.SetValue(Settings::GpuAccuracy::High);
         Settings::values.current_gpu_accuracy = Settings::GpuAccuracy::High;
-#ifdef EDEN_NX2_PS5_PROTO
-        // Profiled native command fetch dominates CPU waits. GPU accuracy remains High,
-        // so dirty macro/indirect parameters keep the engine's explicit refresh path.
-        Settings::values.dma_accuracy.SetValue(Settings::DmaAccuracy::Unsafe);
-#else
         Settings::values.dma_accuracy.SetValue(Settings::DmaAccuracy::Default);
-#endif
         Settings::values.memory_layout_mode = Settings::MemoryLayout::Memory_4Gb;
         // A development run that names jit_list in dev-settings decides the block list by itself.
         [[maybe_unused]] bool dev_block_list = false;  // read where a session applies its settings
@@ -1279,7 +1297,13 @@ int main(int argc, char** argv) {
                 Settings::values.current_gpu_accuracy = Settings::GpuAccuracy::Low;
             }
             if (speed.unsafe_cpu) Settings::values.cpu_accuracy = Settings::CpuAccuracy::Unsafe;
-            if (speed.unsafe_dma) Settings::values.dma_accuracy.SetValue(Settings::DmaAccuracy::Unsafe);
+            Settings::values.dma_accuracy.SetValue(speed.unsafe_dma ?
+                Settings::DmaAccuracy::Unsafe : Settings::DmaAccuracy::Default);
+#ifdef EDEN_NX2_PS5_PROTO
+            Eden::Performance::cpu_write_defer.store(speed.unsafe_dma, std::memory_order_relaxed);
+            Eden::Report("memory", speed.unsafe_dma ? "Deferred CPU writes enabled (unsafe DMA)" :
+                                                    "Immediate CPU writes enabled (default DMA)");
+#endif
             Settings::values.use_reactive_flushing.SetValue(speed.reactive_flushing);
             Settings::values.skip_cpu_inner_invalidation.SetValue(speed.skip_invalidation);
             // Settings > Performance > Compact memory: the guest's memory in 16 KiB pages where a
@@ -1512,6 +1536,15 @@ int main(int argc, char** argv) {
                     Eden::code_seed = rng_seed;
                     Eden::Report("launch", ("RNG seed: " + std::to_string(rng_seed)).c_str());
                 }
+            }
+#endif
+#if defined(PS5_NATIVE) && defined(EDEN_NX2_PS5_PROTO)
+            // DeviceMemory is constructed with the current layout. The engine's later
+            // NX2 detection in System::Load must not enlarge the kernel beyond that reserve.
+            if (game && eden_game_is_switch2(guest)) {
+                Settings::values.memory_layout_mode.SetGlobal(false);
+                Settings::values.memory_layout_mode.SetValue(Settings::MemoryLayout::Memory_12Gb);
+                Eden::Report("memory", "Switch 2: selecting 12 GiB before constructing DeviceMemory");
             }
 #endif
             Core::System system;
@@ -2109,6 +2142,10 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (!completion->guest_fault.empty()) {
+                    if (Eden::HostFiles::Exhausted()) {
+                        throw std::runtime_error("The app could not open more game files. Fully close "
+                                                 "EdGlantine PS5 and launch the game again. See the logs for details.");
+                    }
 #ifdef PS5_NATIVE
                     // A game can run its save-load completion before its own callback exists
                     // (a boot race between two guest threads); a fresh boot normally passes. Retry early faults, report others.

@@ -571,5 +571,29 @@
       "Remove source-range retention and invalidation scans made ineffective by conservative gathers."
     ],
     "nativeTranslatorSalt": "0x4f554e4345a00007"
+  },
+  "memoryReadbackIntegration": {
+    "date": "2026-11-02",
+    "status": "included in final cumulative source candidate; hardware rendering unvalidated",
+    "upstreamCommits": [
+      "mucahidkambur/EglantinePS5@dbadad075ca18cced6adafea325a26c454dc94c6",
+      "Djihads80/Eglantine@2065b1431c0ecfeade61a7e7511889c4800b6bb9",
+      "Djihads80/Eglantine@41a81ab5e3d88b53b634ed765385874728634e9f"
+    ],
+    "patch": "eden/tools/eden-patches/91-nx2-memory-readback.diff",
+    "patchSha256": "62c5b0885c02cfdd0c885fea099df74eab7526ab340d7d882b109d1f58cb6445",
+    "remoteBuildRoot": "/tmp/edglantine-memory-20261102",
+    "hostValidation": "PASS: five extracted production ASan/UBSan groups and layered-patch cache lifecycle fixture",
+    "hardwareValidated": false,
+    "scope": [
+      "unbacked image accounting and saturated GC/deletion",
+      "per-heap VRAM accounting, preserving PS5 shared-pool policy",
+      "NX2 non-fastmem CPU reads and selective buffer fence downloads",
+      "mixed texture/buffer read coherence and partial preflushable ranges"
+    ],
+    "limits": "No console test or FPS/rendering claim; desktop fastmem read traps and automatic BC3 policy not imported.",
+    "nativeBuild": "PASS on dedie; final relink with isolated writable RADV link-map directory",
+    "artifacts": "artifacts/memory-readback/",
+    "deploymentJournal": "artifacts/00.065.000-final-review/install-journal.json"
   }
 }

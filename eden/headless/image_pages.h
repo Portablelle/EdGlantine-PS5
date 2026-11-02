@@ -1,8 +1,8 @@
 // Eden PS5 port: which pages of guest memory a texture cache image has ever been in.
 //
 // A guest read of memory the GPU caches follow asks the rasterizer whether something the GPU
-// wrote must be copied back first (RasterizerVulkan::GetFlushArea). Only the texture cache can
-// say so, for an image whose place in guest memory overlaps the read, and to ask it the guest
+// wrote must be copied back first (RasterizerVulkan::GetFlushArea). The texture cache answers
+// for overlapping images; the buffer cache is queried separately for GPU-written buffers. The guest
 // thread takes the texture cache's lock, which the GPU thread holds through every draw. A large
 // open-world game asks 700 to 3,000 times a frame, and a guest core's profile had the question
 // and the wait for that lock as the largest thing the emulator itself costs it.

@@ -78,7 +78,7 @@ if game:
 value = json.loads((app / 'sce_sys/param.json').read_text())
 assert (value['titleId'], value['conceptId']) == ('PPSA99862', '99862')
 assert value['contentId'] == 'UP9000-PPSA99862_00-EDENNX2PROTO0001'
-assert value['localizedParameters']['en-US']['titleName'] == 'Eden NX2 Prototype'
+assert value['localizedParameters']['en-US']['titleName'] == 'EdGlantine PS5'
 assert value['pubtools']['loudnessSnd0'] == '-28.00'
 # The app version has one home, sce_sys/param.json: the program was built with the same value.
 assert re.fullmatch(r'\d{2}\.\d{3}\.\d{3}', value['contentVersion']), value['contentVersion']

@@ -1,0 +1,524 @@
+diff --git a/src/audio_core/renderer/sink/circular_buffer_sink_info.cpp b/src/audio_core/renderer/sink/circular_buffer_sink_info.cpp
+--- a/src/audio_core/renderer/sink/circular_buffer_sink_info.cpp
++++ b/src/audio_core/renderer/sink/circular_buffer_sink_info.cpp
+@@ -17,13 +17,9 @@
+ }
+ 
+ void CircularBufferSinkInfo::CleanUp() {
+-    auto state_{reinterpret_cast<DeviceState*>(state.data())};
+-
+-    if (state_->upsampler_info) {
+-        state_->upsampler_info->manager->Free(state_->upsampler_info);
+-        state_->upsampler_info = nullptr;
+-    }
+-
++    // The state holds a CircularBufferState, not a DeviceState: there is no upsampler here, and
++    // reading it as one turned current_pos into a pointer (Mario Tennis Fever crashed on it).
++    state.fill(0);
+     parameter.fill(0);
+     type = Type::Invalid;
+ }
+diff --git a/src/shader_recompiler/environment.h b/src/shader_recompiler/environment.h
+--- a/src/shader_recompiler/environment.h
++++ b/src/shader_recompiler/environment.h
+@@ -96,6 +96,10 @@
+ 
+     [[nodiscard]] virtual u32 TextureBoundBuffer() const = 0;
+ 
++    /// Constant buffer holding the surface (image write) descriptors; the texture one unless the
++    /// program needs both from different buffers.
++    [[nodiscard]] virtual u32 SurfaceBoundBuffer() const { return TextureBoundBuffer(); }
++
+     [[nodiscard]] virtual u32 LocalMemorySize() const = 0;
+ 
+     [[nodiscard]] virtual u32 SharedMemorySize() const = 0;
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -60,6 +60,7 @@
+     std::vector<u32> source_instruction_offsets;
+     u32 source_size{};
+     u32 required_texture_buffer = ~0U;
++    u32 required_surface_buffer = ~0U;
+     u32 error_offset{};
+     std::string_view error;
+ 
+@@ -1458,9 +1459,9 @@
+                 (mask == 3 && ((dest & 1) || dest > 254)) ||
+                 (mask == 15 && ((dest & 3) || dest > 252)))
+                 return fail(index, "native formatted surface load mode");
+-            if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
++            if (result.required_surface_buffer != ~0U && result.required_surface_buffer != binding)
+                 return fail(index, "native surface descriptor buffer conflict");
+-            result.required_texture_buffer = binding;
++            result.required_surface_buffer = binding;
+             emit(base(0xeb00000000000000ULL) | (u64{coordinate} << 8) |
+                 (u64{mask} << 20) | (u64{dimension} << 33) | (u64{offset} << 36) | (u64{1} << 51));
+             break;
+@@ -1475,12 +1476,12 @@
+                 (dimension != 3 && dimension != 4 && dimension != 5) ||
+                 binding >= 18 || offset > 0x1fff || insn.Bits(59, 2) || data > 252 || coordinate > (dimension == 3 ? 253U : 252U))
+                 return fail(index, "native formatted surface store mode");
+-            const bool bindless = result.required_texture_buffer != ~0U && result.required_texture_buffer != binding;
++            const bool bindless = result.required_surface_buffer != ~0U && result.required_surface_buffer != binding;
+             if (bindless) {
+                 emit(0x4c98000000000000ULL | predicate | 250 | (u64{15} << 39) |
+                      (u64{offset} << 20) | (u64{binding} << 34));
+             } else {
+-                result.required_texture_buffer = binding;
++                result.required_surface_buffer = binding;
+             }
+             if (strong) emit(0xef98000000000000ULL | predicate | (u64{1} << 8));
+             emit(0xeb20000000000000ULL | predicate | data | (u64{coordinate} << 8) |
+diff --git a/src/shader_recompiler/ir_opt/texture_pass.cpp b/src/shader_recompiler/ir_opt/texture_pass.cpp
+--- a/src/shader_recompiler/ir_opt/texture_pass.cpp
++++ b/src/shader_recompiler/ir_opt/texture_pass.cpp
+@@ -599,7 +599,8 @@
+         }
+     } else {
+         addr = ConstBufferAddr{
+-            .index = env.TextureBoundBuffer(),
++            .index = IsStorageImageOpcode(IndexedInstruction(inst))
++                         ? env.SurfaceBoundBuffer() : env.TextureBoundBuffer(),
+             .offset = inst.Arg(0).U32(),
+             .shift_left = 0,
+             .secondary_index = 0,
+diff --git a/src/shader_recompiler/undef_policy.h b/src/shader_recompiler/undef_policy.h
+--- a/src/shader_recompiler/undef_policy.h
++++ b/src/shader_recompiler/undef_policy.h
+@@ -18,7 +18,7 @@
+ 
+ // Both versions replace 37. Keep serialized environments and driver pipelines separate by mode.
+ inline unsigned VulkanShaderCacheVersion() {
+-    return UndefIsZero() ? 38U : 39U;
++    return UndefIsZero() ? 40U : 41U;
+ }
+ 
+ } // namespace Shader
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -1233,8 +1233,10 @@
+     if (VideoCommon::Nx2Profile::Enabled()) {
+         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
+     }
+-    if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+-        memory_manager.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
++    if (memory_manager.IsMemoryDirty(source, read_bytes,
++                        VideoCommon::CacheType::BufferCache | VideoCommon::CacheType::QueryCache)) {
++        memory_manager.FlushRegion(source, read_bytes,
++                        VideoCommon::CacheType::BufferCache | VideoCommon::CacheType::QueryCache);
+     }
+     for (u32 i = 0; i < words; ++i) {
+         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+diff --git a/src/video_core/host_shaders/CMakeLists.txt b/src/video_core/host_shaders/CMakeLists.txt
+--- a/src/video_core/host_shaders/CMakeLists.txt
++++ b/src/video_core/host_shaders/CMakeLists.txt
+@@ -25,6 +25,8 @@
+     ${CMAKE_CURRENT_SOURCE_DIR}/block_linear_unswizzle_3d.comp
+     ${CMAKE_CURRENT_SOURCE_DIR}/block_linear_unswizzle_3d_bcn.comp
+     ${CMAKE_CURRENT_SOURCE_DIR}/convert_abgr8_to_d24s8.frag
++    ${CMAKE_CURRENT_SOURCE_DIR}/convert_abgr8_to_x8d24.frag
++    ${CMAKE_CURRENT_SOURCE_DIR}/convert_x8d24_to_abgr8.frag
+     ${CMAKE_CURRENT_SOURCE_DIR}/convert_abgr8_to_d32f.frag
+     ${CMAKE_CURRENT_SOURCE_DIR}/convert_d32f_to_abgr8.frag
+     ${CMAKE_CURRENT_SOURCE_DIR}/convert_d24s8_to_abgr8.frag
+@@ -155,6 +157,11 @@
+     endif()
+     # Skip compiling to SPIR-V OpenGL exclusive files
+     if (NOT ${FILENAME} MATCHES "opengl.*")
++        set(SPIRV_DEPENDENCIES)
++        if (FILENAME STREQUAL "convert_abgr8_to_x8d24.frag" OR
++            FILENAME STREQUAL "convert_x8d24_to_abgr8.frag")
++            list(APPEND SPIRV_DEPENDENCIES ${CMAKE_CURRENT_SOURCE_DIR}/x8d24_conversion.glsl)
++        endif()
+         string(TOUPPER ${SHADER_NAME}_SPV SPIRV_VARIABLE_NAME)
+         set(SPIRV_HEADER_FILE ${SHADER_DIR}/${SHADER_NAME}_spv.h)
+         add_custom_command(
+@@ -164,6 +171,8 @@
+                 ${GLSLANGVALIDATOR} -V ${QUIET_FLAG} -I"${FIDELITYFX_INCLUDE_DIR}" ${GLSL_FLAGS} --variable-name ${SPIRV_VARIABLE_NAME} -o ${SPIRV_HEADER_FILE} ${SOURCE_FILE} --target-env ${SPIR_V_VERSION}
+             MAIN_DEPENDENCY
+                 ${SOURCE_FILE}
++            DEPENDS
++                ${SPIRV_DEPENDENCIES}
+         )
+         set(SHADER_HEADERS ${SHADER_HEADERS} ${SPIRV_HEADER_FILE})
+     endif()
+diff --git a/src/video_core/host_shaders/convert_abgr8_to_x8d24.frag b/src/video_core/host_shaders/convert_abgr8_to_x8d24.frag
+new file mode 100644
+--- /dev/null
++++ b/src/video_core/host_shaders/convert_abgr8_to_x8d24.frag
+@@ -0,0 +1,13 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#version 450
++#extension GL_GOOGLE_include_directive : require
++
++#include "x8d24_conversion.glsl"
++
++layout(binding = 0) uniform sampler2D color_texture;
++
++void main() {
++    vec4 color = texelFetch(color_texture, ivec2(gl_FragCoord.xy), 0);
++    gl_FragDepth = DecodeX8D24(color.r, color.g, color.b);
++}
+diff --git a/src/video_core/host_shaders/convert_x8d24_to_abgr8.frag b/src/video_core/host_shaders/convert_x8d24_to_abgr8.frag
+new file mode 100644
+--- /dev/null
++++ b/src/video_core/host_shaders/convert_x8d24_to_abgr8.frag
+@@ -0,0 +1,14 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#version 450
++#extension GL_GOOGLE_include_directive : require
++
++#include "x8d24_conversion.glsl"
++
++layout(binding = 0) uniform sampler2D depth_texture;
++layout(location = 0) out vec4 color;
++
++void main() {
++    float depth = texelFetch(depth_texture, ivec2(gl_FragCoord.xy), 0).r;
++    color = unpackUnorm4x8(EncodeX8D24(depth));
++}
+diff --git a/src/video_core/host_shaders/x8d24_conversion.glsl b/src/video_core/host_shaders/x8d24_conversion.glsl
+new file mode 100644
+--- /dev/null
++++ b/src/video_core/host_shaders/x8d24_conversion.glsl
+@@ -0,0 +1,12 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++float DecodeX8D24(float red, float green, float blue) {
++    uint depth = uint(round(red * 255.0f)) | (uint(round(green * 255.0f)) << 8) |
++                 (uint(round(blue * 255.0f)) << 16);
++    uint scaled = floatBitsToUint(float(depth) * (1.0f / 16777216.0f));
++    return uintBitsToFloat(scaled + uint(depth != 0u));
++}
++
++uint EncodeX8D24(float depth) {
++    return uint(round(depth * 16777215.0f));
++}
+diff --git a/src/video_core/macro.cpp b/src/video_core/macro.cpp
+--- a/src/video_core/macro.cpp
++++ b/src/video_core/macro.cpp
+@@ -1444,8 +1444,10 @@
+                             }
+                         }
+                     }
+-                    if (memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+-                        memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
++                    if (memory.IsMemoryDirty(source, read_bytes,
++                        VideoCommon::CacheType::BufferCache | VideoCommon::CacheType::QueryCache)) {
++                        memory.FlushRegion(source, read_bytes,
++                        VideoCommon::CacheType::BufferCache | VideoCommon::CacheType::QueryCache);
+                         static u64 flushes{};
+                         if (++flushes % 2000 == 1) {
+                             LOG_INFO(HW_GPU, "Native MME DMA read flushed GPU-written memory ({} times)", flushes);
+diff --git a/src/video_core/renderer_opengl/gl_shader_cache.cpp b/src/video_core/renderer_opengl/gl_shader_cache.cpp
+--- a/src/video_core/renderer_opengl/gl_shader_cache.cpp
++++ b/src/video_core/renderer_opengl/gl_shader_cache.cpp
+@@ -54,7 +54,7 @@
+ using VideoCommon::SerializePipeline;
+ using Context = ShaderContext::Context;
+ 
+-constexpr u32 CACHE_VERSION = 17;
++constexpr u32 CACHE_VERSION = 18;
+ 
+ template <typename Container>
+ auto MakeSpan(Container& container) {
+diff --git a/src/video_core/renderer_vulkan/blit_image.cpp b/src/video_core/renderer_vulkan/blit_image.cpp
+--- a/src/video_core/renderer_vulkan/blit_image.cpp
++++ b/src/video_core/renderer_vulkan/blit_image.cpp
+@@ -16,6 +16,8 @@
+ #include "video_core/host_shaders/blit_depth_msaa_frag_spv.h"
+ #include "video_core/host_shaders/blit_depth_stencil_msaa_frag_spv.h"
+ #include "video_core/host_shaders/convert_abgr8_to_d24s8_frag_spv.h"
++#include "video_core/host_shaders/convert_abgr8_to_x8d24_frag_spv.h"
++#include "video_core/host_shaders/convert_x8d24_to_abgr8_frag_spv.h"
+ #include "video_core/host_shaders/convert_abgr8_to_d32f_frag_spv.h"
+ #include "video_core/host_shaders/convert_d24s8_to_abgr8_frag_spv.h"
+ #include "video_core/host_shaders/convert_d32f_to_abgr8_frag_spv.h"
+@@ -629,6 +631,8 @@
+       convert_abgr8_to_d24s8_frag(device.IsExtShaderStencilExportSupported()
+                                  ? BuildShader(device, CONVERT_ABGR8_TO_D24S8_FRAG_SPV)
+                                  : vk::ShaderModule{}),
++      convert_abgr8_to_x8d24_frag(BuildShader(device, CONVERT_ABGR8_TO_X8D24_FRAG_SPV)),
++      convert_x8d24_to_abgr8_frag(BuildShader(device, CONVERT_X8D24_TO_ABGR8_FRAG_SPV)),
+       convert_abgr8_to_d32f_frag(BuildShader(device, CONVERT_ABGR8_TO_D32F_FRAG_SPV)),
+       convert_d32f_to_abgr8_frag(BuildShader(device, CONVERT_D32F_TO_ABGR8_FRAG_SPV)),
+       convert_d24s8_to_abgr8_frag(BuildShader(device, CONVERT_D24S8_TO_ABGR8_FRAG_SPV)),
+@@ -832,6 +836,20 @@
+                                       const ImageView& src_image_view) {
+     ConvertColorToDepthPipeline(convert_r16_to_d16_pipeline, dst_framebuffer->RenderPass());
+     Convert(*convert_r16_to_d16_pipeline, dst_framebuffer, src_image_view);
++}
++
++void BlitImageHelper::ConvertABGR8ToX8D24(const Framebuffer* dst_framebuffer,
++                                       const ImageView& src_image_view) {
++    ConvertPipelineDepthTargetEx(convert_abgr8_to_x8d24_pipeline, dst_framebuffer->RenderPass(),
++                                 convert_abgr8_to_x8d24_frag);
++    Convert(*convert_abgr8_to_x8d24_pipeline, dst_framebuffer, src_image_view);
++}
++
++void BlitImageHelper::ConvertX8D24ToABGR8(const Framebuffer* dst_framebuffer,
++                                       const ImageView& src_image_view) {
++    ConvertPipelineEx(convert_x8d24_to_abgr8_pipeline, dst_framebuffer->RenderPass(),
++                      convert_x8d24_to_abgr8_frag, true, false);
++    Convert(*convert_x8d24_to_abgr8_pipeline, dst_framebuffer, src_image_view);
+ }
+ 
+ void BlitImageHelper::ConvertABGR8ToD24S8(const Framebuffer* dst_framebuffer,
+diff --git a/src/video_core/renderer_vulkan/blit_image.h b/src/video_core/renderer_vulkan/blit_image.h
+--- a/src/video_core/renderer_vulkan/blit_image.h
++++ b/src/video_core/renderer_vulkan/blit_image.h
+@@ -108,6 +108,10 @@
+     void ConvertR16ToD16(const Framebuffer* dst_framebuffer, const ImageView& src_image_view);
+ 
+     void ConvertABGR8ToD24S8(const Framebuffer* dst_framebuffer, const ImageView& src_image_view);
++
++    void ConvertABGR8ToX8D24(const Framebuffer* dst_framebuffer, const ImageView& src_image_view);
++
++    void ConvertX8D24ToABGR8(const Framebuffer* dst_framebuffer, const ImageView& src_image_view);
+ 
+     void ConvertABGR8ToD32F(const Framebuffer* dst_framebuffer, const ImageView& src_image_view);
+ 
+@@ -227,6 +231,8 @@
+     vk::ShaderModule convert_depth_to_float_frag;
+     vk::ShaderModule convert_float_to_depth_frag;
+     vk::ShaderModule convert_abgr8_to_d24s8_frag;
++    vk::ShaderModule convert_abgr8_to_x8d24_frag;
++    vk::ShaderModule convert_x8d24_to_abgr8_frag;
+     vk::ShaderModule convert_abgr8_to_d32f_frag;
+     vk::ShaderModule convert_d32f_to_abgr8_frag;
+     vk::ShaderModule convert_d24s8_to_abgr8_frag;
+@@ -282,6 +288,8 @@
+     vk::Pipeline convert_d16_to_r16_pipeline;
+     vk::Pipeline convert_r16_to_d16_pipeline;
+     vk::Pipeline convert_abgr8_to_d24s8_pipeline;
++    vk::Pipeline convert_abgr8_to_x8d24_pipeline;
++    vk::Pipeline convert_x8d24_to_abgr8_pipeline;
+     vk::Pipeline convert_abgr8_to_d32f_pipeline;
+     vk::Pipeline convert_d32f_to_abgr8_pipeline;
+     vk::Pipeline convert_d24s8_to_abgr8_pipeline;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1268,6 +1268,9 @@
+             return true;
+         }
+     }
++    if (True(which & VideoCommon::CacheType::QueryCache) && query_cache.IsRegionGpuModified(addr, size)) {
++        return true;
++    }
+     if (!Settings::IsGPULevelHigh()) {
+         return false;
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -1576,6 +1576,9 @@
+         }
+         break;
+     case PixelFormat::A8B8G8R8_UNORM:
++        if (src_view.format == PixelFormat::X8_D24_UNORM) {
++            return blit_image_helper.ConvertX8D24ToABGR8(dst, src_view);
++        }
+         if (src_view.format == PixelFormat::S8_UINT_D24_UNORM) {
+             return blit_image_helper.ConvertD24S8ToABGR8(dst, src_view);
+         }
+@@ -1594,6 +1597,11 @@
+     case PixelFormat::D16_UNORM:
+         if (src_view.format == PixelFormat::R16_UNORM) {
+             return blit_image_helper.ConvertR16ToD16(dst, src_view);
++        }
++        break;
++    case PixelFormat::X8_D24_UNORM:
++        if (src_view.format == PixelFormat::A8B8G8R8_UNORM) {
++            return blit_image_helper.ConvertABGR8ToX8D24(dst, src_view);
+         }
+         break;
+     case PixelFormat::S8_UINT_D24_UNORM:
+diff --git a/src/video_core/shader_environment.cpp b/src/video_core/shader_environment.cpp
+--- a/src/video_core/shader_environment.cpp
++++ b/src/video_core/shader_environment.cpp
+@@ -145,6 +145,10 @@
+     return texture_bound;
+ }
+ 
++u32 GenericEnvironment::SurfaceBoundBuffer() const {
++    return surface_bound != ~0U ? surface_bound : texture_bound;
++}
++
+ u32 GenericEnvironment::LocalMemorySize() const {
+     return local_memory_size;
+ }
+@@ -275,6 +279,7 @@
+                sizeof(num_cbuf_replacement_values))
+         .write(reinterpret_cast<const char*>(&local_memory_size), sizeof(local_memory_size))
+         .write(reinterpret_cast<const char*>(&texture_bound), sizeof(texture_bound))
++        .write(reinterpret_cast<const char*>(&surface_bound), sizeof(surface_bound))
+         .write(reinterpret_cast<const char*>(&start_address), sizeof(start_address))
+         .write(reinterpret_cast<const char*>(&cached_lowest), sizeof(cached_lowest))
+         .write(reinterpret_cast<const char*>(&cached_highest), sizeof(cached_highest))
+@@ -619,6 +624,9 @@
+         throw Shader::RuntimeError("Native shader at {:#x}, instruction {:#x}: {}",
+                                    program_base, lowered.error_offset, lowered.error);
+     }
++    if (lowered.required_surface_buffer != ~0U) {
++        surface_bound = lowered.required_surface_buffer;
++    }
+     if (lowered.required_texture_buffer != ~0U) {
+         // Native TEX carries its cbuf index explicitly; TEXS obtains it from the environment.
+         texture_bound = lowered.required_texture_buffer;
+@@ -905,6 +913,7 @@
+               sizeof(num_cbuf_replacement_values))
+         .read(reinterpret_cast<char*>(&local_memory_size), sizeof(local_memory_size))
+         .read(reinterpret_cast<char*>(&texture_bound), sizeof(texture_bound))
++        .read(reinterpret_cast<char*>(&surface_bound), sizeof(surface_bound))
+         .read(reinterpret_cast<char*>(&start_address), sizeof(start_address))
+         .read(reinterpret_cast<char*>(&read_lowest), sizeof(read_lowest))
+         .read(reinterpret_cast<char*>(&read_highest), sizeof(read_highest))
+@@ -1073,6 +1082,10 @@
+     return texture_bound;
+ }
+ 
++u32 FileEnvironment::SurfaceBoundBuffer() const {
++    return surface_bound != ~0U ? surface_bound : texture_bound;
++}
++
+ std::array<u32, 3> FileEnvironment::WorkgroupSize() const {
+     return workgroup_size;
+ }
+diff --git a/src/video_core/shader_environment.h b/src/video_core/shader_environment.h
+--- a/src/video_core/shader_environment.h
++++ b/src/video_core/shader_environment.h
+@@ -42,6 +42,7 @@
+     ~GenericEnvironment() override;
+ 
+     [[nodiscard]] u32 TextureBoundBuffer() const final;
++    [[nodiscard]] u32 SurfaceBoundBuffer() const final;
+ 
+     [[nodiscard]] u32 LocalMemorySize() const final;
+ 
+@@ -140,6 +141,7 @@
+ 
+     u32 local_memory_size{};
+     u32 texture_bound{};
++    u32 surface_bound = ~0U; // Unset: preserve the engine texture table fallback.
+     u32 shared_memory_size{};
+     std::array<u32, 3> workgroup_size{};
+ 
+@@ -274,6 +276,7 @@
+     [[nodiscard]] u32 SharedMemorySize() const override;
+ 
+     [[nodiscard]] u32 TextureBoundBuffer() const override;
++    [[nodiscard]] u32 SurfaceBoundBuffer() const override;
+ 
+     [[nodiscard]] std::array<u32, 3> WorkgroupSize() const override;
+ 
+@@ -297,6 +300,7 @@
+     u32 local_memory_size{};
+     u32 shared_memory_size{};
+     u32 texture_bound{};
++    u32 surface_bound = ~0U; // Unset: preserve the engine texture table fallback.
+     u32 read_lowest{};
+     u32 read_highest{};
+     u32 initial_offset{};
+diff --git a/src/video_core/texture_cache/conversion.h b/src/video_core/texture_cache/conversion.h
+new file mode 100644
+--- /dev/null
++++ b/src/video_core/texture_cache/conversion.h
+@@ -0,0 +1,44 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <span>
++#include <vector>
++
++#include "video_core/surface.h"
++#include "video_core/texture_cache/types.h"
++
++namespace VideoCommon {
++
++inline VideoCore::Surface::PixelFormat GetAliasConversionFormat(
++    VideoCore::Surface::PixelFormat format, VideoCore::Surface::PixelFormat other_format) {
++    using namespace VideoCore::Surface;
++    if (other_format == PixelFormat::X8_D24_UNORM &&
++        GetFormatType(format) == SurfaceType::ColorTexture && BytesPerBlock(format) == 4) {
++        return PixelFormat::A8B8G8R8_UNORM;
++    }
++    return format;
++}
++
++inline std::vector<ImageCopy> MakeImageCopyLayers(std::span<const ImageCopy> copies) {
++    std::vector<ImageCopy> layer_copies;
++    layer_copies.reserve(copies.size());
++    for (const ImageCopy& copy : copies) {
++        const s32 num_layers = copy.dst_subresource.num_layers;
++        if (num_layers <= 1 || copy.src_subresource.num_layers != num_layers) {
++            layer_copies.push_back(copy);
++            continue;
++        }
++        for (s32 layer = 0; layer < num_layers; ++layer) {
++            ImageCopy single = copy;
++            single.dst_subresource.base_layer += layer;
++            single.src_subresource.base_layer += layer;
++            single.dst_subresource.num_layers = 1;
++            single.src_subresource.num_layers = 1;
++            layer_copies.push_back(single);
++        }
++    }
++    return layer_copies;
++}
++
++} // namespace VideoCommon
+diff --git a/src/video_core/texture_cache/format_lookup_table.cpp b/src/video_core/texture_cache/format_lookup_table.cpp
+--- a/src/video_core/texture_cache/format_lookup_table.cpp
++++ b/src/video_core/texture_cache/format_lookup_table.cpp
+@@ -150,6 +150,7 @@
+     case Hash(TextureFormat::X8Z24, UNORM):
+         return PixelFormat::X8_D24_UNORM;
+     case Hash(TextureFormat::X8Z24, UNORM, UINT, UINT, UINT, LINEAR):
++    case Hash(TextureFormat::X8Z24, UNORM, UINT, UNORM, UNORM, LINEAR):
+         return PixelFormat::X8_D24_UNORM;
+     case Hash(TextureFormat::Z24S8, UINT, UNORM, UNORM, UNORM, LINEAR):
+         return PixelFormat::S8_UINT_D24_UNORM;
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -27,6 +27,7 @@
+ #include "video_core/engines/kepler_compute.h"
+ #include "video_core/guest_memory.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
++#include "video_core/texture_cache/conversion.h"
+ #include "video_core/texture_cache/image_view_base.h"
+ #include "video_core/texture_cache/samples_helper.h"
+ #include "video_core/texture_cache/texture_cache_base.h"
+@@ -3375,7 +3376,7 @@
+     if (runtime.ShouldReinterpret(dst, src)) {
+         return runtime.ReinterpretImage(dst, src, copies);
+     }
+-    for (const ImageCopy& copy : copies) {
++    for (const ImageCopy& copy : MakeImageCopyLayers(copies)) {
+         UNIMPLEMENTED_IF(copy.dst_subresource.num_layers != 1);
+         UNIMPLEMENTED_IF(copy.src_subresource.num_layers != 1);
+         UNIMPLEMENTED_IF(copy.src_offset != Offset3D{});
+@@ -3393,14 +3394,15 @@
+         const SubresourceExtent src_extent{.levels = 1, .layers = 1};
+         const SubresourceRange dst_range{.base = dst_base, .extent = dst_extent};
+         const SubresourceRange src_range{.base = src_base, .extent = src_extent};
+-        PixelFormat dst_format = dst.info.format;
++        PixelFormat dst_format = GetAliasConversionFormat(dst.info.format, src.info.format);
++        const PixelFormat src_format = GetAliasConversionFormat(src.info.format, dst.info.format);
+         if (GetFormatType(src.info.format) == SurfaceType::DepthStencil &&
+             GetFormatType(dst_format) == SurfaceType::ColorTexture &&
+             BytesPerBlock(dst_format) == 4) {
+             dst_format = PixelFormat::A8B8G8R8_UNORM;
+         }
+         const ImageViewInfo dst_view_info(ImageViewType::e2D, dst_format, dst_range);
+-        const ImageViewInfo src_view_info(ImageViewType::e2D, src.info.format, src_range);
++        const ImageViewInfo src_view_info(ImageViewType::e2D, src_format, src_range);
+         const auto [dst_framebuffer_id, dst_view_id] = RenderTargetFromImage(dst_id, dst_view_info);
+         Framebuffer* const dst_framebuffer = &slot_framebuffers[dst_framebuffer_id];
+         const ImageViewId src_view_id = FindOrEmplaceImageView(src_id, src_view_info);

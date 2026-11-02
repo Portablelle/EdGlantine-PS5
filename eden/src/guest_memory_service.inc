@@ -994,7 +994,13 @@ void FillGuestMemory(std::uint8_t* at, int fill, std::size_t bytes) noexcept {
 void GuestMemoryFreed(std::uint64_t offset, std::size_t bytes) noexcept {
     SparseRange* const range = guest_range.load(std::memory_order_acquire);
     if (range == nullptr || !range->promote || bytes < SparseSlot) return;
-    const std::uint64_t first = (offset + SparseSlot - 1) / SparseSlot;
+    const auto begin = range->begin.load(std::memory_order_relaxed);
+    const std::uint64_t span = range->end - begin;
+    if (offset >= span) return;
+    bytes = std::min<std::uint64_t>(bytes, span - offset);
+    // Only complete slots inside the actual reservation. Avoid overflow when
+    // a stale kernel layout supplies an offset/length outside that reservation.
+    const std::uint64_t first = offset / SparseSlot + (offset % SparseSlot != 0);
     const std::uint64_t last = (offset + bytes) / SparseSlot; // exclusive
     for (std::uint64_t slot = first; slot < last; ++slot) {
         LockSlot(*range, static_cast<std::size_t>(slot));

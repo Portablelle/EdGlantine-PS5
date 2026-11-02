@@ -62,7 +62,7 @@
                 const auto copies = FixSmallVectorADL(FullDownloadCopies(image.info));
                 image.DownloadMemory(map, copies);
                 bytes += image.unswizzled_size_bytes;
-                usage -= ReclaimedBytes(image);
+                usage -= (std::min)(usage, ReclaimedBytes(image));
                 // The original policy changes at these thresholds. Stop looking
                 // ahead here so we never copy a texture that it would retain.
                 return usage < (aggressive_mode || ::Eden::Performance::KeepDirtyTextures() ? critical_memory

@@ -15,6 +15,8 @@ enum {
 // Cached for this process; restart after replacing setup files. Empty means ready.
 const char* eden_startup_error(void);
 uint64_t eden_game_title_id(const char* rom_path);
+// Uses the engine NPDM parser; only validated loose dumps can opt into NX2 memory.
+int eden_game_is_switch2(const char* rom_path);
 
 int eden_extract_game_metadata(const char* rom_path, const char* keys_dir,
                                const char* cover_tga_path, char* title,

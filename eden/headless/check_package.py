@@ -53,7 +53,7 @@ def check():
     assert all(not (APP / p).is_symlink() and (APP / p).stat().st_size for p in REQUIRED)
     param = json.loads((APP / 'sce_sys/param.json').read_text())
     assert param['titleId'] == 'PPSA99862' and param['contentId'].endswith('EDENNX2PROTO0001')
-    assert param['localizedParameters']['en-US']['titleName'] == 'Eden NX2 Prototype'
+    assert param['localizedParameters']['en-US']['titleName'] == 'EdGlantine PS5'
     assert param['pubtools']['loudnessSnd0'] == '-28.00'
     lapy = json.loads((APP / 'lapy-manifest.json').read_text())
     assert lapy['schema'] == 'lapy-owned-build/1'

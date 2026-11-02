@@ -5,6 +5,13 @@ import subprocess
 import sys
 source, output = map(Path, sys.argv[1:])
 port = Path(__file__).resolve().parents[1] / 'headless'
+import importlib.util
+def load_transform(name):
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(name + '.py'))
+    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    return module
+native_policy = load_transform('prepare-native-shader-policy')
+
 def adapt(relative, destination, replacements):
     text = (source / relative).read_text()
     for old, new in replacements:
@@ -90,22 +97,46 @@ void RasterizerVulkan::DispatchCompute() {"""),
     # Guest threads take the cache locks here (tracked-page writes, flush-area reads).
     ('bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {',
      'bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {\n    ::Eden::Performance::Timer guest_write_timer(::Eden::Performance::guest_cpu_write);'),
-    ('VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {',
-     'VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {\n    ::Eden::Performance::Timer guest_read_timer(::Eden::Performance::guest_cpu_read);\n'
-     # A read of memory no image was ever registered in: the texture cache would find none and
-     # change nothing, so its lock (held by the GPU thread through every draw) is not taken
-     # (headless/image_pages.h).
-     '    if (::Eden::ImagePages::NeverHeld(addr, size)) {\n'
-     '        return VideoCore::RasterizerDownloadArea{\n'
-     '            .start_address = Common::AlignDown(addr, Core::DEVICE_PAGESIZE),\n'
-     '            .end_address = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE),\n'
-     '            .preemtive = true,\n'
-     '        };\n'
-     '    }'),
-    # ... and wait for those locks spinning briefly before sleeping (performance.h GuestCacheLock).
-    ('        std::scoped_lock lock{texture_cache.mutex};\n        auto area = texture_cache.GetFlushArea(addr, size);',
-     '        ::Eden::Performance::GuestCacheLock(texture_cache.mutex);\n'
-     '        std::lock_guard lock{texture_cache.mutex, std::adopt_lock};\n        auto area = texture_cache.GetFlushArea(addr, size);'),
+    ('''VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        auto area = texture_cache.GetFlushArea(addr, size);
+        if (area) {
+            return *area;
+        }
+    }
+    VideoCore::RasterizerDownloadArea new_area{
+        .start_address = Common::AlignDown(addr, Core::DEVICE_PAGESIZE),
+        .end_address = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE),
+        .preemtive = true,
+    };
+    return new_area;
+}''',
+     r'''VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
+    ::Eden::Performance::Timer guest_read_timer(::Eden::Performance::guest_cpu_read);
+    VideoCore::RasterizerDownloadArea result{
+        .start_address = Common::AlignDown(addr, Core::DEVICE_PAGESIZE),
+        .end_address = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE),
+        .preemtive = true,
+    };
+    if (buffer_cache.FlushesOnCpuRead()) {
+        ::Eden::Performance::GuestCacheLock(buffer_cache.mutex);
+        std::lock_guard lock{buffer_cache.mutex, std::adopt_lock};
+        if (auto area = buffer_cache.GetFlushArea(addr, size)) {
+            result.preemtive = area->preemtive;
+        }
+    }
+    if (!::Eden::ImagePages::NeverHeld(addr, size)) {
+        ::Eden::Performance::GuestCacheLock(texture_cache.mutex);
+        std::lock_guard lock{texture_cache.mutex, std::adopt_lock};
+        if (auto area = texture_cache.GetFlushArea(addr, size)) {
+            result.preemtive = result.preemtive && area->preemtive;
+        }
+    }
+    // Cache only the requested pages: wider texture areas may contain unread buffers.
+    return result;
+}'''),
+    # Wait for the write locks spinning briefly before sleeping (performance.h GuestCacheLock).
     ('        std::scoped_lock lock{buffer_cache.mutex};\n        if (buffer_cache.OnCPUWrite(addr, size)) {',
      '        ::Eden::Performance::GuestCacheLock(buffer_cache.mutex);\n'
      '        std::lock_guard lock{buffer_cache.mutex, std::adopt_lock};\n        if (buffer_cache.OnCPUWrite(addr, size)) {'),
@@ -360,21 +391,6 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {'''),
             std::lock_guard lock{texture_cache.mutex, std::adopt_lock};
             lap(&Detail::texture_wait_ns);
 '''),
-    # Guest reads may skip the download check while the texture cache lock is held (cpu_read_skip).
-    ('''        ::Eden::Performance::GuestCacheLock(texture_cache.mutex);
-        std::lock_guard lock{texture_cache.mutex, std::adopt_lock};
-        auto area = texture_cache.GetFlushArea(addr, size);''',
-     '''        if (::Eden::Performance::cpu_read_skip.load(std::memory_order_relaxed)) {
-            if (!texture_cache.mutex.try_lock()) {
-                ::Eden::Performance::cpu_read_skipped.fetch_add(1, std::memory_order_relaxed);
-                // Empty: HandleRasterizerDownload does not remember it, so the next read checks again.
-                return VideoCore::RasterizerDownloadArea{.start_address = addr, .end_address = addr, .preemtive = true};
-            }
-        } else {
-            ::Eden::Performance::GuestCacheLock(texture_cache.mutex);
-        }
-        std::lock_guard lock{texture_cache.mutex, std::adopt_lock};
-        auto area = texture_cache.GetFlushArea(addr, size);'''),
     ('        if (hold_start != 0) ::Eden::Performance::AddSince(::Eden::Performance::draw_cache_hold, hold_start);\n',
      '        if (hold_start != 0) ::Eden::Performance::AddHold(hold_start);\n'),
     # Dynamic vertex input: a stream with instancing on and frequency 0 advances per vertex, as the
@@ -1098,18 +1114,14 @@ download_source = (source / 'src/video_core/texture_cache/texture_cache.h').read
 download_begin = download_source.index('void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size)')
 download_loop = download_source.index('    for (const ImageId image_id : images) {', download_begin)
 download_prefix = download_source[download_begin:download_loop]
-# Reuse DeleteImage's exact accounting to stop lookahead when its existing
-# pressure policy changes. Fail on source drift rather than inventing a budget.
-delete_begin = download_source.index('    if (image.HasScaled()) {', download_source.index('void TextureCache<P>::DeleteImage('))
-delete_end = download_source.index('    const GPUVAddr gpu_addr', delete_begin)
-reclaimed_bytes = download_source[delete_begin:delete_end].replace('total_used_memory -=', 'bytes +=')
+# Registration, deletion and lookahead share the core accounting helper. The
+# concrete Image type preserves backend accounting rather than slicing ImageBase.
 gc_begin = download_source.index('void TextureCache<P>::RunGarbageCollector() {')
 gc_end = download_source.index('\ntemplate <class P>', gc_begin)
 gc_original = download_source[gc_begin:gc_end]
 gc = gc_original
-gc_setup = '''    const auto ReclaimedBytes = [&](const ImageBase& image) {
-        u64 bytes = 0;
-''' + reclaimed_bytes + '''        return bytes;
+gc_setup = '''    const auto ReclaimedBytes = [&](const Image& image) {
+        return ReclaimableImageBytes(image);
     };
 ''' + (port / 'vulkan_gc_downloads.inc').read_text()
 for old, new in [
@@ -1658,6 +1670,7 @@ for old, new in pipeline_cache_writes:
     if shader_source.count(old) != 1:
         raise RuntimeError(f'Pipeline cache write anchor changed: {old[:60]}')
     shader_source = shader_source.replace(old, new)
+shader_source = native_policy.pipeline(shader_source)
 shader_output = output / 'vk_pipeline_cache_cost.cpp'
 if not shader_output.exists() or shader_output.read_text() != shader_source:
     shader_output.write_text(shader_source)

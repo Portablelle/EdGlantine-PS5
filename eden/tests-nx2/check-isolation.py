@@ -5,7 +5,7 @@ param=json.loads((root/'sce_sys/param.json').read_text())
 assert param['titleId']=='PPSA99862'
 assert param['conceptId']=='99862'
 assert param['contentId']=='UP9000-PPSA99862_00-EDENNX2PROTO0001'
-assert param['localizedParameters']['en-US']['titleName']=='Eden NX2 Prototype'
+assert param['localizedParameters']['en-US']['titleName']=='EdGlantine PS5'
 paths=(root/'headless/storage_paths.h').read_text()
 assert 'kDataDir = "/data/eden-nx2"' in paths
 assert 'kInstallDir = "/data/homebrew/PPSA99862"' in paths

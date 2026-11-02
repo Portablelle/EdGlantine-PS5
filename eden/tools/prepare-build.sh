@@ -23,11 +23,12 @@ scratch=$(cat .local/headless-cache)
 
 eden="$scratch/source"
 eden_archive=eden-67bada77.tar.gz
-source_identity="$eden_archive:$(sha256sum tools/eden-patches/90-nx2-prototype.diff | cut -d' ' -f1)"
+source_identity="$eden_archive:$(sha256sum tools/eden-patches/*.diff | sha256sum | cut -d' ' -f1)"
 # A tree unpacked from another archive is the source of another Eden revision: it is unpacked
 # again (Eden's package cache, downloads only, is kept). A tree left from before an update of
 # the pin was built as if it were the new one, and what Eden had changed went unseen.
-if [[ ! -f $eden/CMakeLists.txt || $(cat "$eden/.unpacked-from" 2>/dev/null) != "$source_identity" ]]; then
+if [[ ! -f $eden/CMakeLists.txt || $(cat "$eden/.unpacked-from" 2>/dev/null) != "$source_identity" ||
+      $(cat "$eden/.patches-applied" 2>/dev/null) != "$source_identity" ]]; then
     step "Eden source"
     if [[ -d $eden/.cache ]]; then rm -rf "$scratch/source-cache" && mv "$eden/.cache" "$scratch/source-cache"; fi
     rm -rf "$eden"
@@ -38,19 +39,17 @@ if [[ ! -f $eden/CMakeLists.txt || $(cat "$eden/.unpacked-from" 2>/dev/null) != 
 fi
 printf '%s\n' '67bada77f8a43a90da2e94e89b8e7da73c256989' > "$eden/GIT-COMMIT"
 printf '%s\n' 'ps5-headless' > "$eden/GIT-REFSPEC"
-# Fixes to Eden's own source (tools/eden-patches, in name order), each applied once: a patch that
-# reverses cleanly is already in the tree. One that neither reverses nor applies was changed after
-# an earlier version of it went in: the files it touches come back from the pinned archive first.
+# Patch layers can modify the same hunks. Reverse-testing an earlier layer on the
+# final tree is not valid; rebuild from the archive when any patch changes, and
+# mark the whole series only after every layer has applied successfully.
 command -v patch >/dev/null || { echo "patch is required (apt install patch)" >&2; exit 1; }
-for eden_patch in tools/eden-patches/*.diff; do
-    if patch -d "$eden" -p1 -R --dry-run -s -f < "$eden_patch" >/dev/null 2>&1; then continue; fi
-    step "Eden patch $(basename "$eden_patch")"
-    if ! patch -d "$eden" -p1 -N --dry-run -s -f < "$eden_patch" >/dev/null 2>&1; then
-        sed -n 's|^+++ b/||p' "$eden_patch" | sed 's|^|*/|' |
-            xargs tar -xzf ".deps/$eden_archive" --wildcards --strip-components=1 -C "$eden"
-    fi
-    patch -d "$eden" -p1 -N -s < "$eden_patch" || { echo "$eden_patch does not apply to Eden's source" >&2; exit 1; }
-done
+if [[ $(cat "$eden/.patches-applied" 2>/dev/null) != "$source_identity" ]]; then
+    for eden_patch in tools/eden-patches/*.diff; do
+        step "Eden patch $(basename "$eden_patch")"
+        patch -d "$eden" -p1 -N -s -f < "$eden_patch" || { echo "$eden_patch does not apply to Eden's source" >&2; exit 1; }
+    done
+    printf '%s\n' "$source_identity" > "$eden/.patches-applied"
+fi
 # Optional: seed Eden's package cache from another checkout's (CI reuses a development cache).
 if [[ -n ${EDEN_CPM_CACHE_SEED:-} && ! -d $eden/.cache/cpm ]]; then
     step "Eden package cache from $EDEN_CPM_CACHE_SEED"

@@ -1,0 +1,51 @@
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -1,3 +1,5 @@
++#include <atomic>
++#include <cstdio>
+ // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
+@@ -1165,6 +1167,20 @@
+         }
+         channel_state->fast_bound_uniform_buffers[stage] |= 1u << binding_index;
+         channel_state->uniform_buffer_binding_sizes[stage][binding_index] = size;
++        // Alignment alone may force streaming even when this range is GPU-written.
++        // Finish the exact readback before allocating the mapped upload: a download
++        // can submit/wait and retire staging allocations.
++        if (needs_alignment_stream && memory_tracker.IsRegionGpuModified(device_addr, size)) {
++            SynchronizeBuffer(buffer, device_addr, size);
++            DownloadBufferMemory(buffer, device_addr, size);
++        #ifdef EDEN_NX2_PS5_PROTO
++            static std::atomic<unsigned long long> alignment_syncs{0};
++            const auto count = alignment_syncs.fetch_add(1, std::memory_order_relaxed) + 1;
++            if (count <= 4 || (count & (count - 1)) == 0)
++                std::fprintf(stderr, "NX2_UNIFORM_ALIGN_SYNC stage=graphics address=%llx bytes=%u checks=%llu\n",
++                             static_cast<unsigned long long>(device_addr), size, count);
++        #endif
++        }
+         // Stream buffer path to avoid stalling on non-Nvidia drivers or Vulkan
+         const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
+         device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
+@@ -1461,6 +1477,20 @@
+              !memory_tracker.IsRegionGpuModified(binding.device_addr, size));
+         if constexpr (!IS_OPENGL) {
+             if (use_fast_buffer) {
++                // Alignment alone may force streaming even when this range is GPU-written.
++                // Finish the exact readback before allocating the mapped upload: a download
++                // can submit/wait and retire staging allocations.
++                if (needs_alignment_stream && memory_tracker.IsRegionGpuModified(binding.device_addr, size)) {
++                    SynchronizeBuffer(buffer, binding.device_addr, size);
++                    DownloadBufferMemory(buffer, binding.device_addr, size);
++                #ifdef EDEN_NX2_PS5_PROTO
++                    static std::atomic<unsigned long long> alignment_syncs{0};
++                    const auto count = alignment_syncs.fetch_add(1, std::memory_order_relaxed) + 1;
++                    if (count <= 4 || (count & (count - 1)) == 0)
++                        std::fprintf(stderr, "NX2_UNIFORM_ALIGN_SYNC stage=compute address=%llx bytes=%u checks=%llu\n",
++                                     static_cast<unsigned long long>(binding.device_addr), size, count);
++                #endif
++                }
+                 const std::span<u8> span =
+                     runtime.BindMappedUniformBuffer(0, binding_index, size);
+                 device_memory.ReadBlockUnsafe(binding.device_addr, span.data(), size);

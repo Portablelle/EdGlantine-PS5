@@ -86,7 +86,7 @@ std::string changes_text(int changes)
 
 void Launcher::start_scan()
 {
-    if (!scan_.valid() && home_.setup_ready)
+    if (!scan_.valid())
         scan_ = std::async(std::launch::async, [this] { return services_.games(); });
 }
 
@@ -468,7 +468,7 @@ void Launcher::press_library(Key key)
         game_rows_.reset(dialog_rows(Modal::game), 0);
         return;
     case Key::cross:
-        if (game == nullptr || !home_.setup_ready)
+        if (game == nullptr || !GameReady(home_.setup_ready, *game))
         {
             cue(Cue::error);
             return;
@@ -506,7 +506,7 @@ void Launcher::draw_library(Canvas &c)
         kicker(c, tr("LIBRARY"), kPanelLeft, baseline(80.0f, 30.0f, t.size_small), t.accent_pale, kPanelWidth);
         if (count == 0)
         {
-            text(c, games_loaded_ || !home_.setup_ready ? tr("No ROM files found.") : tr("Reading..."),
+            text(c, games_loaded_ ? tr("No ROM files found.") : tr("Reading..."),
                  kPanelLeft + kPanelWidth * 0.5f, baseline(400.0f, 38.0f, t.size_text), t.size_text,
                  t.copy, Align::center);
         }
@@ -574,7 +574,7 @@ void Launcher::draw_library(Canvas &c)
     {
         const float cx = left + kGridWidth * 0.5f;
         icon(c, Icon::library, cx, 460.0f, 96.0f, t.rule);
-        text_shrink(c, games_loaded_ || !home_.setup_ready ? tr("No ROM files found.") : tr("Reading..."), cx,
+        text_shrink(c, games_loaded_ ? tr("No ROM files found.") : tr("Reading..."), cx,
                     baseline(540.0f, 38.0f, t.size_text), t.size_text, t.copy, kGridWidth, Align::center);
     }
     else
@@ -781,7 +781,7 @@ void Launcher::draw_library(Canvas &c)
     else
     {
         primary_button(c, first, tr("Play"), translate_hint(Pad::cross), 0.0f, 0.0f,
-                       game != nullptr && home_.setup_ready);
+                       game != nullptr && GameReady(home_.setup_ready, *game));
         secondary_button(c, second, tr("Game settings"), translate_hint(Pad::triangle), 0.0f, 0.0f,
                          game != nullptr && game->title_id != 0);
     }

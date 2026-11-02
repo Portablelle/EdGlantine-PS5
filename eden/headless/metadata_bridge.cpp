@@ -1,3 +1,4 @@
+#include "dump_metadata.h"
 #include "game_name.h"
 #include "metadata_bridge.h"
 #include "assets_dir.h"
@@ -44,9 +45,11 @@
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/submission_package.h"
 #include "core/file_sys/vfs/vfs_real.h"
+#include "core/file_sys/program_metadata.h"
 #include "core/hle/service/ns/language.h"
 #include "core/hle/service/set/settings_types.h"
 #include "core/loader/loader.h"
+#include "core/loader/nso.h"
 
 namespace {
 constexpr std::array<const char*, 18> language_names{
@@ -129,6 +132,16 @@ uint32_t ReadLanguages(const FileSys::VirtualDir& game, const FileSys::VirtualDi
     if (packed_update)
         if (const uint32_t languages = ReadLanguages(packed_update)) return languages;
     return game ? ReadLanguages(game) : 0;
+}
+
+uint32_t ReadDumpLanguages(const std::filesystem::path& entry) {
+    FileSys::RealVfsFilesystem vfs;
+    const auto root = entry.parent_path().parent_path();
+    for (const auto& candidate : {root, root/"control", root/"exefs", root/"romfs"}) {
+        const auto directory = vfs.OpenDirectory(candidate.string(), FileSys::OpenMode::Read);
+        if (directory) if (const auto flags = ReadLanguages(directory)) return flags;
+    }
+    return 0;
 }
 
 // Game file -> its language flags, kept from the Library's metadata pass over the same data.
@@ -215,8 +228,38 @@ int eden_write_cover_tga(const unsigned char* encoded, size_t size, const char* 
     return 1;
 }
 
+namespace {
+bool LoadDumpMetadata(const std::filesystem::path& entry, FileSys::ProgramMetadata& metadata) {
+    if (!Eden::DumpMetadata::IsEntry(entry)) return false;
+    FileSys::RealVfsFilesystem vfs;
+    const auto main = vfs.OpenFile(entry.string(), FileSys::OpenMode::Read);
+    if (!main || Loader::AppLoader_NSO::IdentifyType(main) != Loader::FileType::NSO) return false;
+    const auto npdm = vfs.OpenFile((entry.parent_path() / "main.npdm").string(), FileSys::OpenMode::Read);
+    return npdm && metadata.Load(npdm) == Loader::ResultStatus::Success;
+}
+} // namespace
+
+namespace Eden::DumpMetadata {
+std::uint64_t ProgramId(const std::filesystem::path& entry) {
+    FileSys::ProgramMetadata metadata;
+    return LoadDumpMetadata(entry, metadata) ? metadata.GetTitleID() : 0;
+}
+bool Ready(const std::filesystem::path& entry) {
+    std::error_code error;
+    return std::filesystem::is_directory(entry.parent_path().parent_path() / "romfs", error) &&
+           !error && ProgramId(entry) != 0;
+}
+} // namespace Eden::DumpMetadata
+
+int eden_game_is_switch2(const char* rom_path) {
+    if (!rom_path) return 0;
+    FileSys::ProgramMetadata metadata;
+    return LoadDumpMetadata(rom_path, metadata) && metadata.GetTitleID() != 0 && metadata.IsSwitch2();
+}
+
 uint64_t eden_game_title_id(const char* rom_path) {
     if (!rom_path) return 0;
+    if(Eden::DumpMetadata::IsEntry(rom_path)) return Eden::DumpMetadata::ProgramId(rom_path);
     Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, Eden::AssetsPath("keys"));
     FileSys::RealVfsFilesystem vfs;
     const auto file = vfs.OpenFile(rom_path, FileSys::OpenMode::Read);
@@ -240,6 +283,30 @@ int eden_extract_game_metadata(const char* rom_path, const char* keys_dir,
                                size_t title_capacity) {
     if (!rom_path || !keys_dir || !cover_tga_path || !title || title_capacity == 0) return 0;
     title[0] = '\0';
+    if(Eden::DumpMetadata::IsEntry(rom_path)) {
+        if(!Eden::DumpMetadata::Ready(rom_path)) return 0;
+        GameLanguages()[rom_path] = ReadDumpLanguages(rom_path);
+        FileSys::RealVfsFilesystem dump_vfs;
+        const auto root=std::filesystem::path(rom_path).parent_path().parent_path();
+        int result=0;
+        for(const auto& candidate : {root,root/"control",root/"exefs",root/"romfs"}) {
+            const auto directory=dump_vfs.OpenDirectory(candidate.string(),FileSys::OpenMode::Read);
+            if(!directory) continue;
+            if(!(result&EDEN_METADATA_TITLE)) {
+                const auto name=ReadTitle(directory);
+                if(!name.empty()) {std::snprintf(title,title_capacity,"%s",name.c_str());result|=EDEN_METADATA_TITLE;}
+            }
+            if(!(result&EDEN_METADATA_COVER)) {
+                const auto icon=FindIcon(directory);
+                if(icon && WriteTga(icon,cover_tga_path)) result|=EDEN_METADATA_COVER;
+            }
+        }
+        if(!(result&EDEN_METADATA_TITLE)) {
+            const auto name=root.filename().string();
+            if(Eden::UsableName(name)) {std::snprintf(title,title_capacity,"%s",name.c_str());result|=EDEN_METADATA_TITLE;}
+        }
+        return result;
+    }
     Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, keys_dir);
     FileSys::RealVfsFilesystem vfs;
     const auto file = vfs.OpenFile(rom_path, FileSys::OpenMode::Read);
@@ -268,6 +335,8 @@ uint32_t eden_game_supported_languages(const char* rom_path, const char* keys_di
     if (!rom_path || !keys_dir) return 0;
     if (const auto known = GameLanguages().find(rom_path); known != GameLanguages().end()) return known->second;
     try {
+        if (Eden::DumpMetadata::IsEntry(rom_path))
+            return GameLanguages()[rom_path] = ReadDumpLanguages(rom_path);
         Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, keys_dir);
         FileSys::RealVfsFilesystem vfs;
         const auto file = vfs.OpenFile(rom_path, FileSys::OpenMode::Read);

@@ -1049,6 +1049,14 @@ string(REPLACE "${spin_old}" "void KSpinLock::Lock() {\n    ::Eden::Performance:
 write_derived("${PORT_BUILD_DIR}/k_spin_lock.cpp" "#include \"${EDEN_PORT_DIR}/performance.h\"\n${spin_source}")
 list(REMOVE_ITEM core_sources "hle/kernel/k_spin_lock.cpp")
 list(APPEND core_sources "${PORT_BUILD_DIR}/k_spin_lock.cpp")
+# The add-on provider must not recursively visit loose RomFS assets or uploads.
+execute_process(COMMAND python3 "${PORT_ROOT}/tools/prepare-library-scan.py"
+    "${PROJECT_SOURCE_DIR}/src/core/file_sys/registered_cache.cpp"
+    "${PORT_BUILD_DIR}/registered_cache.cpp" COMMAND_ERROR_IS_FATAL ANY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${PORT_ROOT}/tools/prepare-library-scan.py")
+list(REMOVE_ITEM core_sources "file_sys/registered_cache.cpp")
+list(APPEND core_sources "${PORT_BUILD_DIR}/registered_cache.cpp")
 # Eden keeps up to 8,192 host files open and closes the least recently used one only past that.
 # Each open file is a stdio FILE, and on the PS5 (as on FreeBSD) a FILE has its own thread library
 # lock, made at its first read and kept until it is closed. Every NSP and XCI in the updates folder
@@ -1061,10 +1069,35 @@ string(FIND "${vfs_real_source}" "${open_files_old}" open_files_at)
 if(open_files_at LESS 0)
     message(FATAL_ERROR "Pinned vfs_real.cpp MaxOpenFiles changed")
 endif()
-string(REPLACE "${open_files_old}" "constexpr size_t MaxOpenFiles = 512;" vfs_real_source "${vfs_real_source}")
-write_derived("${PORT_BUILD_DIR}/vfs_real.cpp" "${vfs_real_source}")
+string(REPLACE "${open_files_old}" "constexpr size_t MaxOpenFiles = Eden::HostFiles::MaxCachedOpenFiles;" vfs_real_source "${vfs_real_source}")
+write_derived("${PORT_BUILD_DIR}/vfs_real.cpp" "#include \"${EDEN_PORT_DIR}/host_file_pressure.h\"\n${vfs_real_source}")
+set_property(SOURCE "${PORT_BUILD_DIR}/vfs_real.cpp" APPEND PROPERTY OBJECT_DEPENDS
+    "${EDEN_PORT_DIR}/host_file_pressure.h")
 list(REMOVE_ITEM core_sources "file_sys/vfs/vfs_real.cpp")
 list(APPEND core_sources "${PORT_BUILD_DIR}/vfs_real.cpp")
+execute_process(COMMAND python3 "${PORT_ROOT}/tools/prepare-host-memory.py"
+    "${PROJECT_SOURCE_DIR}" "${PORT_BUILD_DIR}" "${EDEN_PORT_DIR}" COMMAND_ERROR_IS_FATAL ANY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PORT_ROOT}/tools/prepare-host-memory.py")
+target_include_directories(video_core BEFORE PRIVATE "${PORT_BUILD_DIR}/host-memory" "${EDEN_PORT_DIR}")
+
+# Preserve the actual fopen error before logging can change errno. The session
+# must not retry an early guest fault caused by exhausted host descriptors.
+file(READ "${PROJECT_SOURCE_DIR}/src/common/fs/file.cpp" host_file_source)
+set(host_open_failure "    if (!IsOpen()) {\n        const auto ec = std::error_code{errno, std::generic_category()};\n        LOG_ERROR(Common_Filesystem, \"Failed to open the file at path={}, ec_message={}\",")
+string(FIND "${host_file_source}" "${host_open_failure}" host_open_failure_at)
+if(host_open_failure_at LESS 0)
+    message(FATAL_ERROR "Pinned IOFile::Open failure handler changed")
+endif()
+string(REPLACE "${host_open_failure}"
+    "    if (!IsOpen()) {\n        const auto ec = std::error_code{errno, std::generic_category()};\n        Eden::HostFiles::ObserveOpenError(ec.value());\n        LOG_ERROR(Common_Filesystem, \"Failed to open the file at path={}, ec_message={}\","
+    host_file_source "${host_file_source}")
+write_derived("${PORT_BUILD_DIR}/host_file.cpp" "#include \"${EDEN_PORT_DIR}/host_file_pressure.h\"\n${host_file_source}")
+get_target_property(host_file_common_sources common SOURCES)
+list(FILTER host_file_common_sources EXCLUDE REGEX "(^|/)fs/file\\.cpp$")
+set_property(TARGET common PROPERTY SOURCES "${host_file_common_sources}")
+target_sources(common PRIVATE "${PORT_BUILD_DIR}/host_file.cpp")
+set_property(SOURCE "${PORT_BUILD_DIR}/host_file.cpp" TARGET_DIRECTORY common APPEND
+    PROPERTY OBJECT_DEPENDS "${EDEN_PORT_DIR}/host_file_pressure.h")
 if(EDEN_DEV_PROFILE)
     # Guest-visible waits: syncpoint event registration to signal (GPU-pipeline latency
     # the game waits on) and buffer-queue dequeue waits (presentation back-pressure).
@@ -1853,13 +1886,13 @@ file(READ "${PROJECT_SOURCE_DIR}/src/core/hle/kernel/kernel.cpp" kernel_source)
 # The guest's memory is backed where it is used (src/memory_pages.cpp). Here: everything outside
 # the pools, as soon as the kernel knows where the pools are and before its first write (the
 # slab heaps). A pool's pages follow when they are handed out (k_memory_manager.cpp below).
-set(guest_backing_site "        DeriveInitialMemoryLayout();\n        Init::InitializeSlabHeaps(system, *memory_layout);")
+set(guest_backing_site "        DeriveInitialMemoryLayout();")
 string(FIND "${kernel_source}" "${guest_backing_site}" guest_backing_at)
 if(guest_backing_at LESS 0)
     message(FATAL_ERROR "Pinned kernel start changed; review where the guest's memory is backed.")
 endif()
 string(REPLACE "${guest_backing_site}"
-    "        DeriveInitialMemoryLayout();\n        for (const auto& region : memory_layout->GetPhysicalMemoryRegionTree()) {\n            const u64 dram = Core::DramMemoryMap::Base;\n            if (region.IsDerivedFrom(KMemoryRegionType_DramUserPool) || region.GetLastAddress() < dram) continue;\n            const u64 start = std::max<u64>(region.GetAddress(), dram);\n            ::Common::CommitGuestMemory(start - dram, region.GetLastAddress() - start + 1);\n        }\n        Init::InitializeSlabHeaps(system, *memory_layout);"
+    "        DeriveInitialMemoryLayout();\n        for (const auto& region : memory_layout->GetPhysicalMemoryRegionTree()) {\n            const u64 dram = Core::DramMemoryMap::Base;\n            if (region.IsDerivedFrom(KMemoryRegionType_DramUserPool) || region.GetLastAddress() < dram) continue;\n            const u64 start = std::max<u64>(region.GetAddress(), dram);\n            ::Common::CommitGuestMemory(start - dram, region.GetLastAddress() - start + 1);\n        }"
     kernel_source "${kernel_source}")
 string(PREPEND kernel_source "#include <algorithm>\n#include <cstddef>\n#include <cstdint>\n#include \"core/device_memory.h\"\nnamespace Common { void CommitGuestMemory(std::uint64_t offset, std::size_t bytes) noexcept; }\n")
 file(READ "${PROJECT_SOURCE_DIR}/src/core/hle/kernel/k_memory_manager.cpp" pool_source)
@@ -2812,19 +2845,15 @@ if(EDEN_DEV_PROFILE)
 endif()
 # The shader cache file's reader checks what it reads and keeps the whole entries of a damaged
 # file (shader_cache_reader.inc; shader_cache_check.cpp checks it on the host).
-file(READ "${PROJECT_SOURCE_DIR}/src/video_core/shader_environment.cpp" shader_environment_source)
-string(FIND "${shader_environment_source}" "void LoadPipelines(" shader_reader_begin)
-string(FIND "${shader_environment_source}" "} // namespace VideoCommon" shader_reader_end REVERSE)
-if(shader_reader_begin LESS 0 OR shader_reader_end LESS shader_reader_begin)
-    message(FATAL_ERROR "Pinned shader cache reader changed")
-endif()
-string(SUBSTRING "${shader_environment_source}" 0 ${shader_reader_begin} shader_environment_head)
-string(SUBSTRING "${shader_environment_source}" ${shader_reader_end} -1 shader_environment_tail)
-string(PREPEND shader_environment_head "#include <cstdio>\n#include <new>\n#include <stdexcept>\n#include <system_error>\n")
-write_derived("${PORT_BUILD_DIR}/shader_environment.cpp"
-    "${shader_environment_head}#include \"${EDEN_PORT_DIR}/shader_cache_reader.inc\"\n\n${shader_environment_tail}")
+execute_process(COMMAND python3 "${PORT_ROOT}/tools/prepare-shader-environment.py"
+    "${PROJECT_SOURCE_DIR}/src/video_core/shader_environment.cpp"
+    "${PORT_BUILD_DIR}/shader_environment.cpp" "${EDEN_PORT_DIR}" "${PS5_NATIVE}"
+    COMMAND_ERROR_IS_FATAL ANY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${PORT_ROOT}/tools/prepare-shader-environment.py"
+    "${PORT_ROOT}/tools/prepare-native-shader-policy.py")
 set_property(SOURCE "${PORT_BUILD_DIR}/shader_environment.cpp" APPEND PROPERTY OBJECT_DEPENDS
-    "${EDEN_PORT_DIR}/shader_cache_reader.inc")
+    "${EDEN_PORT_DIR}/shader_cache_reader.inc" "${EDEN_PORT_DIR}/native_shader_policy.h")
 # Eden recompresses an ASTC texture to BC1 or BC3 a mip level at a time: every layer of the level
 # is decoded into one buffer, four bytes a pixel, and then compressed. For a texture array of 121
 # layers that buffer is 484 MiB, asked of the pool the CPU shares with the GPU at the moment a game

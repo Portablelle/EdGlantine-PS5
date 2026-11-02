@@ -1,3 +1,4 @@
+#include "dump_metadata.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "eden_services.h"
 
@@ -211,7 +212,8 @@ void SaveTitle(const std::string& filename, const std::string& title) {
 // kept whatever the game's first name held), else the name its file gives.
 std::string GameTitle(const std::string& filename) {
     const std::string saved = SavedTitle(filename);
-    return Eden::UsableName(saved) ? Eden::PlainName(saved) : CleanTitle(filename);
+    return Eden::UsableName(saved) ? Eden::PlainName(saved) :
+        CleanTitle(Eden::DumpPaths::ValidEntry(filename) ? filename.substr(0,filename.find('/')) : filename);
 }
 
 // The cached cover of a ROM, extracted from it when missing; empty when it has none.
@@ -298,6 +300,8 @@ std::vector<std::string> GameFiles() {
         if (rom(name) && Eden::ValidRomPath(name)) files.push_back(name);
     for (const std::string& folder : ListEntries(roms, true, ok)) {
         if (folder.empty() || folder[0] == '.') continue;
+        const std::string dump=folder+"/exefs/main";
+        if(Eden::ValidRomPath(dump) && Eden::DumpMetadata::Ready(JoinPath(roms,dump))) files.push_back(dump);
         bool listed = false;
         for (const std::string& name : ListEntries(JoinPath(roms, folder), false, listed)) {
             const std::string file = folder + "/" + name;
@@ -651,6 +655,8 @@ pe::ui::Home EdenServices::home() {
     }
     const std::string last_path = Eden::AssetsPath("roms/" + home.last_file);
     home.last_exists = !home.last_file.empty() && IsFile(last_path);
+    home.last_standalone = home.last_exists && Eden::FilesystemAccess() &&
+        Eden::DumpPaths::ValidEntry(home.last_file) && Eden::DumpMetadata::Ready(last_path);
     if (!home.last_file.empty()) {
         std::string title = GameTitle(home.last_file);
         std::string cover = CoverPath(home.last_file);
@@ -748,10 +754,11 @@ std::vector<pe::ui::Game> EdenServices::games() {
         struct stat info {};
         if (stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode)) continue;
         pe::ui::Game game;
-        game.name = CleanTitle(std::filesystem::path(file).filename().string());
-        game.format = format;
-        game.size = SizeLabel(static_cast<double>(info.st_size));
+        game.name = GameTitle(file);
+        game.format = Eden::DumpPaths::ValidEntry(file) ? "ExeFS" : format;
+        game.size = Eden::DumpPaths::ValidEntry(file) ? std::string{"-"} : SizeLabel(static_cast<double>(info.st_size));
         game.file = file;
+        game.standalone = Eden::DumpPaths::ValidEntry(file);
         // A game whose data cannot be read is still listed, by its file name.
         try {
             char title[513]{};
@@ -1533,6 +1540,10 @@ std::vector<pe::ui::Download> EdenServices::downloads() {
 }
 
 bool EdenServices::delete_game(const pe::ui::Game& game, std::string* message) {
+    if(Eden::DumpPaths::ValidEntry(game.file)) {
+        if(message) *message="Folder dumps are managed in the game files folder.";
+        return false;
+    }
     if (!Eden::FilesystemAccess() || game.sources.empty() || game.remote || !Eden::ValidRomPath(game.file))
         return false;
     const std::lock_guard lock(bridge_);

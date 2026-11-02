@@ -4,15 +4,41 @@ EdGlantine-PS5 is an experimental PS5 port based on ProsperoEden and the Eden NX
 engine, with adaptations from the Eglantine forks. It reaches gameplay in tested
 scenarios, but performance, rendering correctness and stability still need work.
 
-**Contributors welcome.** The latest reported gameplay result is **21 FPS** on
-version **00.064.000**, confirmed by the user on PS5. A stable **30 FPS has not
-been achieved** in that test. A profiling capture is also available.
+**Contributors welcome.** On version **00.065.000**, both Welcome Tour and Pokopia
+reach gameplay. Welcome Tour regressed to about **8 FPS**, versus **21 FPS** on
+.064. Pokopia reaches about **45–51 FPS**, but the user reports temporary freezes
+and extensive flickering. These are experimental results, not stable compatibility.
 Help with profiling, CPU/GPU optimization, memory synchronization and PS5 testing
 would make a real difference. See [Contributing](#contributing) below.
 
 ## Current state
 
-- **Latest build: 00.064.000.** Shares CPU preparation of texture tables and sampled
+- **Installed build: 00.065.000.** Adds controller selection of folder dumps in
+  the library and the homescreen name **EdGlantine PS5**. The library scan is
+  independent of key/firmware setup; validated decrypted dumps can be selected
+  without container keys, while NSP/XCI launches retain the setup requirement.
+  NX2 dumps select the 12 GiB layout before device-memory construction; sparse
+  page returns are bounded to the actual reservation. The focused bounds regression
+  passed under ASan/UBSan on the dedicated host; the user confirmed both games
+  start on PS5. Targeted dump-library tests and package checks passed. Includes
+  the source fixes listed below. The DMA setting now also controls deferred CPU
+  writes, rather than forcing the unsafe path for every NX2 title. Rendering
+  with default DMA and full ASTC textures still flickers. A video confirms that
+  meshes intermittently appear at other objects’ positions. The unaligned-uniform
+  streaming fallback now synchronizes GPU-written constants before copying them
+  through CPU memory; a regression test reproduces the old stale read and verifies
+  graphics/compute binding paths under ASan/UBSan. The console retest still
+  flickers at about 50.8 FPS, with no alignment-sync activations or logged shader
+  compilation/Vulkan errors. A separate opt-in diagnostic reads
+  `/data/eden-nx2/gpu-sync-diagnostic.txt` containing `syncshaders` before Vulkan
+  initialization and logs `NX2_GPU_SYNC_DIAGNOSTIC ... applied=1` when the driver
+  flag is set. Remove the file and restart the app to restore normal scheduling.
+  Console retest confirmed the opt-in marker, 49.22 FPS over 60.17 seconds,
+  no logged shader compilation/Vulkan errors, and unchanged asset flicker.
+  Shader serialization alone did not fix the defect; it does not exclude all
+  cache visibility, shader translation, or draw-state errors. The diagnostic
+  has been disabled after this unsuccessful A/B test.
+- **Previous performance baseline: 00.064.000.** Shares CPU preparation of texture tables and sampled
   descriptors within each stage. It preserves the .063 page batching, memory-owner
   and texture-stride fixes. The build and targeted tests passed on the build server;
   the user also confirmed testing on PS5. The 20.093-second console capture records
@@ -22,12 +48,13 @@ would make a real difference. See [Contributing](#contributing) below.
 - **Source fixes since the tested .064 package:** publication review addressed
   shader-register preservation, memory-cache coherence, profiling and observer
   lifetimes, and remote build reliability. See [CUBIC-REVIEW.md](CUBIC-REVIEW.md)
-  for the fixes and targeted tests. These changes are not part of the PS5-tested
+  for the fixes and targeted tests. These changes are included in .065, but are not part of the PS5-tested
   .064 binary.
-- **Latest gameplay result: .064 at 21 FPS**, matching the reported .063 frame
-  rate, with GPU splitting disabled. No FPS improvement is observed in this user
-  feedback. These results are not a compatibility benchmark or a guarantee for
-  other games or scenes; full rendering correctness remains unvalidated.
+- **Current gameplay observations (.065):** Welcome Tour reaches 7.6–9.3 FPS in
+  the last measured intervals. Pokopia reaches 45–51 FPS with temporary stalls;
+  the user reports extensive flickering. Neither title is validated as stable.
+  GPU splitting remains disabled. Comparison with .064 still requires matching
+  scenes and effective settings.
 - **Measured bottlenecks:** a 20.112-second .063 solo capture recorded 8.650 seconds
   of CPU draw preparation/configuration, including 3.731 seconds of descriptor
   work and 2.812 seconds of resource reads. These phases are nested and must not
@@ -95,11 +122,14 @@ Builds run on the remote build server, with targeted tests and incremental chang
 Sources and patches are versioned; packages, dumps, games, keys, SDKs and reference
 working copies remain local.
 
-- Title: `PPSA99862` — **Eden NX2 Prototype**.
+- Title: `PPSA99862` — **EdGlantine PS5**.
 - Data, saves, configuration and caches: `/data/eden-nx2`.
-- Prototype entry point: `/data/eden-nx2/game/exefs/main`, alongside `main.npdm`,
+- Folder dumps: `/data/eden-nx2/roms/<Game>/exefs/main`, alongside `main.npdm`,
   the other ExeFS modules and the same game's `../romfs` directory.
-- The entry point launches if present; otherwise the standalone frontend opens.
+- The controller frontend opens at startup. Choose a game in Library and press Cross;
+  explicit `--rom` launches remain supported. Each folder dump has its own NPDM title ID.
+- The library lists complete ExeFS/RomFS folders and ordinary NSP/XCI entries. Hidden
+  upload folders and incomplete dumps are omitted; folder dumps are managed in storage.
 - Graphics and compute NX2 MME JIT enabled; legacy Maxwell macro JIT disabled.
 - Experimental GPU thread splitting inactive by default; six-core + GPU placement
   applies only if the topology is validated.
@@ -150,6 +180,17 @@ The source cache includes the NX2 patch hash: changing the patch recreates the
 prepared core and reapplies the PS5 patches before reconfiguration. Dependencies
 and flags come from ProsperoEden and are pinned in `eden/tools/deps.json`.
 A copy of the original wrapper archive is retained in `sources/`.
+
+## Memory/readback source integration — not deployed
+
+The source includes targeted adaptations from Eglantine and mucahidkambur's fork:
+unbacked-image accounting, saturated deletion/GC counters, per-heap VRAM budget
+accounting, and CPU readback of NX2 GPU-written buffers on the PS5 slow read path.
+Pages first consumed by the CPU participate in later fence downloads; mixed
+texture/buffer reads cannot skip dirty buffers. PS5 shared-pool accounting and
+the existing ASTC policy are preserved. See the [integration and validation notes](milestones/memory-readback/README.md).
+Native compilation/link, integrated checks and targeted ASan/UBSan tests passed
+on `dedie`. No new console performance or rendering result is established.
 
 ## Completed validation
 
@@ -342,3 +383,24 @@ Package files must only be installed under this project's separate title identit
 `PPSA99862`. The 00.007.000 update preserved its registration; the system entry
 could still show 00.006.000. The earlier package record listed 00.031.000; consult
 `prototype.json` and the current status above for the installed version and retained rollback.
+
+## Pokopia rendering investigation
+
+Read the [record of completed experiments](eden/docs/POKOPIA_RENDERING_INVESTIGATION.md)
+before choosing another diagnostic. It records unsuccessful settings and fixes,
+FPS measurements, capture limitations, evidence locations and remaining questions.
+Do not repeat an unchanged negative experiment without new evidence.
+
+The FSEL semantic fix is active, but flickering and the black sky remain unresolved.
+Both `syncshaders` and `fullsync` were tested without visual improvement; fullsync
+reduced performance and has been disabled for subsequent full app launches.
+The installed capture build supports main-viewport filtering, full descriptor
+snapshots and absolute paths for auxiliary requests; see the investigation record
+for the protocol and its limitations.
+
+## Bananza startup investigation
+
+See the [startup failure record](eden/docs/BANANZA_STARTUP_INVESTIGATION.md).
+The observed retries follow host file-open exhaustion, then guest null accesses.
+A bounded VFS cache and resource-error retry guard passed a focused host test;
+console validation is still required.

@@ -1,0 +1,291 @@
+--- a/src/common/settings.cpp
++++ b/src/common/settings.cpp
+@@ -223,6 +223,10 @@
+ u64 GetCurrentProgramID() {
+     return current_program_id;
+ }
++
++static bool current_program_is_switch2 = false;
++void SetCurrentProgramIsSwitch2(bool value) { current_program_is_switch2 = value; }
++bool CurrentProgramIsSwitch2() { return current_program_is_switch2; }
+ 
+ bool IsDockedMode() {
+     return values.use_docked_mode.GetValue() == Settings::ConsoleMode::Docked;
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -980,6 +980,8 @@
+ 
+ void SetCurrentProgramID(u64 program_id);
+ u64 GetCurrentProgramID();
++void SetCurrentProgramIsSwitch2(bool value);
++bool CurrentProgramIsSwitch2();
+ 
+ bool IsOpenGL();
+ 
+--- a/src/core/core.cpp
++++ b/src/core/core.cpp
+@@ -332,6 +332,9 @@
+             fs_controller.InitTempStorage();
+         }
+ 
++        Settings::SetCurrentProgramIsSwitch2(virtual_filesystem != nullptr &&
++            IsSwitch2Program(GetGameFileFromPath(virtual_filesystem, filepath)));
++
+         // Switch 2 titles size their heap from the total memory and need the 12 GiB layout. Set it
+         // as a per-game value, so RestoreGlobalState brings back the configured layout afterwards.
+         if (virtual_filesystem != nullptr &&
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -781,7 +781,12 @@
+     // GPU-written data, as with fastmem (where such reads never trap); without fastmem every
+     // read otherwise takes the rasterizer caches' locks, one 4 KiB page at a time.
+     void HandleRasterizerReadDownload(VAddr v_address, size_t size) {
+-        if (!Settings::values.use_reactive_flushing.GetValue()) {
++        // On NX2 without fastmem these reads are our only opportunity to learn
++        // which GPU-written buffers the CPU consumes. Later writes to those pages
++        // are copied at fences (BufferCache::DownloadsAtFence).
++        const bool nx2_slow_reads = Settings::CurrentProgramIsSwitch2() &&
++                                   !current_page_table->fastmem_arena;
++        if (!Settings::values.use_reactive_flushing.GetValue() && !nx2_slow_reads) {
+             return;
+         }
+         HandleRasterizerDownload(v_address, size);
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -219,7 +219,15 @@
+     DAddr device_addr_end_aligned = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
+     area->start_address = device_addr_start_aligned;
+     area->end_address = device_addr_end_aligned;
+-    if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
++    bool all_preflushable = true;
++    for (DAddr page = device_addr_start_aligned; page < device_addr_end_aligned;
++         page += Core::DEVICE_PAGESIZE) {
++        if (!memory_tracker.IsRegionPreflushable(page, Core::DEVICE_PAGESIZE)) {
++            all_preflushable = false;
++            break;
++        }
++    }
++    if (all_preflushable) {
+         area->preemtive = true;
+         return area;
+     };
+@@ -353,7 +361,7 @@
+         const DAddr diff = base_address - *cpu_src_address;
+         const DAddr new_base_address = *cpu_dest_address + diff;
+         tmp_intervals.push_back({new_base_address, size});
+-        if (AsyncBufferDownloads()) {
++        if (DownloadsAtFence(new_base_address, size)) {
+             uncommitted_gpu_modified_ranges.Add(new_base_address, size);
+         }
+     };
+@@ -1823,7 +1831,7 @@
+     }
+     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
+     gpu_modified_ranges.Add(device_addr, size);
+-    if (AsyncBufferDownloads()) {
++    if (DownloadsAtFence(device_addr, size)) {
+         uncommitted_gpu_modified_ranges.Add(device_addr, size);
+     }
+ }
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -261,6 +261,9 @@
+ 
+     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size);
+ 
++    /// CPU reads must query buffers when broad fence downloads are disabled.
++    bool FlushesOnCpuRead() const { return !AsyncBufferDownloads(); }
++
+     bool InlineMemory(DAddr dest_address, size_t copy_size, std::span<const u8> inlined_buffer);
+ 
+     void BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr, u32 size);
+@@ -546,6 +549,10 @@
+     /// read GPU-written memory at most 64 times in 200 s (counted with reactive flushing) and
+     /// the native MME's DMA reads never touched those pages. Without them a fence costs ~1 us
+     /// instead of ~5 and draw setup ~7% less. EDEN_NX2_BUFFER_DOWNLOADS=0/1 forces it.
++    bool DownloadsAtFence(DAddr device_addr, u64 size) noexcept {
++        return AsyncBufferDownloads() || memory_tracker.IsRegionPreflushable(device_addr, size);
++    }
++
+     bool AsyncBufferDownloads() const {
+         static const int forced = [] {
+             const char* value = std::getenv("EDEN_NX2_BUFFER_DOWNLOADS");
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -252,17 +252,18 @@
+         // 7 GB, which on a 12 GB card (11.2 GB budget) kept title 1 evicting textures with 3 GB
+         // unused. EDEN_NX2_TC_*_MIB overrides still win.
+         if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
+-            if (native_thresholds_applied && budget_check_frames++ % 60 == 0) {
++            if (native_thresholds_applied && budget_check_frames++ % 30 == 0) {
+                 const u64 budget = runtime.GetDeviceMemoryBudget();
+                 if (budget > 2_GiB) {
+                     const u64 old_critical = critical_memory;
+-                    critical_memory = budget - 768_MiB;
+-                    expected_memory = budget - 1536_MiB;
++                    const u64 margin = (std::min)(budget / 8, 1_GiB);
++                    critical_memory = budget - margin;
++                    expected_memory = budget - 2 * margin;
+                     // Log only real changes (the budget moves by a few MiB all the time).
+                     const u64 change = critical_memory > old_critical
+                                            ? critical_memory - old_critical
+                                            : old_critical - critical_memory;
+-                    ApplyThresholdOverrides(change >= 256_MiB);
++                    ApplyThresholdOverrides(budget_check_frames == 1 || change >= 256_MiB);
+                 }
+             }
+         }
+@@ -1828,6 +1829,27 @@
+     const u64 tentative_size = (image_size_bytes * scale_up) >> down_shift;
+     const u64 fitted_size = Common::AlignUp(tentative_size, 1024);
+     return fitted_size;
++}
++
++template <class P>
++u64 TextureCache<P>::ImageMemoryBytes(const Image& image) const {
++    // Our sparse backend binds all admitted layers before publication. Unlike the
++    // upstream lazy BindLayers path there are no later binds to account for here.
++    if (True(image.flags & ImageFlagBits::Unbacked)) {
++        return 0;
++    }
++    u64 tentative_size = (std::max)(image.guest_size_bytes, image.unswizzled_size_bytes);
++    if ((IsPixelFormatASTC(image.info.format) &&
++         True(image.flags & ImageFlagBits::AcceleratedUpload)) ||
++        True(image.flags & ImageFlagBits::Converted)) {
++        tentative_size = TranscodedAstcSize(tentative_size, image.info.format);
++    }
++    return Common::AlignUp(tentative_size, 1024);
++}
++
++template <class P>
++u64 TextureCache<P>::ReclaimableImageBytes(const Image& image) {
++    return ImageMemoryBytes(image) + (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0);
+ }
+ 
+ template <class P>
+@@ -2735,13 +2757,7 @@
+     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
+                "Trying to register an already registered image");
+     image.flags |= ImageFlagBits::Registered;
+-    u64 tentative_size = (std::max)(image.guest_size_bytes, image.unswizzled_size_bytes);
+-    if ((IsPixelFormatASTC(image.info.format) &&
+-         True(image.flags & ImageFlagBits::AcceleratedUpload)) ||
+-        True(image.flags & ImageFlagBits::Converted)) {
+-        tentative_size = TranscodedAstcSize(tentative_size, image.info.format);
+-    }
+-    total_used_memory += Common::AlignUp(tentative_size, 1024);
++    total_used_memory += ImageMemoryBytes(slot_images[image_id]);
+     image.lru_index = lru_cache.Insert(image_id, frame_tick);
+ 
+     ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, image_id](u64 page) {
+@@ -3113,16 +3129,8 @@
+             async_decode->cancelled = true;
+         }
+     }
+-    if (image.HasScaled()) {
+-        total_used_memory -= GetScaledImageSizeBytes(image);
+-    }
+-    u64 tentative_size = (std::max)(image.guest_size_bytes, image.unswizzled_size_bytes);
+-    if ((IsPixelFormatASTC(image.info.format) &&
+-         True(image.flags & ImageFlagBits::AcceleratedUpload)) ||
+-        True(image.flags & ImageFlagBits::Converted)) {
+-        tentative_size = TranscodedAstcSize(tentative_size, image.info.format);
+-    }
+-    total_used_memory -= Common::AlignUp(tentative_size, 1024);
++    // The driver/pool reading can be below the image estimates. Never wrap the counter.
++    total_used_memory -= (std::min)(total_used_memory, ReclaimableImageBytes(slot_images[image_id]));
+     const GPUVAddr gpu_addr = image.gpu_addr;
+     const auto alloc_it = image_allocs_table.find(gpu_addr);
+     if (alloc_it == image_allocs_table.end()) {
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -476,6 +476,8 @@
+     bool ScaleUp(Image& image);
+     bool ScaleDown(Image& image);
+     u64 GetScaledImageSizeBytes(const ImageBase& image);
++    u64 ImageMemoryBytes(const Image& image) const;
++    u64 ReclaimableImageBytes(const Image& image);
+ 
+     void QueueAsyncDecode(Image& image, ImageId image_id);
+     void TickAsyncDecode();
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -1603,26 +1603,19 @@
+ }
+ 
+ u64 Device::GetDeviceMemoryUsage() const {
+-    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget;
++    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+     budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+     budget.pNext = nullptr;
+     physical.GetMemoryProperties(&budget);
++    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
++    if (allocator != nullptr) {
++        vmaGetHeapBudgets(allocator, heap_budgets.data());
++    }
+     u64 result{};
+     for (const size_t heap : valid_heap_memory) {
+-        result += budget.heapUsage[heap];
+-    }
+-    // Space in VMA's blocks that no allocation uses counts as used, but freeing an image gives
+-    // its share back only once its whole block is empty: the caches, collecting until this drops,
+-    // evicted thousands of textures in a row without lowering it (title 1). Count only what
+-    // allocations use.
+-    if (allocator != nullptr) {
+-        std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
+-        vmaGetHeapBudgets(allocator, heap_budgets.data());
+-        for (const size_t heap : valid_heap_memory) {
+-            const VmaStatistics& statistics = heap_budgets[heap].statistics;
+-            const u64 unused = statistics.blockBytes - statistics.allocationBytes;
+-            result -= (std::min)(result, unused);
+-        }
++        const auto& stats = heap_budgets[heap].statistics;
++        const u64 unused = stats.blockBytes - (std::min)(stats.blockBytes, stats.allocationBytes);
++        result += budget.heapUsage[heap] - (std::min)(budget.heapUsage[heap], unused);
+     }
+     return result;
+ }
+@@ -1634,9 +1627,19 @@
+     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+     budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+     physical.GetMemoryProperties(&budget);
+-    u64 result{};
++    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
++    if (allocator != nullptr) {
++        vmaGetHeapBudgets(allocator, heap_budgets.data());
++    }
++    // Count the main device-local heap's budget once. Other heaps contribute usage,
++    // in the same units as GetDeviceMemoryUsage(), rather than another VRAM budget.
++    u64 result = budget.heapBudget[main_heap];
+     for (const size_t heap : valid_heap_memory) {
+-        result += budget.heapBudget[heap];
++        if (heap != main_heap) {
++            const auto& stats = heap_budgets[heap].statistics;
++            const u64 unused = stats.blockBytes - (std::min)(stats.blockBytes, stats.allocationBytes);
++            result += budget.heapUsage[heap] - (std::min)(budget.heapUsage[heap], unused);
++        }
+     }
+     return result;
+ }
+@@ -1660,6 +1663,11 @@
+         }
+         valid_heap_memory.push_back(element);
+         if (is_heap_local) {
++            const auto& main = mem_properties.memoryHeaps[main_heap];
++            if ((main.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0 ||
++                mem_properties.memoryHeaps[element].size > main.size) {
++                main_heap = element;
++            }
+             local_memory += mem_properties.memoryHeaps[element].size;
+         }
+         if (extensions.memory_budget) {
+--- a/src/video_core/vulkan_common/vulkan_device.h
++++ b/src/video_core/vulkan_common/vulkan_device.h
+@@ -1255,6 +1255,7 @@
+     // Telemetry parameters
+     std::set<std::string, std::less<>> supported_extensions; ///< Reported Vulkan extensions.
+     std::set<std::string, std::less<>> loaded_extensions;    ///< Loaded Vulkan extensions.
++    size_t main_heap{}; ///< Largest device-local heap; its budget is not summed twice.
+     std::vector<size_t> valid_heap_memory;                   ///< Heaps used.
+ 
+     /// Format properties dictionary.

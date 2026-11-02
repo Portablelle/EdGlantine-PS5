@@ -21,7 +21,9 @@ for statement in (
     'Settings::values.gpu_accuracy.SetValue(Settings::GpuAccuracy::Low);',
     'Settings::values.current_gpu_accuracy = Settings::GpuAccuracy::Low;',
     'Settings::values.cpu_accuracy = Settings::CpuAccuracy::Unsafe;',
-    'Settings::values.dma_accuracy.SetValue(Settings::DmaAccuracy::Unsafe);',
+    'Settings::values.dma_accuracy.SetValue(speed.unsafe_dma ?\n'
+    '                Settings::DmaAccuracy::Unsafe : Settings::DmaAccuracy::Default);',
+    'Eden::Performance::cpu_write_defer.store(speed.unsafe_dma, std::memory_order_relaxed);',
     'Settings::values.use_reactive_flushing.SetValue(speed.reactive_flushing);',
     'Settings::values.skip_cpu_inner_invalidation.SetValue(speed.skip_invalidation);',
     'Common::SetGuestMemoryFine(speed.compact_memory || dev_cram_fine);',
@@ -29,7 +31,7 @@ for statement in (
     'Settings::values.speed_limit.SetValue(static_cast<u16>(speed_percent > 0 ? speed_percent : 100));',
 ):
     assert statement in release, statement
-for guard in ('if (speed.fast_gpu) {', 'if (speed.unsafe_cpu)', 'if (speed.unsafe_dma)'):
+for guard in ('if (speed.fast_gpu) {', 'if (speed.unsafe_cpu)'):
     assert guard in release, guard
 # Every session starts at the exact levels, before the settings are read: one app run starts many
 # games, and a level the game before lowered would stay for the next one.

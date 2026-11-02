@@ -1,3 +1,4 @@
+#include "dump_paths.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Everything the launcher remembers, in one JSON file (config/prosperoeden.json):
 //
@@ -192,6 +193,7 @@ inline bool ValidRomPath(std::string_view name) {
     if (name.size() < 5 || name.size() > 511) return false;
     for (unsigned char c : name)
         if (c < 32 || c == 127 || c == '\\') return false;
+    if (DumpPaths::ValidEntry(name)) return true;
     if (const auto slash = name.find('/'); slash != std::string_view::npos) {
         if (slash == 0 || name[0] == '.' || name.find('/', slash + 1) != std::string_view::npos) return false;
         if (slash > 255 || name.size() - slash - 1 < 5 || name.size() - slash - 1 > 255) return false;

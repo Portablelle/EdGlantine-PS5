@@ -1,0 +1,291 @@
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1,3 +1,4 @@
++#include "video_core/position_capture_gate.h"
+ #include "video_core/native_wait_profile.h"
+ #include "video_core/native_draw_indirect.h"
+ // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+@@ -214,6 +215,16 @@
+ }
+ } // Anonymous namespace
+ 
++struct RasterizerVulkan::NativeDrawCaptureSession {
++    u32 native_capture_count{};
++    bool requested_capture{};
++    u32 requested_skip{}, requested_limit{64};
++    bool requested_targets{};
++    u64 requested_shader_hash{};
++    u32 position_capture_poll{};
++    Eden::PositionCaptureGate position_capture_gate;
++};
++
+ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra::GPU& gpu_,
+                                    Tegra::MaxwellDeviceMemoryManager& device_memory_,
+                                    const Device& device_, MemoryAllocator& memory_allocator_,
+@@ -242,6 +253,7 @@
+       accelerate_dma(buffer_cache, texture_cache, scheduler),
+       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
+       wfi_event(device.GetLogical().CreateEvent()) {
++    native_capture_session = std::make_unique<NativeDrawCaptureSession>();
+     scheduler.SetQueryCache(query_cache);
+ }
+ 
+@@ -378,33 +390,45 @@
+     draw_func();
+     submitted = true;
+     buffer_cache.runtime.FlushStorageWrites();
+-    static u32 native_capture_count{};
+-    static bool requested_capture{};
+-    static u32 requested_skip{}, requested_limit{64};
+-    static bool requested_targets{};
+-    static u64 requested_shader_hash{};
+-    static const bool draw_requests_enabled = std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") ||
+-                                              std::getenv("EDEN_NATIVE_DRAW_ON_DEMAND");
+-    if (maxwell3d->GetNativeMacroEngine().native_turing && draw_requests_enabled) {
++#ifdef EDEN_NX2_PS5_PROTO
++    CaptureNativeDraw(is_indexed);
++#endif
++}
++
++void RasterizerVulkan::CaptureNativeDraw(bool is_indexed) {
++#ifdef EDEN_NX2_PS5_PROTO
++    auto& native_capture_count = native_capture_session->native_capture_count;
++    auto& requested_capture = native_capture_session->requested_capture;
++    auto& requested_skip = native_capture_session->requested_skip;
++    auto& requested_limit = native_capture_session->requested_limit;
++    auto& requested_targets = native_capture_session->requested_targets;
++    auto& requested_shader_hash = native_capture_session->requested_shader_hash;
++    auto& position_capture_poll = native_capture_session->position_capture_poll;
++    auto& position_capture_gate = native_capture_session->position_capture_gate;
++    constexpr bool draw_requests_enabled = true;
++    if (maxwell3d->GetNativeMacroEngine().native_turing && draw_requests_enabled &&
++        (++position_capture_poll % 256) == 0 && !requested_capture) {
+         std::error_code error;
+-        if (std::filesystem::exists("native-draw.request", error)) {
+-            u32 skip{}, count{64}, targets{};
+-            std::ifstream request("native-draw.request");
+-            if (!(request >> skip >> count >> targets) || skip > 16384 || !count || count > 2048 || targets > 1) {
++        if (std::filesystem::exists("/data/eden-nx2/position-capture.request", error)) {
++            u32 skip{}, count{16}, targets{};
++            std::ifstream request("/data/eden-nx2/position-capture.request");
++            if (!(request >> skip >> count >> targets) || skip > 16384 || !count || count > 32 || (targets != 0 && targets != 2 && targets != 3)) {
+                 skip = 0;
+-                count = 64;
++                count = 16;
+                 targets = 0;
+             }
+             u64 shader_hash{};
+             request >> std::hex >> shader_hash;
+             request.close();
+-            if (std::filesystem::remove("native-draw.request", error)) {
++            if (std::filesystem::remove("/data/eden-nx2/position-capture.request", error)) {
+                 native_capture_count = 0;
+                 requested_capture = true;
+                 requested_skip = skip;
+                 requested_limit = count;
+                 LOG_INFO(HW_GPU, "Native draw request: skip={}, count={}, targets={}", skip, count, targets);
+-                requested_targets = targets != 0;
++                requested_targets = false;
++                position_capture_gate.Reset(targets, skip);
++                LOG_INFO(HW_GPU, "NX2_POSITION_CAPTURE scope={}", targets);
+                 requested_shader_hash = shader_hash;
+                 LOG_INFO(HW_GPU, "Native draw fragment filter: {:#x}", shader_hash);
+             }
+@@ -425,13 +449,27 @@
+             matches_shader = hash == requested_shader_hash;
+         }
+     }
++    if (requested_capture) {
++        const auto& r = maxwell3d->regs;
++        const auto& vp = r.viewport_transform[0];
++        const auto address = [&](size_t stage) {
++            return (GPUVAddr{r.pipelines[stage].reserved[0] & 0xff} << 32) |
++                   r.pipelines[stage].reserved[1];
++        };
++        matches_shader = position_capture_gate.Accept(vp.scale_x, vp.scale_y, address(1), address(5),
++                                                     requested_skip == 0 && matches_shader);
++        if (position_capture_gate.Exhausted()) {
++            requested_capture = false;
++            LOG_INFO(HW_GPU, "NX2_POSITION_CAPTURE complete draws={} budget=1", native_capture_count);
++        }
++    }
+     const bool capture_requested = requested_capture && requested_skip == 0 && matches_shader;
+     if (requested_capture && requested_skip) --requested_skip;
+     if (maxwell3d->GetNativeMacroEngine().native_turing &&
+         ((VideoCommon::NativeDrawCaptureEnabled() && native_capture_count < 16) || capture_requested)) {
+         const bool on_demand = requested_capture;
+         const u32 capture = native_capture_count++;
+-        const auto prefix = fmt::format("{}{}", on_demand ? "native-requested-draw-" : "native-draw-", capture);
++        const auto prefix = fmt::format("/data/eden-nx2/logs/position-capture-draw-{}", capture);
+         if (on_demand && native_capture_count >= requested_limit) requested_capture = false;
+         const auto dump = [&](const std::string& name, GPUVAddr address, size_t size) {
+             if (!size || !gpu_memory->IsFullyMappedRange(address, size)) return;
+@@ -444,7 +482,7 @@
+                      std::count_if(bytes.begin(), bytes.end(), [](u8 byte) { return byte != 0; }));
+         };
+         if (on_demand && capture == 0) {
+-            std::ifstream request("native-memory.request");
++            std::ifstream request("/data/eden-nx2/position-memory.request");
+             if (request) {
+                 GPUVAddr address{};
+                 size_t length{};
+@@ -462,11 +500,11 @@
+                 }
+                 request.close();
+                 std::error_code error;
+-                std::filesystem::remove("native-memory.request", error);
++                std::filesystem::remove("/data/eden-nx2/position-memory.request", error);
+             }
+         }
+         if (on_demand && capture == 0) {
+-            std::ifstream request("native-textures.request");
++            std::ifstream request("/data/eden-nx2/position-textures.request");
+             if (request) {
+                 u32 index{};
+                 for (u32 entry = 0; entry < 16 && (request >> index); ++entry) {
+@@ -536,7 +574,7 @@
+                 }
+                 request.close();
+                 std::error_code error;
+-                std::filesystem::remove("native-textures.request", error);
++                std::filesystem::remove("/data/eden-nx2/position-textures.request", error);
+             }
+         }
+         const auto& regs = maxwell3d->regs;
+@@ -576,8 +614,10 @@
+                 dump(fmt::format("-vertex-{}", stream), regs.vertex_streams[stream].Address(), 128);
+         }
+         if (on_demand) {
+-            dump("-tic", regs.tex_header.Address(), (std::min)(u64{regs.tex_header.limit} + 1, u64{8192}) * 32);
+-            dump("-tsc", regs.tex_sampler.Address(), (std::min)(u64{regs.tex_sampler.limit} + 1, u64{8192}) * 32);
++                dump(fmt::format("-tic-{:x}", regs.tex_header.Address()), regs.tex_header.Address(),
++                     (std::min)(u64{regs.tex_header.limit} + 1, u64{65536}) * 32);
++                dump(fmt::format("-tsc-{:x}", regs.tex_sampler.Address()), regs.tex_sampler.Address(),
++                     (std::min)(u64{regs.tex_sampler.limit} + 1, u64{8192}) * 32);
+             for (size_t stage : {1U, 5U}) {
+                 if (!regs.IsShaderConfigEnabled(stage)) continue;
+                 const auto& stage_config = regs.pipelines[stage];
+@@ -589,22 +629,61 @@
+                 dump(fmt::format("-shader-{}", stage), address, shader_size);
+             }
+         }
++        std::ofstream layout(prefix + "-layout.txt");
++        const auto& draw = maxwell3d->draw_manager.draw_state;
++        layout << "draw " << is_indexed << ' ' << draw.vertex_buffer.first << ' '
++               << draw.vertex_buffer.count << ' ' << draw.base_index << ' '
++               << draw.index_buffer.first << ' ' << draw.index_buffer.count << ' '
++               << draw.base_instance << ' ' << draw.instance_count << ' '
++               << static_cast<u32>(draw.topology) << '\n';
++        layout << "snapshot after_draw cpu_before_download gpu_after_download\n";
++        layout << "viewport " << regs.viewport_transform[0].scale_x << ' '
++               << regs.viewport_transform[0].scale_y << '\n';
++        layout << "tables " << std::hex << regs.tex_header.Address() << ' ' << regs.tex_header.limit
++               << ' ' << regs.tex_sampler.Address() << ' ' << regs.tex_sampler.limit << std::dec << '\n';
++        for (size_t stream = 0; stream < regs.vertex_streams.size(); ++stream) {
++            const auto& input = regs.vertex_streams[stream];
++            const u64 length = regs.NativeVertexStreamSize(stream);
++            if (!input.IsEnabled() || !length || length > 64 * 1024 * 1024) continue;
++            layout << "vertex_mapping " << stream << ' ' << std::hex << input.Address() << ' ' << length
++                   << ' ' << gpu_memory->GpuToCpuAddress(input.Address()).value_or(0) << std::dec
++                   << ' ' << gpu_memory->IsFullyMappedRange(input.Address(), length)
++                   << ' ' << gpu_memory->IsContinuousRange(input.Address(), length) << '\n';
++        }
+         for (size_t stage : {0U, 4U}) {
+             const auto& buffers = maxwell3d->state.shader_stages[stage].const_buffers;
+             for (size_t bank = 0; bank < buffers.size(); ++bank) {
+                 if (!on_demand && bank != 2 && bank != 3) continue;
+                 if (on_demand && Tegra::NativeRootTables::IsBank(static_cast<u32>(bank))) {
+                     const auto& words = maxwell3d->native_root_tables.Data(static_cast<u32>(bank));
++                    layout << "root " << stage << ' ' << bank << ' ' << sizeof(words) << '\n';
+                     std::ofstream file(fmt::format("{}-cbuf-{}-{}.bin", prefix, stage, bank), std::ios::binary);
+                     file.write(reinterpret_cast<const char*>(words.data()), sizeof(words));
+                     continue;
+                 }
+                 const auto& cb = buffers[bank];
+-                if (cb.enabled) dump(fmt::format("-cbuf-{}-{}", stage, bank), cb.address,
+-                    std::min<size_t>(cb.size, on_demand ? 65536 : 128));
+-            }
+-        }
+-    }
++                const size_t length = std::min<size_t>(cb.size, 65536);
++                layout << "cbuf " << stage << ' ' << bank << ' ' << cb.enabled << ' '
++                       << std::hex << cb.address << ' ' << length << std::dec << '\n';
++                if (!cb.enabled || !length || !gpu_memory->IsFullyMappedRange(cb.address, length)) continue;
++                dump(fmt::format("-cbuf-{}-{}", stage, bank), cb.address, length);
++                // The first file is the CPU view, not evidence of current GPU contents.
++                // Download only the selected, bounded range, retaining both for comparison.
++                for (const auto& [address, size] : gpu_memory->GetSubmappedRange(cb.address, length)) {
++                    if (const auto device = gpu_memory->GpuToCpuAddress(address))
++                        buffer_cache.DownloadMemory(*device, size);
++                }
++                dump(fmt::format("-cbuf-synced-{}-{}", stage, bank), cb.address, length);
++            }
++        }
++        layout.close();
++        registers.close();
++        if (on_demand && !requested_capture)
++            LOG_INFO(HW_GPU, "NX2_POSITION_CAPTURE complete draws={}", native_capture_count);
++    }
++#else
++    (void)is_indexed;
++#endif
+ }
+ 
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <array>
++#include <memory>
+ #include <unordered_map>
+ 
+ #include <boost/container/static_vector.hpp>
+@@ -150,6 +151,9 @@
+                                                             u32 pixel_stride);
+ 
+ private:
++    struct NativeDrawCaptureSession;
++    std::unique_ptr<NativeDrawCaptureSession> native_capture_session;
++    void CaptureNativeDraw(bool is_indexed);
+     static constexpr const u64 NEEDS_D24[] = {
+         0x01006A800016E000ULL, // SSBU
+         0x0100E95004038000ULL, // XC2
+diff --git a/src/video_core/position_capture_gate.h b/src/video_core/position_capture_gate.h
+new file mode 100644
+--- /dev/null
++++ b/src/video_core/position_capture_gate.h
+@@ -0,0 +1,30 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <set>
++
++namespace Eden {
++class PositionCaptureGate {
++public:
++    void Reset(unsigned new_scope, unsigned initial_skip = 0) {
++        scope = new_scope;
++        observed = 0;
++        budget = 2048 + std::min(initial_skip, 16384U);
++        programs.clear();
++    }
++    bool Accept(float scale_x, float scale_y, std::uint64_t vertex,
++                std::uint64_t fragment, bool eligible) {
++        if (++observed > budget) return false;
++        if (!eligible) return false;
++        if (scope >= 2 && !((scale_x == 960.f || scale_x == -960.f) &&
++                            (scale_y == 540.f || scale_y == -540.f))) return false;
++        return scope != 3 || programs.insert({vertex, fragment}).second;
++    }
++    bool Exhausted() const { return observed > budget; }
++private:
++    unsigned scope{}, observed{}, budget{2048};
++    std::set<std::array<std::uint64_t, 2>> programs;
++};
++} // namespace Eden

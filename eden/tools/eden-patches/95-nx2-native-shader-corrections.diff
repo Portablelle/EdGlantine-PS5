@@ -1,0 +1,130 @@
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -70,8 +70,55 @@
+ // Lower only operations whose semantics are representable by the existing
+ // Maxwell frontend. These are new instructions, not reinterpretations of the
+ // native bytes. Scheduling/control words are added by the environment adapter.
++// A canceled inner PBK may be discarded by the immediately enclosing SSY.
++// Prove the selected path skips the inner join and reaches the parent's join
++// using only register cleanup and unconditional forward branches. This also
++// handles BREAK/BRA with both an execution and a second condition predicate.
++inline bool VerifiedParentCancellation(std::span<const Instruction> code, u32 at,
++                                       u32 inner_at, u32 parent_at) {
++    if (at >= code.size() || code.size() - at < 2 ||
++        inner_at >= code.size() || parent_at >= code.size()) return false;
++    const auto& cancel = code[at];
++    const auto& branch = code[at + 1];
++    const auto& inner = code[inner_at];
++    const auto& parent = code[parent_at];
++    const auto target = [](const Instruction& instruction, u32 pc) {
++        const u64 raw = instruction.words[1] | (u64{instruction.words[2] & 0x3ffff} << 32);
++        return s64{pc + 1} * 16 + (static_cast<s64>(raw << 14) >> 14);
++    };
++    if (cancel.Bits(0, 12) != 0x942 || cancel.words[1] ||
++        (cancel.words[0] & ~0x0000f000U) != (0x942U | (inner.Bits(16, 4) << 16)) ||
++        (cancel.words[2] & ~0x07800000U) ||
++        branch.words[0] != (0x947U | (cancel.Bits(12, 4) << 12)) ||
++        (branch.words[2] & ~0x3ffffU) != cancel.words[2]) return false;
++    const s64 inner_end = s64{inner_at + 1} * 16 + static_cast<s32>(inner.words[1]);
++    const s64 join = s64{parent_at} * 16 + static_cast<s32>(parent.words[1]);
++    s64 pc = target(branch, at + 1);
++    if (pc < 0 || inner_end < 0 || pc < inner_end || pc > join || pc % 16 || join < 0 || join % 16 ||
++        static_cast<u64>(join / 16) >= code.size()) return false;
++    const auto& sync = code[join / 16];
++    if (sync.words[0] != (0x7941U | (parent.Bits(16, 4) << 16)) ||
++        sync.words[1] || sync.words[2] != 0x03800000U) return false;
++    while (pc < join) {
++        const auto& instruction = code[pc / 16];
++        const u32 op = instruction.Bits(0, 12);
++        if (op == 0x947) {
++            if (instruction.words[0] != 0x7947U ||
++                (instruction.words[2] & ~0x3ffffU) != 0x03800000U) return false;
++            const s64 next = target(instruction, static_cast<u32>(pc / 16));
++            if (next <= pc || next > join || next % 16) return false;
++            pc = next;
++        } else {
++            if (op != 0x202 && op != 0x802 && op != 0xa02 &&
++                op != 0x224 && op != 0x824 && op != 0xa24 && op != 0x918) return false;
++            pc += 16;
++        }
++    }
++    return true;
++}
++
+ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
+-                                     std::span<const u32> verified_traps = {}, bool allow_register_spills = false) {
++                                     std::span<const u32> verified_traps = {}, bool allow_register_spills = false, bool correct_float_select = false) {
+     LoweredProgram result;
+     struct Relocation { u32 output_index; s64 target; bool call = false; u32 output_target = ~0U; };
+     std::vector<Relocation> relocations;
+@@ -80,6 +127,7 @@
+     std::vector<u32> cancellation_parent_scopes;
+     std::vector<s64> barrier_targets;
+     std::vector<u32> validated_barrier_cancellations;
++    std::vector<u32> parent_barrier_cancellations;
+     s64 last_outer_sync_target = -1;
+     u32 last_outer_sync_token = ~0U;
+     const bool has_barrier_break = std::any_of(code.begin(), code.end(), [](const auto& instruction) {
+@@ -211,6 +259,10 @@
+                 const auto& inner = code[scopes.back()];
+                 const u32 parent_index = scopes[scopes.size() - 2];
+                 const auto& parent = code[parent_index];
++                if (VerifiedParentCancellation(code, at, scopes.back(), parent_index)) {
++                    cancellation_parent_scopes.push_back(parent_index);
++                    parent_barrier_cancellations.push_back(at);
++                }
+                 const s64 join = s64{parent_index} * 16 + static_cast<s32>(parent.words[1]);
+                 const s64 inner_join = s64{scopes.back()} * 16 + static_cast<s32>(inner.words[1]);
+                 const u32 pred = op.Bits(12, 4);
+@@ -593,6 +645,20 @@
+                     emit(base(0x5ca0000000000000ULL) | (dest << 8) | (u64{254} << 20) |
+                          (u64{insn.Bits(87, 4)} << 39));
+             }
++            break;
++        }
++        case 0x234: { // HSETP2 register pair; each half writes a predicate.
++            const u32 combine = insn.Bits(69, 2);
++            if (insn.Bits(16, 8) || insn.Bits(64, 5) || combine > 2 || insn.Bits(91, 1) ||
++                (insn.words[1] & 0x0fffff00U))
++                return fail(index, "native register half predicate mode");
++            const auto a = half_source(0), b = half_source(1);
++            emit(0x5d20000000000000ULL | predicate | (u64{insn.Bits(81, 3)} << 3) |
++                 insn.Bits(84, 3) | (u64{a.reg} << 8) | (u64{b.reg} << 20) |
++                 (u64{b.swizzle} << 28) | (u64{b.absolute} << 30) | (u64{b.negate} << 31) |
++                 (u64{insn.Bits(76, 4)} << 35) | (u64{insn.Bits(87, 4)} << 39) |
++                 (u64{a.negate} << 43) | (u64{a.absolute} << 44) | (u64{combine} << 45) |
++                 (u64{a.swizzle} << 47) | (u64{insn.Bits(71, 1)} << 49) | (u64{insn.Bits(80, 1)} << 6));
+             break;
+         }
+         case 0x434: { // HSETP2.GEU.AND, packed immediate and independent half predicates.
+@@ -3078,7 +3144,7 @@
+         case 0x208: case 0x808: case 0xa08: { // Bitwise SEL / FSEL
+             // FSEL carries abs/neg on both selected operands (bits 73/72 and 62/63, as for FADD).
+             // Off by default until it is proven not to change FastFusion colours: EDEN_NATIVE_LOWER_ENABLE=audit_fsel.
+-            const bool floating = (opcode & 0x1ff) == 0x8 && LowerGroupEnabled("audit_fsel");
++            const bool floating = (opcode & 0x1ff) == 0x8 && (correct_float_select || LowerGroupEnabled("audit_fsel"));
+             const u32 a = operand(0, floating), b = operand(1, floating);
+             emit(base(0x5ca0000000000000ULL) | (u64{a} << 8) | (u64{b} << 20) |
+                 (u64{insn.Bits(87, 3)} << 39) | (u64{insn.Bits(90, 1)} << 42));
+@@ -3816,6 +3882,8 @@
+             // together so the next BREAK is not mistaken for a fresh inner cancellation.
+             if (std::ranges::find(validated_barrier_cancellations, index) != validated_barrier_cancellations.end()) break;
+             if (barrier_tokens.size() < 2) return fail(index, "native barrier cancellation mode");
++            if (std::ranges::find(parent_barrier_cancellations, index) != parent_barrier_cancellations.end() &&
++                !barrier_sync_scopes.back() && barrier_sync_scopes[barrier_sync_scopes.size() - 2]) break;
+             if (!barrier_sync_scopes.back() && barrier_sync_scopes[barrier_sync_scopes.size() - 2] &&
+                 index + 1 < code.size() && insn.words[0] ==
+                     ((barrier_tokens.back() << 16) | (native_predicate << 12) | 0x942) &&
+diff --git a/src/shader_recompiler/frontend/ir/attribute.h b/src/shader_recompiler/frontend/ir/attribute.h
+--- a/src/shader_recompiler/frontend/ir/attribute.h
++++ b/src/shader_recompiler/frontend/ir/attribute.h
+@@ -238,7 +238,7 @@
+ constexpr size_t NUM_FIXEDFNCTEXTURE = 10;
+ 
+ [[nodiscard]] inline bool IsGeneric(Attribute attribute) noexcept {
+-    return attribute >= Attribute::Generic0X && attribute <= Attribute::Generic31X;
++    return attribute >= Attribute::Generic0X && attribute <= Attribute::Generic31W;
+ }
+ 
+ [[nodiscard]] inline bool IsLegacyAttribute(Attribute attribute) noexcept {

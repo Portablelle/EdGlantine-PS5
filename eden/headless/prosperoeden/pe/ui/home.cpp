@@ -78,7 +78,7 @@ void Launcher::open_game_settings_from_home(const std::string &file)
 
 void Launcher::press_home(Key key)
 {
-    const bool ready = home_.setup_ready;
+    const bool ready = home_.setup_ready || home_.last_standalone;
     const bool minimal = th().minimal_home;
     const int count = static_cast<int>(games_.size());
 
@@ -120,7 +120,7 @@ void Launcher::press_home(Key key)
             return;
         case Key::cross:
         {
-            if (count == 0 || !ready)
+            if (count == 0 || !GameReady(home_.setup_ready, games_[static_cast<std::size_t>(library_.selected)]))
             {
                 cue(Cue::error);
                 return;
@@ -221,7 +221,7 @@ void Launcher::press_home(Key key)
             return;
         case Key::cross:
             press_ = 1.0f;
-            if (home_focus_ == kMain && has_game && !game->remote)
+            if (home_focus_ == kMain && has_game && !game->remote && GameReady(home_.setup_ready, *game))
                 launch(game->file, game->name, game->cover);
             else if (home_focus_ == kMain && !ready)
                 go_section(3);
@@ -394,7 +394,7 @@ void Launcher::draw_home(Canvas &c)
 {
     gfx::DrawList &list = c.list;
     const Theme &t = th();
-    const bool ready = home_.setup_ready;
+    const bool ready = home_.setup_ready || home_.last_standalone;
     const bool continue_ready = ready && home_.last_exists;
     const bool minimal = t.minimal_home;
     const auto focus = [&](int index) { return home_springs_[static_cast<std::size_t>(index)].value; };
@@ -550,7 +550,7 @@ void Launcher::draw_home(Canvas &c)
             const Rect first{cx, card.y + card.h - 36.0f - 68.0f - 14.0f - 76.0f, cw, 76.0f};
             const Rect second{cx, card.y + card.h - 36.0f - 68.0f, cw, 68.0f};
             primary_button(c, first, tr("Play"), translate_hint(Pad::cross), focus(kMain), press_,
-                           has_game && ready);
+                           has_game && GameReady(home_.setup_ready, *game));
             secondary_button(c, second, tr("Game settings"), translate_hint(Pad::triangle),
                              focus(kGameSettings), press_, has_game && game->title_id != 0);
         }

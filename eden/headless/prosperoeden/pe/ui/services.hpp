@@ -89,7 +89,13 @@ struct Game
     std::string key;
     // Not on the console yet: on its sources only. Its file is the name it gets in roms/.
     bool remote = false;
+    // A validated decrypted folder dump: container keys are not a launch prerequisite.
+    bool standalone = false;
 };
+
+inline bool GameReady(bool setup_ready, const Game& game) {
+    return setup_ready || game.standalone;
+}
 
 // A download source: a place on the network with Switch games (headless/remote/remote.h).
 struct SourceInfo
@@ -242,6 +248,7 @@ struct Home
     bool launch_failed = false; // the status is about the game that just failed to start
     std::string last_file; // the last game played; empty before the first one
     bool last_exists = false;
+    bool last_standalone = false;
     std::string last_title;
     std::string last_caption;
     bool last_caption_warning = false; // the caption says what is wrong with the game
