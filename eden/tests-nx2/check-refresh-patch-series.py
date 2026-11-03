@@ -13,8 +13,9 @@ with tempfile.TemporaryDirectory(prefix='eglantine-series-') as temporary:
     for patch in patches:
         with patch.open('rb') as stream:
             subprocess.run(['patch','-p1','-N','-s','-f'],cwd=tree,stdin=stream,check=True)
-    paths = re.findall(r'^\+\+\+ b/(.+)$', patches[-1].read_text(), re.M)
-    assert paths and patches[-1].name == '99i-eglantine-coherence-memory.diff'
+    refresh = next(p for p in patches if p.name == '99i-eglantine-coherence-memory.diff')
+    paths = re.findall(r'^\+\+\+ b/(.+)$', refresh.read_text(), re.M)
+    assert paths
     for path in paths:
         assert (tree/path).read_bytes() == (source/path).read_bytes(), path
     print(f'PASS full ordered patch series; {len(paths)} refresh files match the build source')
