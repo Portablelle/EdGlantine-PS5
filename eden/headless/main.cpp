@@ -1834,7 +1834,7 @@ int main(int argc, char** argv) {
                 // Session commands and diagnostic deadlines must progress even with no HUD.
                 std::jthread runtime_control([&](std::stop_token stop) {
                     Eden::Performance::ProfilingSession profiling;
-                    auto next_memory_report = session_start + std::chrono::seconds(30);
+                    auto next_memory_report = session_start + std::chrono::seconds(10);
 #ifdef EDEN_NX2_PS5_PROTO
                     Eden::RuntimeControl commands(Eden::AppFile("split-enable.request"),
                                                   Eden::AppFile("profile-refresh.request"));
@@ -1849,7 +1849,7 @@ int main(int argc, char** argv) {
                         const auto now = std::chrono::steady_clock::now();
                         if (game && now >= next_memory_report) {
                             Eden::Performance::ReportSessionMemory("play", 0);
-                            next_memory_report = now + std::chrono::seconds(30);
+                            next_memory_report = now + std::chrono::seconds(10);
                         }
                         std::this_thread::sleep_for(std::chrono::milliseconds(50));
                     }

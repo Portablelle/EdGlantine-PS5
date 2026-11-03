@@ -196,6 +196,11 @@ void *eden_heap_pages(size_t size) {
     void *address = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     return address == MAP_FAILED ? NULL : address;
 }
+void eden_direct_memory_failure_record(void) {}
+void eden_direct_memory_failure_read(int64_t *free_bytes, size_t *largest) {
+    *free_bytes = -1;
+    *largest = (size_t)-1;
+}
 void eden_heap_pages_free(void *address, size_t size) { munmap(address, size); }
 '''
 

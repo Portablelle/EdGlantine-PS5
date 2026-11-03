@@ -59,7 +59,7 @@ namespace Tegra::Memory {
   operator std::span<T>(){return data;}
  };
 }
-std::vector<BufferImageCopy> UnswizzleImage(Memory&,u64,const ImageInfo&,std::span<u8> src,std::vector<u8>& dst){std::copy(src.begin(),src.end(),dst.begin());return {{}};}
+std::vector<BufferImageCopy> UnswizzleImage(Memory& m,u64,const ImageInfo&,std::span<u8> src,std::vector<u8>& dst,Common::ScratchBuffer<u8>* = nullptr){if(src.empty())src=m.bytes;std::copy(src.begin(),src.end(),dst.begin());return {{}};}
 void ConvertedLayout(const ImageInfo&,std::vector<BufferImageCopy>&){}
 int conversions=0;
 void ConvertImage(std::span<const u8> in,const ImageInfo&,std::span<u8> out,std::span<BufferImageCopy>){++conversions;std::copy(in.begin(),in.end(),out.begin());}

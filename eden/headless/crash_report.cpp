@@ -31,6 +31,7 @@ std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::int64_t, std:
 std::size_t eden_heap_committed(void);
 std::size_t eden_heap_large_held(unsigned* blocks);
 std::size_t eden_heap_last_failure(unsigned* why, std::size_t* count);
+void eden_direct_memory_failure_read(std::int64_t*, std::size_t*) noexcept;
 #endif
 // The app's code, from the link (tools/unwind.ld).
 extern const char __eden_text_start[];
@@ -319,6 +320,22 @@ void PutGuestMemoryOom() noexcept {
 #endif
 }
 
+#ifdef PS5_NATIVE
+void PutHeapRefusalMemory() noexcept {
+    auto& t = report;
+    std::int64_t free_bytes = -1;
+    std::size_t largest = 0;
+    eden_direct_memory_failure_read(&free_bytes, &largest);
+    t.Put(" (free ");
+    if (free_bytes >= 0) t.Dec(static_cast<std::uint64_t>(free_bytes) >> 20);
+    else t.Put("unknown");
+    t.Put(" MiB, largest ");
+    if (largest != static_cast<std::size_t>(-1)) t.Dec(largest >> 20);
+    else t.Put("unknown");
+    t.Put(" MiB at the time)");
+}
+#endif
+
 // The report, complete in its buffer.
 void Compose(const Kind* kind, int code, std::uint64_t address, const Registers& r, const char* reason,
              const Stamp& stamp, bool restart) noexcept {
@@ -410,6 +427,9 @@ void Compose(const Kind* kind, int code, std::uint64_t address, const Registers&
                 t.Put(" bytes");
             }
             t.Put(why < sizeof(kWhy) / sizeof(kWhy[0]) ? kWhy[why] : "");
+            if (why == 2) {
+                PutHeapRefusalMemory();
+            }
             t.Put('\n');
         }
     }

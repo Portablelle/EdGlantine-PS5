@@ -417,6 +417,7 @@ void SampleGpuFrame(unsigned frame) {
 extern "C" void ps5_opengl_heap_snapshot(const char* phase, unsigned iteration);
 extern "C" unsigned eden_heap_arenas_created(void) __attribute__((weak));
 extern "C" std::size_t eden_heap_committed(void) __attribute__((weak));
+extern "C" std::uint64_t eden_vulkan_memory_bytes(void) __attribute__((weak));
 extern "C" std::size_t eden_heap_large_held(unsigned* blocks) __attribute__((weak));
 #ifdef PS5_NATIVE
 extern "C" std::int64_t sceKernelGetDirectMemorySize();
@@ -698,9 +699,10 @@ void ReportSessionMemory(const char* phase, unsigned session) {
     }
 #endif
     std::printf("EDEN_SESSION_MEMORY phase=%s session=%u total=%lld free=%lld largest_free=%zu regions=%u "
-                "heap_pieces=%zu heap_large=%zu large_blocks=%u tables=%zu\n",
+                "heap_pieces=%zu heap_large=%zu large_blocks=%u tables=%zu gpu_bytes=%llu\n",
                 phase, session, total, free_bytes, largest, regions,
-                eden_heap_committed ? eden_heap_committed() : std::size_t{0}, large, large_blocks, table_held);
+                eden_heap_committed ? eden_heap_committed() : std::size_t{0}, large, large_blocks, table_held,
+                static_cast<unsigned long long>(eden_vulkan_memory_bytes ? eden_vulkan_memory_bytes() : 0));
     std::fflush(stdout);
 }
 

@@ -90,6 +90,27 @@ extern "C" void eden_direct_memory_free(std::int64_t* free_bytes, std::size_t* l
 #endif
 }
 
+namespace {
+static_assert(std::atomic<std::int64_t>::is_always_lock_free);
+static_assert(std::atomic<std::size_t>::is_always_lock_free);
+std::atomic<std::int64_t> refused_free{-1};
+std::atomic<std::size_t> refused_largest{static_cast<std::size_t>(-1)};
+}
+
+// Keep the pool at refusal, before unwinding or another thread gives memory back.
+extern "C" void eden_direct_memory_failure_record() noexcept {
+    std::int64_t free_bytes = -1;
+    std::size_t largest = 0;
+    eden_direct_memory_free(&free_bytes, &largest);
+    refused_free.store(free_bytes, std::memory_order_relaxed);
+    refused_largest.store(largest, std::memory_order_release);
+}
+
+extern "C" void eden_direct_memory_failure_read(std::int64_t* free_bytes, std::size_t* largest) noexcept {
+    *largest = refused_largest.load(std::memory_order_acquire);
+    *free_bytes = refused_free.load(std::memory_order_relaxed);
+}
+
 namespace Common {
 namespace {
 // The header sits in the page before the data. Blocks of at least LargePage start their data
@@ -164,14 +185,22 @@ void* AllocatePagesAt(std::size_t size, [[maybe_unused]] std::uintptr_t hint) no
     const auto limit = sceKernelGetDirectMemorySize();
     auto rc = sceKernelAllocateDirectMemory(0, limit, total, lead, 12, &physical);
     if (rc != 0) {
-        std::fprintf(stderr, "Direct allocation failed: rc=%08x bytes=%zu limit=%lld\n",
-                     unsigned(rc), total, static_cast<long long>(limit));
+        eden_direct_memory_failure_record();
+        char line[128];
+        const int length = std::snprintf(line, sizeof(line),
+            "Direct allocation failed: rc=%08x bytes=%zu limit=%lld\n",
+            unsigned(rc), total, static_cast<long long>(limit));
+        if (length > 0) Note(line);
         errno = ENOMEM;
         return nullptr;
     }
     rc = sceKernelMapDirectMemory(&base, total, PROT_READ | PROT_WRITE, 0, physical, lead);
     if (rc != 0 || !cpu_mapping_address(base)) {
-        std::fprintf(stderr, "Direct mapping failed: rc=%08x bytes=%zu\n", unsigned(rc), total);
+        eden_direct_memory_failure_record();
+        char line[96];
+        const int length = std::snprintf(line, sizeof(line),
+            "Direct mapping failed: rc=%08x bytes=%zu\n", unsigned(rc), total);
+        if (length > 0) Note(line);
         if (rc == 0 && base && base != MAP_FAILED && munmap(base, total) != 0) std::abort();
         if (sceKernelReleaseDirectMemory(physical, total) != 0) std::abort();
         errno = ENOMEM;

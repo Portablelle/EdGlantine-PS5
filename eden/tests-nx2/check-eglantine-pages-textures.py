@@ -151,8 +151,12 @@ code += function(text,'[[nodiscard]] constexpr u32 CalculateLevelOffset(')
 code += function(text,'[[nodiscard]] constexpr u32 AlignLayerSize(')
 code += function(text,'u32 CalculateLayerSize(')
 code += function(text,'u32 CalculateLayerStride(')
+code += function(text,'u32 CalculateGuestSizeInBytes(')
+if 'bool SwizzleBlockLinearSlices(' in text:
+    code += function(text,'template <bool swizzle>\nbool SwizzleBlockLinearSlices(')
 for sig in ['void SwizzleBlockLinearImage(', 'boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(', 'boost::container::small_vector<BufferImageCopy, 16> UnswizzleImageRows(', 'boost::container::small_vector<BufferImageCopy, 16> FullDownloadCopies(']:
-    code += function(text,sig)
+    code += function(text,sig).replace('Common::ScratchBuffer<u8>* tmp_buffer)',
+                                       'Common::ScratchBuffer<u8>* tmp_buffer = nullptr)')
 code += r'''
 int main(){
  Tegra::MemoryManager memory;ImageInfo info;Common::ScratchBuffer<u8> tmp;
