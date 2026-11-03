@@ -18,7 +18,7 @@ diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_
  void BufferCache<P>::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
 -    channel_state->uniform_buffers[stage][index] = NULL_BINDING;
 +    auto& current = channel_state->uniform_buffers[stage][index];
-+    if (current.device_addr == 0 && current.size == 0 && !current.buffer_id) [[likely]] {
++    if (current.device_addr == 0 && current.size == 0 && current.buffer_id == NULL_BUFFER_ID) [[likely]] {
 +        return;
 +    }
 +    current = NULL_BINDING;

@@ -99,7 +99,9 @@ template<class P>struct TextureCache {
  Images slot_images;Common::LeastRecentlyUsedCache<Traits>lru_cache;
 };
 namespace Settings {bool IsGPUFenceBehaviorAccurate(){return false;}}
-struct Binding {DAddr device_addr{};u32 size{};BufferId buffer_id{};};
+struct Binding {DAddr device_addr{};u32 size{};BufferId buffer_id{};
+ inline static unsigned assignments{};
+ Binding&operator=(const Binding&other){++assignments;device_addr=other.device_addr;size=other.size;buffer_id=other.buffer_id;return *this;}};
 constexpr Binding NULL_BINDING{};constexpr BufferId NULL_BUFFER_ID=0;
 struct Buffer {bool IsInBounds(u64,u32){return true;}bool IsSparseCompatible(){return true;}};
 struct Memory {std::optional<DAddr>address=32;std::optional<DAddr>GpuToCpuAddress(GPUVAddr){return address;}};
@@ -185,7 +187,9 @@ int main(int argc,char**argv){
  b.BindGraphicsUniformBuffer(0,0,32,16);assert(b.state.uniform_buffers[0][0].device_addr==0);
  b.memory.address=64;b.BindGraphicsUniformBuffer(1,2,32,16);
  assert(b.state.uniform_buffers[1][2].device_addr==64&&b.state.uniform_buffers[1][2].size==16);
- b.DisableGraphicsUniformBuffer(1,2);b.DisableGraphicsUniformBuffer(1,2);
+ const auto assignments=Binding::assignments;
+ b.DisableGraphicsUniformBuffer(1,2);assert(Binding::assignments==assignments+1);
+ b.DisableGraphicsUniformBuffer(1,2);assert(Binding::assignments==assignments+1);
  assert(b.state.uniform_buffers[1][2].size==0&&!b.state.uniform_buffers[1][2].buffer_id);
  constexpr u64 end=u64{1}<<36;
  for(auto addr:std::array<u64,4>{0,end,end+1,std::numeric_limits<u64>::max()})assert(b.FindBuffer(addr,16,false)==0);
