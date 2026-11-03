@@ -61,6 +61,7 @@
 #endif
 #ifdef PS5_NATIVE
 #include "native_directory.h"
+#include "ps5_video_decoder.h"
 #include "cache_budget.h"
 #include "performance.h"
 #include "stall_watchdog.h"
@@ -279,6 +280,7 @@ int main(int argc, char** argv) {
         SCOPE_EXIT { if (report != stdout) std::fclose(report); };
         std::setvbuf(report, nullptr, _IONBF, 0);
 #ifdef PS5_NATIVE
+        Eden::RegisterPs5VideoDecoder();
         Eden::BootTrace::Begin(Eden::kAppVersion, __DATE__ " " __TIME__);
         // The PS5 keyboard's module, for a game's text entry: asked for before anything else
         // changes what the app may load (system_keyboard.h).

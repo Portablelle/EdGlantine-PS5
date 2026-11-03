@@ -1,0 +1,95 @@
+diff --git a/src/core/hle/service/am/service/native_video_decoder.cpp b/src/core/hle/service/am/service/native_video_decoder.cpp
+--- a/src/core/hle/service/am/service/native_video_decoder.cpp
++++ b/src/core/hle/service/am/service/native_video_decoder.cpp
+@@ -7,7 +7,11 @@
+ #include <vector>
+ #include <deque>
+ #include <cstring>
++#include <cstdlib>
+ #include <limits>
++#include <memory>
++#include "common/scope_exit.h"
++#include "common/thread_worker.h"
+ #include "core/memory.h"
+ #include "core/hle/service/nvdrv/devices/nvhost_as_gpu.h"
+ #include "video_core/gpu.h"
+@@ -79,6 +83,54 @@
+ };
+ 
+ namespace {
++u32 NativeVideoConvertThreads() {
++    const char* setting = std::getenv("EDEN_NX2_VIDEO_CONVERT_THREADS");
++    if (!setting) return 4;
++    char* end;
++    const long value = std::strtol(setting, &end, 10);
++    if (end == setting || *end != '\0') return 4;
++    return static_cast<u32>(std::clamp(value, 1L, 8L));
++}
++
++// Owned by one codec and called synchronously by PumpOutput. Only CPU row
++// conversion runs on the workers; all guest memory and GPU operations stay here.
++class NativeVideoConverter {
++public:
++    void Convert(u8* rgba, u32 row_bytes, std::array<const u8*, 3> planes,
++                 std::array<u32, 3> strides, u32 width, u32 height, bool full_range) {
++        const auto convert_rows = [=](u32 first, u32 last) {
++            for (u32 y = first; y < last; ++y) {
++                ConvertNativeVideoYuv709Row(rgba + size_t{y} * row_bytes,
++                    planes[0] + size_t{y} * strides[0],
++                    planes[1] + size_t{y / 2} * strides[1],
++                    planes[2] + size_t{y / 2} * strides[2], width, full_range);
++            }
++        };
++        if (thread_count == 1 || height < 64 || size_t{width} * height < 65536) {
++            convert_rows(0, height);
++            return;
++        }
++        if (!workers) {
++            // The calling service thread converts one slice as well.
++            workers = std::make_unique<Common::ThreadWorker>(thread_count - 1, "VideoConvert");
++        }
++        // Also drain any queued slices if queue allocation throws. No task may
++        // outlive the caller's frame buffers, including during Stop/Reset.
++        SCOPE_EXIT { workers->WaitForRequests(); };
++        for (u32 i = 1; i < thread_count; ++i) {
++            const auto first = static_cast<u32>(u64{height} * i / thread_count);
++            const auto last = static_cast<u32>(u64{height} * (i + 1) / thread_count);
++            workers->QueueWork([=] { convert_rows(first, last); });
++        }
++        convert_rows(0, height / thread_count);
++    }
++
++private:
++    // Read once per codec. A single-threaded or small-frame codec creates no pool.
++    const u32 thread_count = NativeVideoConvertThreads();
++    std::unique_ptr<Common::ThreadWorker> workers;
++};
++
+ class INativeVideoCodec final : public ServiceFramework<INativeVideoCodec> {
+ public:
+     INativeVideoCodec(Core::System& system_, std::shared_ptr<NativeVideoState> state_, NativeVideoKind kind_)
+@@ -405,13 +457,9 @@
+             } else if (!frame.eos) {
+                 std::vector<u8> rgba(size_t{pool.layout.row_bytes} * pool_height);
+                 PerfMark(Allocate, phase);
+-                for (u32 y = 0; y < frame.heights[0]; ++y) {
+-                    ConvertNativeVideoYuv709Row(rgba.data() + size_t{y} * pool.layout.row_bytes,
+-                        frame.planes[0].data() + size_t{y} * frame.widths[0],
+-                        frame.planes[1].data() + size_t{y / 2} * frame.widths[1],
+-                        frame.planes[2].data() + size_t{y / 2} * frame.widths[2],
+-                        frame.widths[0], frame.full_range);
+-                }
++                video_converter.Convert(rgba.data(), pool.layout.row_bytes,
++                    {frame.planes[0].data(), frame.planes[1].data(), frame.planes[2].data()},
++                    frame.widths, frame.widths[0], frame.heights[0], frame.full_range);
+                 PerfMark(Convert, phase);
+                 std::vector<u8> tiled(pool.layout.image_bytes);
+                 PerfMark(Allocate, phase);
+@@ -829,6 +877,7 @@
+     std::unique_ptr<FFmpeg::Decoder> h264_decoder;
+     std::unique_ptr<FFmpeg::DecoderContext> h264_context;
+     std::map<u64, u64> h264_timestamps;
++    NativeVideoConverter video_converter;
+     // The FFmpeg path also serves VP9 (frames are passed through unchanged, no extradata).
+     bool ffmpeg_vp9{};
+     std::optional<GraphicsSupervisorProtocol::VideoDecoderConfiguration> configuration;
