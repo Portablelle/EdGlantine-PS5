@@ -1,0 +1,80 @@
+diff --git a/src/common/slot_vector.h b/src/common/slot_vector.h
+index f6da7a5..8e1c06e 100644
+--- a/src/common/slot_vector.h
++++ b/src/common/slot_vector.h
+@@ -52,12 +52,16 @@ public:
+             const u64* const bitset = slot_vector->stored_bitset.data();
+             const u32 size = static_cast<u32>(slot_vector->stored_bitset.size()) * 64;
+             if (id.Value() < size) {
+-                do {
+-                    ++id.index;
+-                } while (id.Value() < size && !IsValid(bitset));
+-                if (id.Value() == size) {
+-                    id = SlotId{};
++                u32 index = id.Value() + 1;
++                while (index < size) {
++                    const u64 word = bitset[index / 64] >> (index % 64);
++                    if (word != 0) {
++                        index += static_cast<u32>(std::countr_zero(word));
++                        break;
++                    }
++                    index = (index / 64 + 1) * 64;
+                 }
++                id = index < size ? SlotId{index} : SlotId{};
+             }
+             return *this;
+         }
+@@ -139,7 +143,7 @@ public:
+         if (it == stored_bitset.end()) {
+             return end();
+         }
+-        const u32 word_index = static_cast<u32>(std::distance(it, stored_bitset.begin()));
++        const u32 word_index = static_cast<u32>(std::distance(stored_bitset.begin(), it));
+         const SlotId first_id{word_index * 64 + static_cast<u32>(std::countr_zero(*it))};
+         return Iterator(this, first_id);
+     }
+diff --git a/src/core/hle/kernel/k_priority_queue.h b/src/core/hle/kernel/k_priority_queue.h
+index 89a0c5b..5d93455 100644
+--- a/src/core/hle/kernel/k_priority_queue.h
++++ b/src/core/hle/kernel/k_priority_queue.h
+@@ -11,6 +11,7 @@
+ #include <bitset>
+ #include <concepts>
+ #include <cstddef>
++#include <type_traits>
+ 
+ #include "common/alignment.h"
+ #include "common/assert.h"
+@@ -196,12 +197,7 @@ public:
+         constexpr Member* GetFront(s32 core) const {
+             ASSERT(IsValidCore(core));
+ 
+-            const s32 priority = s32([](auto const& e) {
+-                for (size_t i = 0; i < e.size(); ++i)
+-                    if (e[i])
+-                        return i;
+-                return e.size();
+-            }(m_available_priorities[core]));
++            const s32 priority = s32(GetNextSet(m_available_priorities[core], size_t(-1)));
+             if (priority <= LowestPriority) {
+                 return m_queues[priority].GetFront(core);
+             } else {
+@@ -222,7 +218,17 @@ public:
+ 
+         template<size_t N>
+         constexpr size_t GetNextSet(std::bitset<N> const& bit, size_t n) const {
+-            for (size_t i = n + 1; i < bit.size(); i++)
++            const size_t first = n + 1;
++            if (first >= bit.size()) {
++                return bit.size();
++            }
++            if constexpr (N <= 64) {
++                if (!std::is_constant_evaluated()) {
++                    const u64 remaining = bit.to_ullong() >> first;
++                    return remaining != 0 ? first + size_t(std::countr_zero(remaining)) : bit.size();
++                }
++            }
++            for (size_t i = first; i < bit.size(); i++)
+                 if (bit[i])
+                     return i;
+             return bit.size();
