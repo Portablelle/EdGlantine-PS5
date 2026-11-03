@@ -81,6 +81,17 @@ int main(){
  n.backing[1]={{0},4096};n.backing[2]={{0},8192};n.backing[4]={{0},16384};n.backing[5]={{0},32768};
  n.UpdatePagesCachedCountNoLock(4096,5*4096,1);
  assert((n.a.calls==std::vector<std::tuple<u64,size_t,bool>>{{4096,8192,true},{16384,4096,true},{32768,4096,true}}));
+ // Out-of-range ASIDs return before touching counters or recording a backend call.
+ DeviceMemoryManager<int> invalid;
+ invalid.backing[1]={{2},4096};
+ invalid.UpdatePagesCachedCountNoLock(4096,4096,1);
+ assert(invalid.a.calls.empty()&&invalid.b.calls.empty());
+ assert(invalid.cached_pages->at(1).value==0);
+ // A switch to an out-of-range ASID flushes the previous owner's pending run.
+ invalid.backing[1]={{0},4096};invalid.backing[2]={{2},8192};
+ invalid.UpdatePagesCachedCountNoLock(4096,2*4096,1);
+ assert((invalid.a.calls==std::vector<std::tuple<u64,size_t,bool>>{{4096,4096,true}}));
+ assert(invalid.b.calls.empty()&&invalid.cached_pages->at(2).value==0);
 }
 '''
 run('memory-owners',code)

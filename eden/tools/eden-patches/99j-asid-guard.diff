@@ -1,0 +1,25 @@
+diff --git a/src/core/device_memory_manager.inc b/src/core/device_memory_manager.inc
+index 5ef2f4a..aad8267 100644
+--- a/src/core/device_memory_manager.inc
++++ b/src/core/device_memory_manager.inc
+@@ -603,6 +603,10 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
+     const size_t page_end = Common::DivCeil(addr + size, Memory::YUZU_PAGESIZE);
+     size_t page = addr >> Memory::YUZU_PAGEBITS;
+     auto [asid, base_vaddress] = ExtractCPUBacking(page);
++    // There is no registered process to mark for an out-of-range ASID.
++    if (asid.id >= registered_processes.size()) {
++        return;
++    }
+     auto* memory_device_inter = registered_processes[asid.id];
+     const auto release_pending = [&] {
+         if (uncache_bytes > 0) {
+@@ -633,6 +637,9 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
+ 
+         if (asid.id != asid_2.id) [[unlikely]] {
+             release_pending();
++            if (asid_2.id >= registered_processes.size()) {
++                return;
++            }
+             asid = asid_2;
+             memory_device_inter = registered_processes[asid_2.id];
+         }
