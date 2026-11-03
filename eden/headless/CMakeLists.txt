@@ -3185,6 +3185,8 @@ target_sources(eden-headless PRIVATE "${EDEN_PORT_DIR}/system_keyboard.cpp")
 target_sources(eden-headless PRIVATE "${EDEN_PORT_DIR}/multiplayer.cpp")
 target_include_directories(eden-headless BEFORE PRIVATE "${MULTIPLAYER_SOCKET_HEADERS}" "${MULTIPLAYER_OUTPUT}")
 if(PS5_NATIVE)
+    target_sources(eden-headless PRIVATE "${EDEN_PORT_DIR}/ps5_video_decoder.cpp")
+    target_include_directories(eden-headless BEFORE PRIVATE "${FFmpeg_INCLUDE_DIR}")
     target_link_libraries(eden-headless PRIVATE
         "${sdk}/target/lib/libSceImeDialog.so" "${sdk}/target/lib/libSceSysmodule.so"
         "${PORT_ROOT}/build/stubs/libSceCommonDialog.so")

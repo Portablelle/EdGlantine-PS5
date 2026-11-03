@@ -1,0 +1,875 @@
+diff --git a/src/core/hle/service/am/service/native_video_decoder.cpp b/src/core/hle/service/am/service/native_video_decoder.cpp
+--- a/src/core/hle/service/am/service/native_video_decoder.cpp
++++ b/src/core/hle/service/am/service/native_video_decoder.cpp
+@@ -165,6 +165,8 @@
+         output_properties.clear();
+         decoded_frames.clear();
+         decoder.reset();
++        h264_backend.Reset();
++        h264_extradata.clear();
+         h264_context.reset();
+         h264_decoder.reset();
+         h264_timestamps.clear();
+@@ -280,45 +282,60 @@
+                  perf_ns[Allocate], perf_ns[Convert], perf_ns[Swizzle], perf_ns[Invalidate], perf_ns[Write]);
+     }
+ 
++    void QueueH264Frame(const std::shared_ptr<FFmpeg::Frame>& received) {
++        auto phase = PerfClock::now();
++        const AVFrame* av = received->GetFrame();
++        if (av->format != AV_PIX_FMT_YUV420P && av->format != AV_PIX_FMT_YUVJ420P &&
++            av->format != AV_PIX_FMT_NV12) {
++            LOG_ERROR(Service_AM, "Unsupported native H.264 output pixel format {}", av->format);
++            return;
++        }
++        DecodedFrame frame{};
++        frame.bitdepth = 8;
++        frame.format = 0;
++        // Keep signalled matrix coefficients. Only unspecified input retains the
++        // historical BT.709 default; the RGBA admission below rejects other matrices.
++        frame.matrix = av->colorspace == AVCOL_SPC_UNSPECIFIED ? 1U : static_cast<u32>(av->colorspace);
++        frame.full_range = av->format == AV_PIX_FMT_YUVJ420P || av->color_range == AVCOL_RANGE_JPEG;
++        for (u32 plane = 0; plane < 3; ++plane) {
++            frame.widths[plane] = plane ? (av->width + 1) / 2 : av->width;
++            frame.heights[plane] = plane ? (av->height + 1) / 2 : av->height;
++            frame.planes[plane].resize(size_t{frame.widths[plane]} * frame.heights[plane]);
++            for (u32 row = 0; row < frame.heights[plane]; ++row) {
++                auto* destination = frame.planes[plane].data() + size_t{row} * frame.widths[plane];
++                if (av->format == AV_PIX_FMT_NV12 && plane) {
++                    const auto* source = av->data[1] + ptrdiff_t{row} * av->linesize[1];
++                    for (u32 x = 0; x < frame.widths[plane]; ++x)
++                        destination[x] = source[2 * x + plane - 1];
++                } else {
++                    std::memcpy(destination, av->data[plane] + ptrdiff_t{row} * av->linesize[plane],
++                                frame.widths[plane]);
++                }
++            }
++        }
++        PerfMark(Planes, phase);
++        frame.submission_id = static_cast<u64>(av->pts);
++        if (const auto it = h264_timestamps.find(frame.submission_id); it != h264_timestamps.end()) {
++            frame.timestamp = it->second;
++            h264_timestamps.erase(it);
++        }
++        LOG_DEBUG(Service_AM, "native H.264 decoded submission={}, dimensions={}x{}", frame.submission_id,
++                  frame.widths[0], frame.heights[0]);
++        decoded_frames.push_back(std::move(frame));
++    }
++
+     void CollectH264Frames() {
+         auto phase = PerfClock::now();
+         while (auto received = h264_context->ReceiveFrame()) {
+             PerfMark(Receive, phase);
+-            const AVFrame* av = received->GetFrame();
+-            if (av->format != AV_PIX_FMT_YUV420P && av->format != AV_PIX_FMT_YUVJ420P) {
+-                LOG_ERROR(Service_AM, "Unsupported native H.264 output pixel format {}", av->format);
+-                continue;
+-            }
+-            DecodedFrame frame{};
+-            frame.bitdepth = 8;
+-            frame.format = 0;
+-            // Keep signalled matrix coefficients. Only unspecified input retains the
+-            // historical BT.709 default; the RGBA admission below rejects other matrices.
+-            frame.matrix = av->colorspace == AVCOL_SPC_UNSPECIFIED ? 1U : static_cast<u32>(av->colorspace);
+-            frame.full_range = av->format == AV_PIX_FMT_YUVJ420P || av->color_range == AVCOL_RANGE_JPEG;
+-            for (u32 plane = 0; plane < 3; ++plane) {
+-                frame.widths[plane] = plane ? (av->width + 1) / 2 : av->width;
+-                frame.heights[plane] = plane ? (av->height + 1) / 2 : av->height;
+-                frame.planes[plane].resize(size_t{frame.widths[plane]} * frame.heights[plane]);
+-                for (u32 row = 0; row < frame.heights[plane]; ++row)
+-                    std::memcpy(frame.planes[plane].data() + size_t{row} * frame.widths[plane],
+-                                av->data[plane] + ptrdiff_t{row} * av->linesize[plane], frame.widths[plane]);
+-            }
+-            PerfMark(Planes, phase);
+-            frame.submission_id = static_cast<u64>(av->pts);
+-            if (const auto it = h264_timestamps.find(frame.submission_id); it != h264_timestamps.end()) {
+-                frame.timestamp = it->second;
+-                h264_timestamps.erase(it);
+-            }
+-            LOG_DEBUG(Service_AM, "native H.264 decoded submission={}, dimensions={}x{}", frame.submission_id,
+-                      frame.widths[0], frame.heights[0]);
+-            decoded_frames.push_back(std::move(frame));
++            QueueH264Frame(received);
+             phase = PerfClock::now();
+         }
+         PerfMark(Receive, phase);
+     }
+ 
+     void DrainH264() {
++        h264_backend.Finish();
+         avcodec_send_packet(h264_context->GetCodecContext(), nullptr);
+         CollectH264Frames();
+         avcodec_flush_buffers(h264_context->GetCodecContext());
+@@ -338,6 +355,26 @@
+         }
+         auto phase = PerfClock::now();
+         auto bytes = ffmpeg_vp9 ? input.bytes : ToAnnexB(input.bytes);
++        if (!ffmpeg_vp9) {
++            std::shared_ptr<FFmpeg::Frame> hardware_frame;
++            const auto route = h264_backend.Decode(Tegra::Host1x::NvdecCommon::VideoCodec::H264,
++                bytes, {}, FFmpeg::FrameDimensions{static_cast<s32>(configuration->width),
++                    static_cast<s32>(configuration->height), -1},
++                static_cast<s64>(input.submission_id), h264_extradata, hardware_frame);
++            if (route != FFmpeg::HardwareVideoDecoderSession::Route::Software) {
++                PerfMark(Decode, phase);
++                if (route == FFmpeg::HardwareVideoDecoderSession::Route::Hardware) {
++                    h264_timestamps[input.submission_id] = input.timestamp;
++                    QueueH264Frame(hardware_frame);
++                }
++                // Also consume skipped inter pictures: PumpOutput must keep progressing to IDR.
++                pending_input_bytes -= input.bytes.size();
++                pending_inputs.pop_front();
++                R_SUCCEED();
++            }
++            auto restart = h264_backend.TakeRestartPacket();
++            if (!restart.empty()) bytes = std::move(restart);
++        }
+         const size_t size = bytes.size();
+         bytes.resize(size + AV_INPUT_BUFFER_PADDING_SIZE);
+         FFmpeg::Packet packet(std::span<const u8>{bytes.data(), size});
+@@ -350,12 +387,16 @@
+                   input.bytes.size() > 3 ? input.bytes[3] : 0, input.bytes.size() > 4 ? input.bytes[4] : 0);
+         PerfMark(Packet, phase);
+         if (!h264_context->SendPacket(packet)) {
+-            if (!ffmpeg_vp9) {
++            if (!ffmpeg_vp9 && !h264_backend.SoftwareResult(false)) {
+                 LOG_ERROR(Service_AM, "Native H.264 packet rejected");
+                 R_THROW(Kernel::ResultInvalidArgument);
+             }
+-            // A damaged VP9 frame only loses that frame.
+-            LOG_WARNING(Service_AM, "Native VP9 packet rejected, submission={}", input.submission_id);
++            // The adapter handles recovery; consume rejected inputs so PumpOutput progresses.
++            if (ffmpeg_vp9) {
++                LOG_WARNING(Service_AM, "Native VP9 packet rejected, submission={}", input.submission_id);
++            } else {
++                LOG_WARNING(Service_AM, "Native H.264 recovery packet rejected, submission={}", input.submission_id);
++            }
+             h264_timestamps.erase(input.submission_id);
+         }
+         PerfMark(Decode, phase);
+@@ -741,6 +782,8 @@
+                             auto reopened = std::make_unique<FFmpeg::DecoderContext>(*h264_decoder);
+                             if (reopened->OpenContext(*h264_decoder, mime)) {
+                                 h264_context = std::move(reopened);
++                                h264_extradata.assign(mime.begin(), mime.end());
++                                h264_backend.ConfigureH264(h264_extradata);
+                             } else {
+                                 LOG_ERROR(Service_AM, "Native H.264 extradata rejected");
+                             }
+@@ -892,6 +935,8 @@
+     std::unique_ptr<FFmpeg::DecoderContext> h264_context;
+     std::map<u64, u64> h264_timestamps;
+     NativeVideoConverter video_converter;
++    FFmpeg::HardwareVideoDecoderSession h264_backend;
++    std::vector<u8> h264_extradata;
+     // The FFmpeg path also serves VP9 (frames are passed through unchanged, no extradata).
+     bool ffmpeg_vp9{};
+     std::optional<GraphicsSupervisorProtocol::VideoDecoderConfiguration> configuration;
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -75,6 +75,9 @@
+     host1x/codec_types.h
+     host1x/ffmpeg.cpp
+     host1x/ffmpeg.h
++    host1x/hardware_video_decoder.cpp
++    host1x/hardware_video_decoder.h
++    host1x/video_decode.h
+     host1x/control.cpp
+     host1x/control.h
+     host1x/gpu_device_memory_manager.cpp
+diff --git a/src/video_core/host1x/codecs/decoder.cpp b/src/video_core/host1x/codecs/decoder.cpp
+--- a/src/video_core/host1x/codecs/decoder.cpp
++++ b/src/video_core/host1x/codecs/decoder.cpp
+@@ -20,12 +20,12 @@
+ 
+ Decoder::~Decoder() = default;
+ 
+-void Decoder::SetFrameDimensions(s32 width, s32 height) {
++void Decoder::SetFrameDimensions(s32 width, s32 height, s32 profile) {
+     if (width <= 0 || height <= 0) {
+         frame_dimensions.reset();
+         return;
+     }
+-    frame_dimensions = FFmpeg::FrameDimensions{width, height};
++    frame_dimensions = FFmpeg::FrameDimensions{width, height, profile};
+ }
+ 
+ void Decoder::Decode() {
+diff --git a/src/video_core/host1x/codecs/decoder.h b/src/video_core/host1x/codecs/decoder.h
+--- a/src/video_core/host1x/codecs/decoder.h
++++ b/src/video_core/host1x/codecs/decoder.h
+@@ -47,7 +47,7 @@
+     virtual std::tuple<u64, u64, u64, u64> GetInterlacedOffsets() = 0;
+     virtual bool IsInterlaced() = 0;
+ 
+-    void SetFrameDimensions(s32 width, s32 height);
++    void SetFrameDimensions(s32 width, s32 height, s32 profile = -1);
+ 
+     std::optional<FFmpeg::FrameDimensions> GetFrameDimensions() const {
+         return frame_dimensions;
+diff --git a/src/video_core/host1x/codecs/h264.cpp b/src/video_core/host1x/codecs/h264.cpp
+--- a/src/video_core/host1x/codecs/h264.cpp
++++ b/src/video_core/host1x/codecs/h264.cpp
+@@ -53,8 +53,10 @@
+ std::span<const u8> H264::ComposeFrame() {
+     host1x.gmmu_manager.ReadBlock(regs.picture_info_offset.Address(), &current_context, sizeof(H264DecoderContext));
+     const auto& params = current_context.h264_parameter_set;
++    // The SPS below declares High (100), 8-bit. Only 4:2:0 is eligible for the backend.
+     SetFrameDimensions(static_cast<s32>(params.pic_width_in_mbs) * 16,
+-                       static_cast<s32>(params.frame_height_in_mbs) * 16);
++                       static_cast<s32>(params.frame_height_in_mbs) * 16,
++                       params.chroma_format_idc.Value() == 1 ? 100 : -1);
+ 
+     const s64 frame_number = current_context.h264_parameter_set.frame_number.Value();
+     if (!is_first_frame && frame_number != 0) {
+diff --git a/src/video_core/host1x/codecs/vp9.cpp b/src/video_core/host1x/codecs/vp9.cpp
+--- a/src/video_core/host1x/codecs/vp9.cpp
++++ b/src/video_core/host1x/codecs/vp9.cpp
+@@ -844,7 +844,8 @@
+     {
+         Vp9FrameContainer curr_frame = GetCurrentFrame();
+         current_frame_info = curr_frame.info;
+-        SetFrameDimensions(current_frame_info.frame_size.width, current_frame_info.frame_size.height);
++        // ComposeUncompressedHeader writes profile 0 (8-bit 4:2:0).
++        SetFrameDimensions(current_frame_info.frame_size.width, current_frame_info.frame_size.height, 0);
+         bitstream = std::move(curr_frame.bit_stream);
+     }
+     // The uncompressed header routine sets PrevProb parameters needed for the compressed header
+diff --git a/src/video_core/host1x/ffmpeg.cpp b/src/video_core/host1x/ffmpeg.cpp
+--- a/src/video_core/host1x/ffmpeg.cpp
++++ b/src/video_core/host1x/ffmpeg.cpp
+@@ -359,7 +359,22 @@
+     return std::move(m_final_frame);
+ }
+ 
++bool IsBackendFrameValid(const Frame& frame, const FrameDimensions& dimensions, s64 pts) {
++    return Eden::VideoDecode::ValidFrame(frame, dimensions.width, dimensions.height, pts,
++                                         AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P);
++}
++
++DecodeApi::~DecodeApi() {
++    this->Reset();
++}
++
++void HardwareVideoDecoder::ReportFallback(const char* reason) {
++    LOG_WARNING(HW_GPU, "EDEN_HW_VIDEODEC fallback reason={}", reason);
++}
++
+ void DecodeApi::Reset() {
++    m_backend.Reset();
++    m_backend_frames = {};
+     m_hardware_context.reset();
+     m_decoder_context.reset();
+     m_decoder.reset();
+@@ -374,6 +389,7 @@
+ 
+ bool DecodeApi::Initialize(Tegra::Host1x::NvdecCommon::VideoCodec codec) {
+     this->Reset();
++    m_codec = codec;
+     m_decoder.emplace(codec);
+     m_decoder_context.emplace(*m_decoder);
+ 
+@@ -387,6 +403,7 @@
+ 
+     // Enable GPU decoding if requested.
+     if (!is_mediacodec &&
++        !HardwareVideoDecoderAvailable() &&
+         Settings::values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu) {
+         m_hardware_context.emplace();
+         m_hardware_context->InitializeForDecoder(*m_decoder_context, *m_decoder);
+@@ -412,6 +429,22 @@
+ 
+ bool DecodeApi::SendPacket(std::span<const u8> packet_data, const FrameOffsets& offsets,
+                            std::optional<FrameDimensions> dimensions) {
++    std::shared_ptr<Frame> frame;
++    const auto route = m_backend.Decode(m_codec, packet_data, offsets, dimensions, m_next_pts,
++                                        {}, frame);
++    if (route != HardwareVideoDecoderSession::Route::Software) {
++        if (route == HardwareVideoDecoderSession::Route::Hardware && !offsets.hidden) {
++            m_backend_frames.push(DecodedFrame{std::move(frame), offsets});
++        }
++        ++m_next_pts;
++        return true;
++    }
++    auto restart = m_backend.TakeRestartPacket();
++    if (!restart.empty()) {
++        const auto size = restart.size();
++        restart.resize(size + AV_INPUT_BUFFER_PADDING_SIZE);
++        packet_data = {restart.data(), size};
++    }
+     if (!m_opened) {
+         std::vector<u8> extradata;
+ #if defined(__ANDROID__)
+@@ -440,17 +473,24 @@
+         }
+         m_opened = true;
+     }
+-    if (!offsets.hidden) {
+-        m_pending_offsets.push(offsets);
+-    }
+     FFmpeg::Packet packet(packet_data);
+     packet.GetPacket()->pts = m_next_pts;
+     packet.GetPacket()->dts = m_next_pts;
+     ++m_next_pts;
+-    return m_decoder_context->SendPacket(packet);
++    const bool accepted = m_decoder_context->SendPacket(packet);
++    if (accepted && !offsets.hidden) m_pending_offsets.push(offsets);
++    return m_backend.SoftwareResult(accepted);
+ }
+ 
+ std::optional<DecodeApi::DecodedFrame> DecodeApi::ReceiveFrame() {
++    if (!m_backend_frames.empty()) {
++        auto result = std::move(m_backend_frames.front());
++        m_backend_frames.pop();
++        return result;
++    }
++    if (m_backend.IsActive() || m_backend.IsWaiting()) {
++        return std::nullopt;
++    }
+     auto frame = m_decoder_context->ReceiveFrame();
+     if (!frame) {
+         return std::nullopt;
+diff --git a/src/video_core/host1x/ffmpeg.h b/src/video_core/host1x/ffmpeg.h
+--- a/src/video_core/host1x/ffmpeg.h
++++ b/src/video_core/host1x/ffmpeg.h
+@@ -11,10 +11,12 @@
+ #include <span>
+ #include <vector>
+ #include <queue>
++#include <utility>
+ 
+ #include "common/common_funcs.h"
+ #include "common/common_types.h"
+ #include "video_core/host1x/nvdec_common.h"
++#include "video_core/host1x/hardware_video_decoder.h"
+ 
+ extern "C" {
+ #if defined(__GNUC__) || defined(__clang__)
+@@ -198,31 +200,19 @@
+     bool m_decode_order{};
+ };
+ 
+-struct FrameOffsets {
+-    bool interlaced{};
+-    bool hidden{};
+-    u64 luma{};
+-    u64 luma_bottom{};
+-};
+-
+-struct FrameDimensions {
+-    s32 width{};
+-    s32 height{};
+-};
+-
+ class DecodeApi {
+ public:
+     YUZU_NON_COPYABLE(DecodeApi);
+     YUZU_NON_MOVEABLE(DecodeApi);
+ 
+     DecodeApi() = default;
+-    ~DecodeApi() = default;
++    ~DecodeApi();
+ 
+     bool Initialize(Tegra::Host1x::NvdecCommon::VideoCodec codec);
+     void Reset();
+ 
+     bool UsingDecodeOrder() const {
+-        return m_decoder_context->UsingDecodeOrder();
++        return m_backend.IsActive() || m_decoder_context->UsingDecodeOrder();
+     }
+ 
+     bool SendPacket(std::span<const u8> packet_data, const FrameOffsets& offsets,
+@@ -235,6 +225,9 @@
+     std::optional<DecodedFrame> ReceiveFrame();
+ 
+ private:
++    Tegra::Host1x::NvdecCommon::VideoCodec m_codec{};
++    HardwareVideoDecoderSession m_backend;
++    std::queue<DecodedFrame> m_backend_frames;
+     std::optional<FFmpeg::Decoder> m_decoder;
+     std::optional<FFmpeg::DecoderContext> m_decoder_context;
+     std::optional<FFmpeg::HardwareContext> m_hardware_context;
+diff --git a/src/video_core/host1x/hardware_video_decoder.cpp b/src/video_core/host1x/hardware_video_decoder.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/video_core/host1x/hardware_video_decoder.cpp
+@@ -0,0 +1,109 @@
++// SPDX-License-Identifier: GPL-3.0-only
++#include "video_core/host1x/hardware_video_decoder.h"
++#include <atomic>
++#include <cstdlib>
++#include <string_view>
++
++namespace FFmpeg {
++namespace {
++std::atomic<HardwareVideoDecoderFactory> hardware_video_decoder_factory{};
++bool Enabled() {
++    const char* value = std::getenv("EDEN_PS5_HW_VIDEODEC");
++    return !value || std::string_view{value} != "0";
++}
++bool IsRandomAccess(Tegra::Host1x::NvdecCommon::VideoCodec codec, std::span<const u8> packet) {
++    using Tegra::Host1x::NvdecCommon::VideoCodec;
++    return codec == VideoCodec::H264 ? Eden::VideoDecode::IsIdr(packet) :
++           codec == VideoCodec::VP9 && !packet.empty() && (packet[0] & 0xfc) == 0x80;
++}
++}
++
++void RegisterHardwareVideoDecoder(HardwareVideoDecoderFactory factory) {
++    hardware_video_decoder_factory.store(factory);
++}
++bool HardwareVideoDecoderAvailable() {
++    return hardware_video_decoder_factory.load() && Enabled();
++}
++HardwareVideoDecoderSession::~HardwareVideoDecoderSession() { Reset(); }
++
++void HardwareVideoDecoderSession::Transition(State next) {
++    if (m_state == State::Hardware && next != State::Hardware) {
++        m_backend->Close();
++        m_backend.reset();
++        m_dimensions = {};
++    }
++    m_state = next;
++}
++void HardwareVideoDecoderSession::Reset() {
++    Transition(State::Selection);
++    m_h264 = {};
++    m_restart_packet.clear();
++}
++void HardwareVideoDecoderSession::Finish() {
++    if (m_state == State::Hardware) Transition(State::Recovery);
++}
++void HardwareVideoDecoderSession::ConfigureH264(std::span<const u8> extradata) {
++    if (HardwareVideoDecoderAvailable() || IsWaiting()) {
++        if (const auto extra = Eden::VideoDecode::H264Extradata(extradata)) m_h264.Observe(*extra);
++    }
++}
++bool HardwareVideoDecoderSession::SoftwareResult(bool accepted) {
++    if (!accepted && HasFallenBack()) Transition(State::Recovery);
++    return accepted || HasFallenBack();
++}
++
++HardwareVideoDecoderSession::Route HardwareVideoDecoderSession::Decode(
++    Tegra::Host1x::NvdecCommon::VideoCodec codec, std::span<const u8> packet,
++    const FrameOffsets& offsets, std::optional<FrameDimensions> dimensions, s64 pts,
++    std::span<const u8> extradata, std::shared_ptr<Frame>& frame) {
++    using Tegra::Host1x::NvdecCommon::VideoCodec;
++    frame.reset();
++    m_restart_packet.clear();
++    if (codec == VideoCodec::H264 &&
++        ((m_state == State::Selection && HardwareVideoDecoderAvailable()) || IsActive() || IsWaiting())) {
++        if (m_state == State::Selection) ConfigureH264(extradata);
++        m_h264.Observe(packet);
++        if (dimensions && dimensions->profile < 0) dimensions->profile = m_h264.profile;
++    }
++    if (m_state == State::Selection) {
++        const auto factory = hardware_video_decoder_factory.load();
++        if (factory && Enabled() && !offsets.interlaced && dimensions &&
++            dimensions->width > 0 && dimensions->height > 0 && dimensions->profile >= 0 &&
++            (codec == VideoCodec::H264 || codec == VideoCodec::VP9)) {
++            auto backend = factory();
++            if (backend && backend->Supports(codec, *dimensions)) {
++                // Include in-band SPS before Open so admission can verify its VUI restrictions.
++                const auto parameters = codec == VideoCodec::H264 ? m_h264.Restore({}) : std::vector<u8>{};
++                if (!backend->Open(codec, *dimensions,
++                                   codec == VideoCodec::H264 ? std::span<const u8>{parameters} : extradata)) {
++                    backend->ReportFallback("open-failed");
++                    backend->Close();
++                    Transition(State::Fallback); // No references consumed: submit current packet.
++                    if (codec == VideoCodec::H264) m_restart_packet = m_h264.Restore(packet);
++                } else {
++                    m_backend = std::move(backend);
++                    m_dimensions = *dimensions;
++                    Transition(State::Hardware);
++                }
++            }
++        }
++        if (m_state == State::Selection) Transition(State::Software);
++    }
++    if (m_state == State::Hardware) {
++        if (dimensions == m_dimensions && !offsets.interlaced &&
++            m_backend->Decode(packet, pts, frame) &&
++            (offsets.hidden || (frame && IsBackendFrameValid(*frame, *dimensions, pts)))) {
++            return Route::Hardware;
++        }
++        frame.reset();
++        m_backend->ReportFallback("decode-or-output-failed");
++        Transition(State::Recovery);
++    }
++    if (m_state == State::Recovery) {
++        if (!IsRandomAccess(codec, packet)) return Route::Skipped;
++        if (codec == VideoCodec::H264) m_restart_packet = m_h264.Restore(packet);
++        Transition(State::Fallback);
++    }
++    return Route::Software;
++}
++} // namespace FFmpeg
+diff --git a/src/video_core/host1x/hardware_video_decoder.h b/src/video_core/host1x/hardware_video_decoder.h
+new file mode 100644
+--- /dev/null
++++ b/src/video_core/host1x/hardware_video_decoder.h
+@@ -0,0 +1,95 @@
++// SPDX-License-Identifier: GPL-3.0-only
++#pragma once
++#include <memory>
++#include <optional>
++#include <span>
++#include <utility>
++#include <vector>
++#include "common/common_types.h"
++#include "video_core/host1x/nvdec_common.h"
++#include "video_core/host1x/video_decode.h"
++
++namespace FFmpeg {
++class Frame;
++struct FrameDimensions;
++bool IsBackendFrameValid(const Frame& frame, const FrameDimensions& dimensions, s64 pts);
++
++struct FrameOffsets {
++    bool interlaced{};
++    bool hidden{};
++    u64 luma{};
++    u64 luma_bottom{};
++};
++
++struct FrameDimensions {
++    s32 width{};
++    s32 height{};
++    // Profile of the bitstream; unknown profiles stay on FFmpeg.
++    s32 profile{-1};
++
++    bool operator==(const FrameDimensions&) const = default;
++};
++
++// Optional frontend backend. Decode is synchronous, in decode order, and must consume hidden
++// packets too. A visible packet must return one CPU-readable NV12/YUV420P frame. AVBufferRefs
++// must own its planes independently of the decoder (including after Close). Dimensions are
++// the displayed dimensions; apply native output crop before returning the frame. Decode must
++// propagate pts and signal colorspace/color_range on the AVFrame. Native-video consumes 8-bit
++// planar 4:2:0 plus that metadata (NV12 is deinterleaved). Delayed/reordered output is not
++// supported by this synchronous contract: return failure rather than attach a wrong pts.
++// Open receives codec-specific extradata; the session supplies cached Annex-B SPS/PPS for AVC.
++class HardwareVideoDecoder {
++public:
++    virtual ~HardwareVideoDecoder() = default;
++    virtual bool Supports(Tegra::Host1x::NvdecCommon::VideoCodec codec,
++                          const FrameDimensions& dimensions) const = 0;
++    virtual bool Open(Tegra::Host1x::NvdecCommon::VideoCodec codec,
++                      const FrameDimensions& dimensions, std::span<const u8> extradata = {}) = 0;
++    virtual bool Decode(std::span<const u8> packet, s64 pts, std::shared_ptr<Frame>& frame) = 0;
++    virtual void Close() = 0;
++    // The default logs once at the selection seam; native backends can retain a specific reason.
++    virtual void ReportFallback(const char* reason);
++};
++
++using HardwareVideoDecoderFactory = std::unique_ptr<HardwareVideoDecoder> (*)();
++// Register before starting decoder threads. Null by default; existing backends are unaffected.
++void RegisterHardwareVideoDecoder(HardwareVideoDecoderFactory factory);
++
++bool HardwareVideoDecoderAvailable();
++
++// Selection and H.264 recovery adapter shared by host1x and INativeVideoCodec. Software means
++// submit this packet to FFmpeg; Skipped consumes it while waiting for a reference-safe restart.
++class HardwareVideoDecoderSession {
++public:
++    HardwareVideoDecoderSession(const HardwareVideoDecoderSession&) = delete;
++    HardwareVideoDecoderSession& operator=(const HardwareVideoDecoderSession&) = delete;
++    HardwareVideoDecoderSession() = default;
++    ~HardwareVideoDecoderSession();
++    enum class Route { Software, Hardware, Skipped };
++    Route Decode(Tegra::Host1x::NvdecCommon::VideoCodec codec, std::span<const u8> packet,
++                 const FrameOffsets& offsets, std::optional<FrameDimensions> dimensions, s64 pts,
++                 std::span<const u8> extradata, std::shared_ptr<Frame>& frame);
++    void Reset();
++    // Synchronous backends have no queued output. Drain closes them and subsequent packets
++    // use FFmpeg from the next IDR/keyframe; it does not retry hardware after EOS/Flush/Stop.
++    void Finish();
++    // Fallback is software after a hardware attempt; Software was never admitted to hardware.
++    enum class State { Selection, Hardware, Recovery, Software, Fallback };
++    State GetState() const { return m_state; }
++    bool IsActive() const { return m_state == State::Hardware; }
++    bool IsWaiting() const { return m_state == State::Recovery; }
++    bool HasFallenBack() const { return m_state == State::Recovery || m_state == State::Fallback; }
++    std::vector<u8> TakeRestartPacket() { return std::exchange(m_restart_packet, {}); }
++    bool SoftwareResult(bool accepted);
++    void ConfigureH264(std::span<const u8> extradata);
++
++private:
++    std::unique_ptr<HardwareVideoDecoder> m_backend;
++    FrameDimensions m_dimensions{};
++    Eden::VideoDecode::H264ParameterSets m_h264;
++    std::vector<u8> m_restart_packet;
++    void Transition(State next);
++    State m_state{State::Selection};
++};
++
++} // namespace FFmpeg
+diff --git a/src/video_core/host1x/video_decode.h b/src/video_core/host1x/video_decode.h
+new file mode 100644
+--- /dev/null
++++ b/src/video_core/host1x/video_decode.h
+@@ -0,0 +1,264 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// Adapted from sainsaji/EVO-PLAYER-PS5 a54dcf516e9cfda4c26d78733bf5ccb8c10e7e0b (GPL-3.0)
++// Shared, bounded packet framing for backend validation and software recovery.
++#pragma once
++#include <array>
++#include <cstdint>
++#include <optional>
++#include <span>
++#include <vector>
++
++namespace Eden::VideoDecode {
++using Bytes = std::span<const std::uint8_t>;
++constexpr std::size_t InputBytes = 0x800000;
++
++inline std::vector<Bytes> AnnexBNals(Bytes bytes) {
++    std::vector<Bytes> units;
++    std::size_t begin = 0;
++    bool found = false;
++    for (std::size_t i = 0; i + 3 <= bytes.size(); ++i) {
++        if (bytes[i] || bytes[i + 1] || bytes[i + 2] != 1) continue;
++        if (found) {
++            auto end = i;
++            while (end > begin && bytes[end - 1] == 0) --end;
++            if (end == begin) return {};
++            units.push_back(bytes.subspan(begin, end - begin));
++        } else {
++            for (std::size_t j = 0; j < i; ++j) if (bytes[j]) return {};
++        }
++        found = true;
++        begin = i + 3;
++        i += 2;
++    }
++    if (!found || begin == bytes.size()) return {};
++    auto end = bytes.size();
++    while (end > begin && bytes[end - 1] == 0) --end;
++    if (end == begin) return {};
++    units.push_back(bytes.subspan(begin, end - begin));
++    for (const auto unit : units) {
++        const auto type = unit[0] & 31;
++        if ((unit[0] & 0x80) || !type || type > 23 || (type <= 9 && unit.size() < 2)) return {};
++    }
++    return units;
++}
++
++inline bool IsIdr(Bytes bytes) {
++    for (auto nal : AnnexBNals(bytes)) if ((nal[0] & 31) == 5) return true;
++    return false;
++}
++
++// Native Configure may supply avcC; the decoder itself only receives Annex-B access units.
++inline std::optional<std::vector<std::uint8_t>> H264Extradata(Bytes bytes) {
++    if (bytes.size() > InputBytes) return {};
++    if (bytes.empty()) return std::vector<std::uint8_t>{};
++    if (!AnnexBNals(bytes).empty()) return std::vector<std::uint8_t>{bytes.begin(), bytes.end()};
++    if (bytes.size() < 7 || bytes[0] != 1) return {};
++    std::vector<std::uint8_t> result;
++    std::size_t pos = 6;
++    unsigned count = bytes[5] & 31;
++    for (int group = 0; group < 2; ++group) {
++        for (unsigned i = 0; i < count; ++i) {
++            if (bytes.size() - pos < 2) return {};
++            const auto length = (std::size_t{bytes[pos]} << 8) | bytes[pos + 1];
++            pos += 2;
++            if (!length || length > bytes.size() - pos || result.size() + length + 4 > InputBytes) return {};
++            result.insert(result.end(), {0, 0, 0, 1});
++            result.insert(result.end(), bytes.begin() + pos, bytes.begin() + pos + length);
++            pos += length;
++        }
++        if (group == 0) {
++            if (pos == bytes.size()) return {};
++            count = bytes[pos++];
++        }
++    }
++    return result;
++}
++
++struct Bits {
++    Bytes bytes;
++    std::size_t pos{};
++    bool valid{true};
++    std::uint32_t Read(unsigned count) {
++        if (count > 32 || pos > bytes.size() * 8 || count > bytes.size() * 8 - pos) {
++            valid = false;
++            return 0;
++        }
++        std::uint32_t value = 0;
++        while (count--) { value = (value << 1) | ((bytes[pos / 8] >> (7 - pos % 8)) & 1); ++pos; }
++        return value;
++    }
++    std::uint32_t UE() {
++        unsigned zeros = 0;
++        while (valid && Read(1) == 0) if (++zeros > 30) { valid = false; return 0; }
++        return ((1U << zeros) - 1) + Read(zeros);
++    }
++    std::int32_t SE() {
++        const auto value = UE();
++        return value & 1 ? static_cast<std::int32_t>((value + 1) / 2) : -static_cast<std::int32_t>(value / 2);
++    }
++};
++inline std::vector<std::uint8_t> Rbsp(Bytes nal, std::size_t limit = InputBytes) {
++    std::vector<std::uint8_t> result;
++    unsigned zeros = 0;
++    for (std::size_t i = 1; i < nal.size() && result.size() < limit; ++i) {
++        if (zeros >= 2 && nal[i] == 3) {
++            if (i + 1 == nal.size() || nal[i + 1] > 3) return {};
++            zeros = 0;
++            continue;
++        }
++        result.push_back(nal[i]);
++        zeros = nal[i] == 0 ? zeros + 1 : 0;
++    }
++    return result;
++}
++// H.264 E.1.2 HRD syntax; cpb_cnt_minus1 is bounded to 31 by the specification.
++inline bool H264Hrd(Bits& b) {
++    const auto count = b.UE();
++    if (!b.valid || count > 31) return false;
++    b.Read(4); b.Read(4);
++    for (unsigned i = 0; i <= count; ++i) { b.UE(); b.UE(); b.Read(1); }
++    b.Read(5); b.Read(5); b.Read(5); b.Read(5);
++    return b.valid;
++}
++
++struct Picture {
++    std::uint32_t coded_width{}, coded_height{}, width{}, height{}, left{}, top{}, level{};
++    std::uint32_t matrix{2}; // AVCOL_SPC_UNSPECIFIED, native service keeps its BT.709 default.
++    bool full_range{}, no_reordering{};
++};
++inline std::optional<Picture> H264Sps(Bytes nal) {
++    auto data = Rbsp(nal);
++    Bits b{data};
++    const auto profile = b.Read(8);
++    b.Read(8); const auto level = b.Read(8);
++    if (b.UE() > 31) return {}; // constraints, level, SPS id
++    if (!level || level > 52) return {};
++    if (profile == 100) {
++        if (b.UE() != 1 || b.UE() != 0 || b.UE() != 0) return {}; // 8-bit 4:2:0 only
++        b.Read(1);
++        if (b.Read(1)) {
++            for (int list = 0; list < 8; ++list) {
++                if (!b.Read(1)) continue;
++                int last = 8, next = 8;
++                for (int i = 0; i < (list < 6 ? 16 : 64); ++i) {
++                    if (next) next = static_cast<int>((std::int64_t{last} + b.SE() + 256) & 255);
++                    last = next ? next : last;
++                }
++            }
++        }
++    } else if (profile != 66 && profile != 77) return {};
++    if (b.UE() > 12) return {};
++    const auto poc = b.UE();
++    if (poc == 0) { if (b.UE() > 12) return {}; }
++    else if (poc == 1) {
++        b.Read(1); b.SE(); b.SE();
++        const auto cycle = b.UE();
++        if (cycle > 256) return {};
++        for (unsigned i = 0; i < cycle; ++i) b.SE();
++    } else if (poc != 2) return {};
++    const auto references = b.UE();
++    if (references > 4) return {}; // The documented depth-one decoder has four DPB frames.
++    b.Read(1);
++    const auto mw = b.UE(), mh = b.UE();
++    if (mw >= 240 || mh >= 136 || !b.Read(1)) return {}; // progressive only
++    b.Read(1);
++    Picture p;
++    p.level = level;
++    p.coded_width = (mw + 1) * 16; p.coded_height = (mh + 1) * 16;
++    std::uint32_t right = 0, bottom = 0;
++    if (b.Read(1)) { p.left = b.UE(); right = b.UE(); p.top = b.UE(); bottom = b.UE(); }
++    if (p.left >= p.coded_width / 2 || right >= p.coded_width / 2 - p.left ||
++        p.top >= p.coded_height / 2 || bottom >= p.coded_height / 2 - p.top) return {};
++    p.left *= 2; p.top *= 2;
++    p.width = p.coded_width - p.left - right * 2;
++    p.height = p.coded_height - p.top - bottom * 2;
++    if (b.Read(1)) { // vui_parameters_present_flag
++        if (b.Read(1) && b.Read(8) == 255) { b.Read(16); b.Read(16); }
++        if (b.Read(1)) b.Read(1);
++        if (b.Read(1)) {
++            b.Read(3); p.full_range = b.Read(1);
++            if (b.Read(1)) { b.Read(8); b.Read(8); p.matrix = b.Read(8); }
++        }
++        if (b.Read(1)) { // chroma_loc_info_present_flag
++            if (b.UE() > 5 || b.UE() > 5) return {};
++        }
++        if (b.Read(1)) { // timing_info_present_flag
++            if (!b.Read(32) || !b.Read(32)) return {};
++            b.Read(1);
++        }
++        const bool nal_hrd = b.Read(1);
++        if (nal_hrd && !H264Hrd(b)) return {};
++        const bool vcl_hrd = b.Read(1);
++        if (vcl_hrd && !H264Hrd(b)) return {};
++        if (nal_hrd || vcl_hrd) b.Read(1); // low_delay_hrd_flag
++        b.Read(1); // pic_struct_present_flag
++        if (b.Read(1)) { // bitstream_restriction_flag
++            b.Read(1); // motion_vectors_over_pic_boundaries_flag
++            for (int i = 0; i < 4; ++i) if (b.UE() > 16) return {};
++            const auto reorder = b.UE(), buffering = b.UE();
++            if (buffering < references || buffering > 4 || reorder > buffering) return {};
++            p.no_reordering = reorder == 0;
++        }
++    }
++    // Require the complete bounded syntax, including rbsp_trailing_bits. Absence of VUI or
++    // bitstream restrictions is valid SPS syntax but never proves decode-order output.
++    if (!b.Read(1)) return {};
++    while (b.valid && b.pos % 8) if (b.Read(1)) return {};
++    if (!b.valid || b.pos != data.size() * 8 || p.matrix > 14) return {};
++    return p;
++}
++
++template <class Frame>
++inline bool ValidFrame(const Frame& frame, int width, int height, std::int64_t pts, int nv12, int yuv420p) {
++    const auto* av = frame.GetFrame();
++    if (!av || av->pts != pts || frame.IsHardwareDecoded() || frame.GetWidth() != width ||
++        frame.GetHeight() != height || av->crop_top || av->crop_bottom ||
++        av->crop_left || av->crop_right || !frame.GetPlane(0) || !frame.GetPlane(1) ||
++        frame.GetStride(0) < width) {
++        return false;
++    }
++    const std::int32_t chroma_width = width / 2 + width % 2;
++    if (frame.GetPixelFormat() == nv12) {
++        return frame.GetStride(1) >= std::int64_t{2} * chroma_width;
++    }
++    return frame.GetPixelFormat() == yuv420p && frame.GetPlane(2) &&
++           frame.GetStride(1) >= chroma_width && frame.GetStride(2) >= chroma_width;
++}
++// Fixed ID spaces from H.264 7.4.2.1/7.4.2.2. No eviction of still-active IDs.
++struct H264ParameterSets {
++    std::array<std::vector<std::uint8_t>, 32> sps;
++    std::array<std::vector<std::uint8_t>, 256> pps;
++    int profile{-1};
++
++    void Observe(Bytes bytes) {
++        for (auto nal : AnnexBNals(bytes)) {
++            const auto type = nal[0] & 31;
++            if ((type != 7 && type != 8) || nal.size() > 65536) continue;
++            auto rbsp = Rbsp(nal);
++            Bits b{rbsp};
++            if (type == 7) b.Read(24); // profile_idc, constraints, level_idc
++            const auto id = b.UE();
++            const auto parent = type == 8 ? b.UE() : 0;
++            if (!b.valid || parent >= sps.size()) continue;
++            if (type == 7) {
++                if (id >= sps.size()) continue;
++                sps[id].assign(nal.begin(), nal.end());
++                profile = rbsp[0];
++            } else if (id < pps.size()) pps[id].assign(nal.begin(), nal.end());
++        }
++    }
++    std::vector<std::uint8_t> Restore(Bytes packet) const {
++        std::vector<std::uint8_t> result;
++        for (const auto& nal : sps) Append(result, nal); // SPS before every PPS.
++        for (const auto& nal : pps) Append(result, nal);
++        result.insert(result.end(), packet.begin(), packet.end());
++        return result;
++    }
++private:
++    static void Append(std::vector<std::uint8_t>& result, Bytes nal) {
++        if (nal.empty()) return;
++        result.insert(result.end(), {0, 0, 0, 1});
++        result.insert(result.end(), nal.begin(), nal.end());
++    }
++};
++} // namespace Eden::VideoDecode
