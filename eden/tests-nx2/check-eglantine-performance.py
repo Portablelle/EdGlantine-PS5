@@ -52,7 +52,12 @@ namespace Eden::Performance {
  inline int vulkan_api[32]{},gc_unbatched_drain{},gc_batched_drain{};
  bool KeepDirtyTextures(){return gc_keep_dirty.load();}
 }
-using DAddr=u64;using GPUVAddr=u64;using BufferId=unsigned;using ImageId=unsigned;
+using DAddr=u64;using GPUVAddr=u64;using ImageId=unsigned;
+struct BufferId {
+ u32 index;constexpr BufferId(u32 value=0xffffffff):index(value){}
+ constexpr explicit operator bool()const noexcept{return index!=0xffffffff;}
+ constexpr bool operator==(const BufferId&)const noexcept=default;
+};
 constexpr u64 operator""_MiB(unsigned long long n){return n*1024*1024;}
 bool True(unsigned x){return x!=0;}bool False(unsigned x){return !x;}
 #define LOG_INFO(...) ((void)0)
@@ -102,13 +107,14 @@ namespace Settings {bool IsGPUFenceBehaviorAccurate(){return false;}}
 struct Binding {DAddr device_addr{};u32 size{};BufferId buffer_id{};
  inline static unsigned assignments{};
  Binding&operator=(const Binding&other){++assignments;device_addr=other.device_addr;size=other.size;buffer_id=other.buffer_id;return *this;}};
-constexpr Binding NULL_BINDING{};constexpr BufferId NULL_BUFFER_ID=0;
+constexpr BufferId NULL_BUFFER_ID{0};constexpr Binding NULL_BINDING{.buffer_id=NULL_BUFFER_ID};
 struct Buffer {bool IsInBounds(u64,u32){return true;}bool IsSparseCompatible(){return true;}};
 struct Memory {std::optional<DAddr>address=32;std::optional<DAddr>GpuToCpuAddress(GPUVAddr){return address;}};
 template<class P>struct BufferCache {
  static constexpr unsigned CACHING_PAGEBITS=32;
  struct State {std::array<std::array<Binding,4>,2>uniform_buffers{};}state,*channel_state=&state;
- Memory memory,*gpu_memory=&memory;std::array<BufferId,16>page_table{};std::array<Buffer,4>slot_buffers{};
+ Memory memory,*gpu_memory=&memory;std::array<BufferId,16>page_table{};
+ struct Buffers:std::array<Buffer,4>{Buffer&operator[](BufferId id){return at(id.index);}}slot_buffers{};
  unsigned creates{};BufferId CreateBuffer(DAddr,u32,bool){++creates;return 2;}
  void SynchronizeBufferWrites(Buffer&){}
  void BindGraphicsUniformBuffer(size_t,u32,GPUVAddr,u32);
@@ -190,7 +196,7 @@ int main(int argc,char**argv){
  const auto assignments=Binding::assignments;
  b.DisableGraphicsUniformBuffer(1,2);assert(Binding::assignments==assignments+1);
  b.DisableGraphicsUniformBuffer(1,2);assert(Binding::assignments==assignments+1);
- assert(b.state.uniform_buffers[1][2].size==0&&!b.state.uniform_buffers[1][2].buffer_id);
+ assert(b.state.uniform_buffers[1][2].size==0&&b.state.uniform_buffers[1][2].buffer_id==NULL_BUFFER_ID);
  constexpr u64 end=u64{1}<<36;
  for(auto addr:std::array<u64,4>{0,end,end+1,std::numeric_limits<u64>::max()})assert(b.FindBuffer(addr,16,false)==0);
  assert(b.FindBuffer(end-8,16,false)==0&&b.creates==0);
