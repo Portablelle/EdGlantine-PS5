@@ -142,7 +142,7 @@ int main() {
     tail.mapped = 0x1000;
     tail.reads = 0;
     assert(UpscaleOperation(tail, tail.base, tail_cache) == Op::SrcCopy);
-    assert(tail.reads == 1 && tail_cache.at(tail.base).length == 0x1000);
+    assert(tail.reads == 1 && tail_cache.empty());
     // An unmapped first block must not reuse a cached positive result.
     rewritten.instruction(0, 0x434, 0x292d292d);
     rewritten.instruction(4, 0x832, 0x40cc40cc);
@@ -218,9 +218,22 @@ int main() {
     short_memory.mapped = 0x1000;
     short_memory.instruction(0, 0x434, 0x292d292d);
     short_memory.instruction(0x400, 0x832, 0x40cc40cc);
+    short_memory.exit(0x101);
     std::unordered_map<GPUVAddr, UpscaleProgramDetection> cache;
     assert(UpscaleOperation(short_memory, short_memory.base, cache) == Op::SrcCopy);
-    assert(short_memory.reads == 1);
+    assert(short_memory.reads == 1 && cache.empty());
+    // Incomplete programs are rescanned rather than retaining a negative prefix result.
+    assert(UpscaleOperation(short_memory, short_memory.base, cache) == Op::SrcCopy);
+    assert(short_memory.reads == 2 && cache.empty());
+    short_memory.mapped = 0x2000;
+    short_memory.reads = 0;
+    assert(UpscaleOperation(short_memory, short_memory.base, cache) == Op::SrcCopySrgbToLinear);
+    assert(short_memory.reads == 2 && cache.at(short_memory.base).length == 0x1020);
+    assert(cache.at(short_memory.base).decodes);
+    short_memory.reads = 0;
+    short_memory.read_bytes = 0;
+    assert(UpscaleOperation(short_memory, short_memory.base, cache) == Op::SrcCopySrgbToLinear);
+    assert(short_memory.reads == 2 && short_memory.read_bytes == 0x1020);
     MemoryManager unmapped;
     unmapped.mapped = 0;
     cache.clear();
@@ -235,6 +248,8 @@ int main() {
     assert(UpscaleOperation(limit, limit.base, cache) == Op::SrcCopy);
     assert(limit.reads == 32);
     MemoryManager bounded;
+    bounded.words.resize(0x30000 / 4);
+    bounded.mapped = 0x30000; // Every tested program can reach the cap without a mapping hole.
     cache.clear();
     for (u64 program = 0; program < 100; ++program) {
         assert(UpscaleOperation(bounded, bounded.base + program * 0x100, cache) == Op::SrcCopy);

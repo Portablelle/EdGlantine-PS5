@@ -12,7 +12,7 @@ index 7fddf9f..f3ec35a 100644
  
      enum class MemoryLayout : u32 {
 diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
-index e8a25b1..63d5ce7 100644
+index e8a25b1..23fe403 100644
 --- a/src/video_core/engines/kepler_compute.cpp
 +++ b/src/video_core/engines/kepler_compute.cpp
 @@ -23,6 +23,7 @@
@@ -23,7 +23,7 @@ index e8a25b1..63d5ce7 100644
  #include "core/core.h"
  #include "video_core/gpu_split.h"
  #include "video_core/nx2_profile.h"
-@@ -682,6 +683,75 @@ void KeplerCompute::DescribeNativeResources(const NativeQmdScheduler::Descriptor
+@@ -682,6 +683,80 @@ void KeplerCompute::DescribeNativeResources(const NativeQmdScheduler::Descriptor
  
  std::atomic<u32> g_nx2_trace_draws_after_upscale{};
  
@@ -85,11 +85,16 @@ index e8a25b1..63d5ce7 100644
 +            if (status == CaptureResult::Complete) break;
 +        }
 +    }
++    const bool decodes = threshold && exponent;
++    if (status == CaptureResult::Continue && length < 0x20000) {
++        // An unmapped tail may appear later. Retry without caching or logging each frame.
++        decodes_srgb.erase(program);
++        return decodes ? Fermi2D::Operation::SrcCopySrgbToLinear : Fermi2D::Operation::SrcCopy;
++    }
 +    // Bound retained program addresses; an evicted program is scanned again on its next use.
 +    if (known == decodes_srgb.end() && decodes_srgb.size() >= 16) {
 +        decodes_srgb.clear();
 +    }
-+    const bool decodes = threshold && exponent;
 +    decodes_srgb[program] = {hash, length, decodes};
 +    LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: {}", program,
 +             decodes ? "decodes sRGB like the program" : "plain copy");
@@ -99,7 +104,7 @@ index e8a25b1..63d5ce7 100644
  // Title 4's upscaler reads the tonemapped frame through the texture handle at cbuf0+0x90 and
  // writes the output resolution image through the surface handle at cbuf0+0xa0 (from its
  // TLD/SUST operands). Blit one to the other with bilinear filtering when both are plain 2D images
-@@ -699,6 +769,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+@@ -699,6 +774,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
          output->Address() == 0 || output->Width() <= input->Width() || !input->IsBlockLinear() ||
          !output->IsBlockLinear())
          return false;
@@ -107,7 +112,7 @@ index e8a25b1..63d5ce7 100644
      using RTFormat = Tegra::RenderTargetFormat;
      RTFormat format{};
      switch (input->format) {
-@@ -723,7 +794,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+@@ -723,7 +799,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
          return result;
      };
      const Fermi2D::Config config{
