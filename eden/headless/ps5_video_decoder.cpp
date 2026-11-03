@@ -252,6 +252,10 @@ public:
         if (shown > 1) return Fail("vp9-multiple-shown"); // One visible frame per interface call.
         for (std::size_t i = 0; i < split->count; ++i) {
             const auto header = *ParseVp9(split->frames[i]);
+            if (header.color_config) {
+                picture.matrix = header.matrix;
+                picture.full_range = header.full_range;
+            }
             if (!DecodeOne(split->frames[i], pts, header.shown, frame)) return false;
         }
         return true;

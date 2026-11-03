@@ -98,9 +98,6 @@ struct Codec {
     // focused on guest fences and teardown, independently of the Videodec2 API.
     struct HardwareSession { void Reset() {} } h264_backend;
     std::vector<u8> h264_extradata;
-    std::array<std::vector<u8>, 2> h264_parameter_sets;
-    s32 h264_profile{-1};
-    bool h264_hardware_used{};
     unsigned pumps{}, drains{};
     bool Initialized() const { return decoder || h264_context; }
     void DrainH264() { ++drains; }

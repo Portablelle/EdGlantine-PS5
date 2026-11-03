@@ -8,76 +8,16 @@
 #include <optional>
 #include <span>
 #include <vector>
+#include "video_core/host1x/video_decode.h"
 
 namespace Eden::VideoDecode {
-using Bytes = std::span<const std::uint8_t>;
 constexpr std::size_t Alignment = 0x4000;
-constexpr std::size_t InputBytes = 0x800000;
 constexpr std::size_t Slots = 3; // The documented depth-one PS5 bring-up, not EVO's async rings.
 
 inline std::optional<std::size_t> Align(std::uint64_t size, std::size_t alignment = Alignment) {
     if (!size || alignment < Alignment || (alignment & (alignment - 1)) ||
         size > std::numeric_limits<std::size_t>::max() - (alignment - 1)) return {};
     return (static_cast<std::size_t>(size) + alignment - 1) & ~(alignment - 1);
-}
-
-inline std::vector<Bytes> AnnexBNals(Bytes bytes) {
-    std::vector<Bytes> units;
-    std::size_t begin = 0;
-    bool found = false;
-    for (std::size_t i = 0; i + 3 <= bytes.size(); ++i) {
-        if (bytes[i] || bytes[i + 1] || bytes[i + 2] != 1) continue;
-        if (found) {
-            auto end = i;
-            while (end > begin && bytes[end - 1] == 0) --end;
-            if (end == begin || units.size() == 256) return {};
-            units.push_back(bytes.subspan(begin, end - begin));
-        } else {
-            for (std::size_t j = 0; j < i; ++j) if (bytes[j]) return {};
-        }
-        found = true;
-        begin = i + 3;
-        i += 2;
-    }
-    if (!found || begin == bytes.size() || units.size() == 256) return {};
-    auto end = bytes.size();
-    while (end > begin && bytes[end - 1] == 0) --end;
-    if (end == begin) return {};
-    units.push_back(bytes.subspan(begin, end - begin));
-    for (const auto unit : units) if (unit[0] & 0x80) return {};
-    return units;
-}
-
-inline bool IsIdr(Bytes bytes) {
-    for (auto nal : AnnexBNals(bytes)) if ((nal[0] & 31) == 5) return true;
-    return false;
-}
-
-// Native Configure may supply avcC; the decoder itself only receives Annex-B access units.
-inline std::optional<std::vector<std::uint8_t>> H264Extradata(Bytes bytes) {
-    if (bytes.size() > InputBytes) return {};
-    if (bytes.empty()) return std::vector<std::uint8_t>{};
-    if (!AnnexBNals(bytes).empty()) return std::vector<std::uint8_t>{bytes.begin(), bytes.end()};
-    if (bytes.size() < 7 || bytes[0] != 1) return {};
-    std::vector<std::uint8_t> result;
-    std::size_t pos = 6;
-    unsigned count = bytes[5] & 31;
-    for (int group = 0; group < 2; ++group) {
-        for (unsigned i = 0; i < count; ++i) {
-            if (bytes.size() - pos < 2) return {};
-            const auto length = (std::size_t{bytes[pos]} << 8) | bytes[pos + 1];
-            pos += 2;
-            if (!length || length > bytes.size() - pos || result.size() + length + 4 > InputBytes) return {};
-            result.insert(result.end(), {0, 0, 0, 1});
-            result.insert(result.end(), bytes.begin() + pos, bytes.begin() + pos + length);
-            pos += length;
-        }
-        if (group == 0) {
-            if (pos == bytes.size()) return {};
-            count = bytes[pos++];
-        }
-    }
-    return result;
 }
 
 struct Superframe {
@@ -109,43 +49,6 @@ inline std::optional<Superframe> SplitVp9(Bytes bytes) {
     return result;
 }
 
-struct Bits {
-    Bytes bytes;
-    std::size_t pos{};
-    bool valid{true};
-    std::uint32_t Read(unsigned count) {
-        if (count > 32 || pos > bytes.size() * 8 || count > bytes.size() * 8 - pos) {
-            valid = false;
-            return 0;
-        }
-        std::uint32_t value = 0;
-        while (count--) { value = (value << 1) | ((bytes[pos / 8] >> (7 - pos % 8)) & 1); ++pos; }
-        return value;
-    }
-    std::uint32_t UE() {
-        unsigned zeros = 0;
-        while (valid && Read(1) == 0) if (++zeros > 30) { valid = false; return 0; }
-        return ((1U << zeros) - 1) + Read(zeros);
-    }
-    std::int32_t SE() {
-        const auto value = UE();
-        return value & 1 ? static_cast<std::int32_t>((value + 1) / 2) : -static_cast<std::int32_t>(value / 2);
-    }
-};
-inline std::vector<std::uint8_t> Rbsp(Bytes nal, std::size_t limit = InputBytes) {
-    std::vector<std::uint8_t> result;
-    unsigned zeros = 0;
-    for (std::size_t i = 1; i < nal.size() && result.size() < limit; ++i) {
-        if (zeros >= 2 && nal[i] == 3) {
-            if (i + 1 == nal.size() || nal[i + 1] > 3) return {};
-            zeros = 0;
-            continue;
-        }
-        result.push_back(nal[i]);
-        zeros = nal[i] == 0 ? zeros + 1 : 0;
-    }
-    return result;
-}
 inline std::optional<bool> IsBSlice(Bytes nal) {
     auto data = Rbsp(nal, 16);
     Bits bits{data};
@@ -217,18 +120,35 @@ inline std::optional<Picture> H264Sps(Bytes nal) {
 }
 
 struct Vp9Header {
-    bool shown{}, existing{}, key{};
-    unsigned profile{};
+    bool shown{}, existing{}, key{}, color_config{}, full_range{};
+    unsigned profile{}, matrix{2};
 };
 inline std::optional<Vp9Header> ParseVp9(Bytes bytes) {
     Bits b{bytes};
     if (b.Read(2) != 2) return {};
     Vp9Header h;
     h.profile = b.Read(1); h.profile |= b.Read(1) << 1;
-    if (h.profile == 3 && b.Read(1)) return {};
+    if (h.profile != 0) return {}; // Only the 8-bit profile-0 backend is supported.
     h.existing = b.Read(1);
     if (h.existing) { b.Read(3); h.shown = true; }
-    else { h.key = !b.Read(1); h.shown = b.Read(1); }
+    else {
+        h.key = !b.Read(1); h.shown = b.Read(1);
+        const bool resilient = b.Read(1);
+        const bool intra_only = !h.key && !h.shown && b.Read(1);
+        if (!h.key && !resilient) b.Read(2); // reset_frame_context
+        if (h.key || intra_only) {
+            if (b.Read(24) != 0x498342) return {};
+            h.color_config = true;
+            if (h.key) {
+                const auto space = b.Read(3);
+                // VP9 color_space to FFmpeg AVColorSpace, matching the software decoder.
+                constexpr unsigned matrices[]{2, 5, 1, 6, 7, 9};
+                if (space >= 6) return {}; // Reserved / RGB are invalid for profile 0.
+                h.matrix = matrices[space];
+                h.full_range = b.Read(1);
+            } else h.matrix = 5; // Profile-0 intra-only implies BT.601, studio range.
+        }
+    }
     if (!b.valid) return {};
     return h;
 }
