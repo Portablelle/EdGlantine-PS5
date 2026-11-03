@@ -48,6 +48,11 @@ static bool cpu_mapping_range(void* base, std::size_t size) {
 }
 extern "C" {
 std::int64_t sceKernelGetDirectMemorySize();
+// Allocated region at or after an offset (flag 1), as in headless/performance.cpp.
+struct DirectMemoryRegion { std::int64_t start; std::int64_t end; std::int32_t type; };
+std::int32_t sceKernelDirectMemoryQuery(std::int64_t, int, DirectMemoryRegion*, std::size_t);
+std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::int64_t, std::size_t,
+                                             std::int64_t*, std::size_t*);
 std::int32_t sceKernelAllocateDirectMemory(std::int64_t, std::int64_t, std::size_t,
                                          std::size_t, int, std::int64_t*);
 std::int32_t sceKernelMapDirectMemory(void**, std::size_t, int, int, std::int64_t, std::size_t);
@@ -57,6 +62,33 @@ std::int32_t sceKernelEnableDmemAliasing();
 int sceKernelDebugOutText(int, const char*);
 }
 #endif
+
+// Signal-safe, uncached pool snapshot shared by fault notices and the crash report.
+// Unknown values are -1; the region walk follows performance.cpp MemoryPool, with a bound.
+extern "C" void eden_direct_memory_free(std::int64_t* free_bytes, std::size_t* largest) noexcept {
+    *free_bytes = -1;
+    *largest = static_cast<std::size_t>(-1);
+#ifdef PS5_NATIVE
+    const std::int64_t total = sceKernelGetDirectMemorySize();
+    if (total <= 0) return;
+    std::int64_t start = 0;
+    std::size_t available = 0;
+    if (sceKernelAvailableDirectMemorySize(0, total, 0x4000, &start, &available) == 0)
+        *largest = available;
+    std::int64_t taken = 0, offset = 0;
+    unsigned regions = 0;
+    DirectMemoryRegion region{};
+    while (offset < total && regions < 8192) {
+        if (sceKernelDirectMemoryQuery(offset, 1, &region, sizeof(region)) != 0) break;
+        if (region.start < offset || region.end <= region.start || region.end > total) return;
+        taken += region.end - region.start;
+        offset = region.end;
+        ++regions;
+    }
+    // No readable regions, or a truncated walk: do not claim the whole pool is free.
+    if (regions != 0 && regions < 8192) *free_bytes = total - taken;
+#endif
+}
 
 namespace Common {
 namespace {

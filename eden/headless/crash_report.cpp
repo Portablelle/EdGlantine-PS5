@@ -289,6 +289,36 @@ void PutRegister(const char* before, const char* name, std::uint64_t value) noex
     report.Hex(value, 16);
 }
 
+// Only atomics, bounded buffer formatting and console kernel queries. The existing report
+// writer saves this to the logs folder once; never touch eden_log's stdio lock in a fault.
+void PutGuestMemoryOom() noexcept {
+    std::uint64_t held = 0, failures = 0, reserve_used = 0, promotions = 0, faults = 0;
+    if (!eden_guest_memory_oom(&held, &failures, &reserve_used, &promotions, &faults)) return;
+    auto& t = report;
+    t.Put("\nreason: game memory exhausted\nEDEN_CRAM held/guest_committed ");
+    t.Dec(held >> 20);
+    t.Put(" MiB, failures=");
+    t.Dec(failures);
+    t.Put(" reserve_used=");
+    t.Dec(reserve_used);
+    t.Put(" promotions=");
+    t.Dec(promotions);
+    t.Put(" faults=");
+    t.Dec(faults);
+#ifdef PS5_NATIVE
+    std::int64_t free_bytes = -1;
+    std::size_t largest = 0;
+    eden_direct_memory_free(&free_bytes, &largest);
+    t.Put("\ndirect memory: total free ");
+    if (free_bytes >= 0) t.Dec(static_cast<std::uint64_t>(free_bytes) >> 20);
+    else t.Put("unknown");
+    t.Put(" MiB, largest free block ");
+    if (largest != static_cast<std::size_t>(-1)) t.Dec(largest >> 20);
+    else t.Put("unknown");
+    t.Put(" MiB");
+#endif
+}
+
 // The report, complete in its buffer.
 void Compose(const Kind* kind, int code, std::uint64_t address, const Registers& r, const char* reason,
              const Stamp& stamp, bool restart) noexcept {
@@ -331,6 +361,7 @@ void Compose(const Kind* kind, int code, std::uint64_t address, const Registers&
         t.Put("\nreason: ");
         t.Put(reason);
     }
+    PutGuestMemoryOom();
     t.Put("\nwhere: ");
     t.Address(r.rip);
     if (!InCode(r.rip)) t.Put(" (outside the app's code: a system library or generated code)");

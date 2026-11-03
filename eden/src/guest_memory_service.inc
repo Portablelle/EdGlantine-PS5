@@ -46,6 +46,9 @@ struct Counters {
     std::atomic<std::uint64_t> fined{0}, unfined{0}, fine_failures{0};
 };
 Counters counters;
+// The failure counter also latches OOM until the service counters reset.
+static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+static_assert(std::atomic<std::size_t>::is_always_lock_free);
 void ResetCounters() noexcept {
     for (auto* counter : {&counters.faults, &counters.promotions, &counters.copies, &counters.waits,
                           &counters.returns_clear, &counters.returns_free, &counters.returns_scan, &counters.dedup,
@@ -405,6 +408,66 @@ std::atomic<std::uintptr_t> probe_expected{0}; // the self-test's write, whateve
 std::atomic<bool> probe_mismatch{false};
 } // namespace
 
+// Lock-free, best-effort snapshot for the signal handler (headless/crash_report.h).
+extern "C" bool eden_guest_memory_oom(std::uint64_t* held, std::uint64_t* failures,
+                                      std::uint64_t* reserve_used, std::uint64_t* promotions,
+                                      std::uint64_t* faults) noexcept {
+    const auto count = counters.failures.load(std::memory_order_acquire);
+    if (count == 0) return false;
+    *held = guest_committed.load(std::memory_order_relaxed);
+    *failures = count;
+    *reserve_used = counters.reserve_used.load(std::memory_order_relaxed);
+    *promotions = counters.promotions.load(std::memory_order_relaxed);
+    *faults = counters.faults.load(std::memory_order_relaxed);
+    return true;
+}
+
+namespace {
+// Fixed-buffer decimal formatting, like crash_report.cpp Text: no stdio in the fault path.
+struct OomNoticeLine {
+    char data[256]{};
+    std::size_t size = 0;
+    void Put(const char* text) noexcept {
+        for (; *text && size + 1 < sizeof(data); ++text) data[size++] = *text;
+        data[size] = '\0';
+    }
+    void Dec(std::uint64_t value) noexcept {
+        char digits[21]{};
+        unsigned count = 20;
+        do { digits[--count] = static_cast<char>('0' + value % 10); value /= 10; } while (value);
+        Put(digits + count);
+    }
+};
+
+void FormatOomNotice(OomNoticeLine& line, std::uint64_t failures) noexcept {
+    std::int64_t free_bytes = -1;
+    std::size_t largest = 0;
+    eden_direct_memory_free(&free_bytes, &largest);
+    line.Put("EDEN_CRAM out of memory: a written slot of the guest's memory found no block failures=");
+    line.Dec(failures);
+    line.Put(" held=");
+    line.Dec(guest_committed.load(std::memory_order_relaxed) >> 20);
+    line.Put("MiB free=");
+    if (free_bytes >= 0) line.Dec(static_cast<std::uint64_t>(free_bytes) >> 20);
+    else line.Put("unknown");
+    line.Put("MiB largest_free=");
+    if (largest != static_cast<std::size_t>(-1)) line.Dec(largest >> 20);
+    else line.Put("unknown");
+    line.Put("MiB\n");
+}
+
+// Scanner thread only: coalesce failures between passes into one app-log entry.
+void ReportGuestMemoryOomGrowth(std::uint64_t& last_failures) noexcept {
+    const auto failures = counters.failures.load(std::memory_order_acquire);
+    if (failures > last_failures) {
+        OomNoticeLine line;
+        FormatOomNotice(line, failures);
+        Report(line.data);
+    }
+    last_failures = failures;
+}
+} // namespace
+
 // A write fault at `address`: true when it was a write to a slot of the guest's memory that is
 // now writable (the faulting instruction repeats), false for anything else.
 bool HandleGuestWriteFault(void* fault) noexcept {
@@ -452,8 +515,10 @@ bool HandleGuestWriteFault(void* fault) noexcept {
     }
     UnlockSlot(*range, slot, ok ? SlotOwn : state);
     if (!ok) {
-        counters.failures.fetch_add(1, std::memory_order_relaxed);
-        Note("EDEN_CRAM out of memory: a written slot of the guest's memory found no block\n");
+        const auto failures = counters.failures.fetch_add(1, std::memory_order_release) + 1;
+        OomNoticeLine line;
+        FormatOomNotice(line, failures);
+        Note(line.data);
     }
     return ok;
 }
@@ -726,11 +791,13 @@ void MeasureFinePages(SparseRange& range) noexcept {
 
 void ScannerLoop(SparseRange* range) {
     auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    std::uint64_t last_failures = 0;
     std::unique_lock lock{scanner_mutex};
     while (!scanner_stop) {
         scanner_wake.wait_for(lock, std::chrono::seconds(20), [] { return scanner_stop; });
         if (scanner_stop) break;
         lock.unlock();
+        ReportGuestMemoryOomGrowth(last_failures);
         if (scan_requested.load(std::memory_order_relaxed)) ScanPass(*range);
 #ifdef PS5_NATIVE
         FillReserve();

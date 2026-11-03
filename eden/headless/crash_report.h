@@ -23,6 +23,13 @@
 #include <string>
 #include <string_view>
 
+// src/guest_memory_service.inc: signal-safe snapshot; false leaves outputs untouched.
+extern "C" bool eden_guest_memory_oom(std::uint64_t* held, std::uint64_t* failures,
+                                      std::uint64_t* reserve_used, std::uint64_t* promotions,
+                                      std::uint64_t* faults) noexcept;
+// src/memory_pages.cpp: uncached signal-safe pool query; -1 denotes unknown.
+extern "C" void eden_direct_memory_free(std::int64_t* free_bytes, std::size_t* largest) noexcept;
+
 namespace Eden::Crash {
 // Threads that named themselves (the SetCurrentThreadName hook, performance.cpp), for the
 // report's "thread" line. Lock-free: the handler reads it on a thread that may hold any lock.
