@@ -1,0 +1,52 @@
+diff --git a/src/core/hle/service/hid/hid_server.cpp b/src/core/hle/service/hid/hid_server.cpp
+index 775a55d..8445dc9 100644
+--- a/src/core/hle/service/hid/hid_server.cpp
++++ b/src/core/hle/service/hid/hid_server.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
++#include <algorithm>
+ #include <array>
+ 
+ #include "common/common_types.h"
+@@ -1011,14 +1012,23 @@ Result IHidServer::SendVibrationValues(
+ }
+ 
+ Result IHidServer::SendNativeVibrationValues(
+-    u16 flags, AppletResourceUserId aruid,
++    u64 flags, AppletResourceUserId aruid,
+     InArray<Core::HID::VibrationDeviceHandle, BufferAttr_HipcPointer> vibration_handles,
+     InArray<Core::HID::VibrationValue, BufferAttr_HipcPointer> vibration_values) {
+     static u32 diagnostic_batches{};
+     if (diagnostic_batches++ < 8) LOG_INFO(Service_HID, "Native vibration batch flags={:#x}, aruid={}, handles={}, values={}",
+              flags, aruid.pid, vibration_handles.size(), vibration_values.size());
+-    R_UNLESS(flags == 0 || flags == 2, IPC::ResultNotSupported);
+-    R_RETURN(SendVibrationValues(ClientAppletResourceUserId{aruid.pid}, vibration_handles, vibration_values));
++    // Command 214 is best effort, including unknown flags and mismatched arrays.
++    const auto count = (std::min)(vibration_handles.size(), vibration_values.size());
++    for (std::size_t i = 0; i < count; i++) {
++        const auto result = GetResourceManager()->SendVibrationValue(
++            aruid.pid, vibration_handles[i], vibration_values[i]);
++        if (result.IsError()) {
++            LOG_DEBUG(Service_HID, "failed to send vibration {}, result={:#x}", i, result.raw);
++        }
++    }
++
++    R_SUCCEED();
+ }
+ 
+ Result IHidServer::SendVibrationGcErmCommand(
+diff --git a/src/core/hle/service/hid/hid_server.h b/src/core/hle/service/hid/hid_server.h
+index d55055c..0552f3b 100644
+--- a/src/core/hle/service/hid/hid_server.h
++++ b/src/core/hle/service/hid/hid_server.h
+@@ -178,7 +178,7 @@ private:
+         InArray<Core::HID::VibrationDeviceHandle, BufferAttr_HipcPointer> vibration_handles,
+         InArray<Core::HID::VibrationValue, BufferAttr_HipcPointer> vibration_values);
+     Result SendNativeVibrationValues(
+-        u16 flags, AppletResourceUserId aruid,
++        u64 flags, AppletResourceUserId aruid,
+         InArray<Core::HID::VibrationDeviceHandle, BufferAttr_HipcPointer> vibration_handles,
+         InArray<Core::HID::VibrationValue, BufferAttr_HipcPointer> vibration_values);
+     Result SendVibrationGcErmCommand(Core::HID::VibrationDeviceHandle vibration_device_handle,
