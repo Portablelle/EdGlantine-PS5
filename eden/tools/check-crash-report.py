@@ -58,6 +58,15 @@ extern "C" int eden_exit_app(void) {
     (void)!write(1, "EXIT\n", 5);
     _exit(43);
 }
+// Memory-service providers are not linked by this check; preserve its non-OOM reports.
+extern "C" bool eden_guest_memory_oom(std::uint64_t*, std::uint64_t*, std::uint64_t*,
+                                      std::uint64_t*, std::uint64_t*) noexcept {
+    return false;
+}
+extern "C" void eden_direct_memory_free(std::int64_t* free_bytes, std::size_t* largest) noexcept {
+    *free_bytes = -1;
+    *largest = static_cast<std::size_t>(-1);
+}
 #ifdef PS5_NATIVE
 // The console calls the report makes.
 extern "C" int sceKernelDebugOutText(int, const char* text) { return static_cast<int>(write(2, text, std::strlen(text))); }
