@@ -58,67 +58,6 @@ inline std::optional<bool> IsBSlice(Bytes nal) {
     return type % 5 == 1;
 }
 
-struct Picture {
-    std::uint32_t coded_width{}, coded_height{}, width{}, height{}, left{}, top{}, level{};
-    std::uint32_t matrix{2}; // AVCOL_SPC_UNSPECIFIED, native service keeps its BT.709 default.
-    bool full_range{};
-};
-inline std::optional<Picture> H264Sps(Bytes nal) {
-    auto data = Rbsp(nal);
-    Bits b{data};
-    const auto profile = b.Read(8);
-    b.Read(8); const auto level = b.Read(8); b.UE(); // constraints, level, SPS id
-    if (!level || level > 52) return {};
-    if (profile == 100) {
-        if (b.UE() != 1 || b.UE() != 0 || b.UE() != 0) return {}; // 8-bit 4:2:0 only
-        b.Read(1);
-        if (b.Read(1)) {
-            for (int list = 0; list < 8; ++list) {
-                if (!b.Read(1)) continue;
-                int last = 8, next = 8;
-                for (int i = 0; i < (list < 6 ? 16 : 64); ++i) {
-                    if (next) next = static_cast<int>((std::int64_t{last} + b.SE() + 256) & 255);
-                    last = next ? next : last;
-                }
-            }
-        }
-    } else if (profile != 66 && profile != 77) return {};
-    if (b.UE() > 12) return {};
-    const auto poc = b.UE();
-    if (poc == 0) { if (b.UE() > 12) return {}; }
-    else if (poc == 1) {
-        b.Read(1); b.SE(); b.SE();
-        const auto cycle = b.UE();
-        if (cycle > 256) return {};
-        for (unsigned i = 0; i < cycle; ++i) b.SE();
-    } else if (poc != 2) return {};
-    if (b.UE() > 4) return {}; // The documented depth-one decoder has four DPB frames.
-    b.Read(1);
-    const auto mw = b.UE(), mh = b.UE();
-    if (mw >= 240 || mh >= 136 || !b.Read(1)) return {}; // progressive only
-    b.Read(1);
-    Picture p;
-    p.level = level;
-    p.coded_width = (mw + 1) * 16; p.coded_height = (mh + 1) * 16;
-    std::uint32_t right = 0, bottom = 0;
-    if (b.Read(1)) { p.left = b.UE(); right = b.UE(); p.top = b.UE(); bottom = b.UE(); }
-    if (p.left >= p.coded_width / 2 || right >= p.coded_width / 2 - p.left ||
-        p.top >= p.coded_height / 2 || bottom >= p.coded_height / 2 - p.top) return {};
-    p.left *= 2; p.top *= 2;
-    p.width = p.coded_width - p.left - right * 2;
-    p.height = p.coded_height - p.top - bottom * 2;
-    if (b.Read(1)) { // VUI prefix: colour information precedes timing/HRD.
-        if (b.Read(1) && b.Read(8) == 255) { b.Read(16); b.Read(16); }
-        if (b.Read(1)) b.Read(1);
-        if (b.Read(1)) {
-            b.Read(3); p.full_range = b.Read(1);
-            if (b.Read(1)) { b.Read(8); b.Read(8); p.matrix = b.Read(8); }
-        }
-    }
-    if (!b.valid || p.matrix > 14) return {};
-    return p;
-}
-
 struct Vp9Header {
     bool shown{}, existing{}, key{}, color_config{}, full_range{};
     unsigned profile{}, matrix{2};

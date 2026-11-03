@@ -126,6 +126,7 @@ class Ps5VideoDecoder final : public FFmpeg::HardwareVideoDecoder {
 public:
     ~Ps5VideoDecoder() override { Close(); }
 
+    // Capability filter only; Open verifies each SPS before creating an AVC decoder.
     bool Supports(VideoCodec codec, const FFmpeg::FrameDimensions& dimensions) const override {
         if (dimensions.width <= 0 || dimensions.height <= 0 ||
             dimensions.width > 3840 || dimensions.height > 2176) return false;
@@ -154,6 +155,7 @@ public:
             if (!converted) return Fail("h264-extradata");
             prefix = std::move(*converted);
             if (!ReadH264(prefix)) return false;
+            if (!have_sps) return Fail("h264-sps-missing");
         }
         const auto limit = sceKernelGetDirectMemorySize();
         if (limit <= 0) return Fail("direct-memory-limit");
@@ -234,6 +236,7 @@ public:
         if (!decoder || failed) return false;
         if (current_codec == VideoCodec::H264) {
             if (packet.empty() || packet.size() > InputBytes - prefix.size()) return Fail("access-unit-size");
+            if (AnnexBNals(packet).empty()) return Fail("h264-annex-b");
             std::vector<u8> au = std::move(prefix);
             prefix.clear();
             au.insert(au.end(), packet.begin(), packet.end());
@@ -311,11 +314,12 @@ private:
                     (decoder && (parsed->coded_width > max_width || parsed->coded_height > max_height)) ||
                     parsed->level > (display.width > 1920 || display.height > 1088 ? 52U : 51U))
                     return Fail("h264-sps-format");
+                if (!parsed->no_reordering) return Fail("h264-reordering");
                 picture = *parsed;
                 have_sps = true;
             } else if (type == 1 || type == 5) {
                 const auto b_slice = IsBSlice(nal);
-                // OutputInfo carries no PTS. Reject B slices rather than guess EVO's PTS window.
+                // Also reject slices contradicting the admitted zero-reordering SPS.
                 if (!b_slice || *b_slice) return Fail("h264-reordering");
             } else if (type >= 2 && type <= 4) return Fail("h264-data-partition");
             else if (type == 0 || type > 12) return Fail("h264-nal-type");
@@ -399,10 +403,11 @@ private:
     bool owns_queue{}, reset_done{}, have_sps{}, decoded_once{}, failed{};
 };
 
+} // namespace
+
 std::unique_ptr<FFmpeg::HardwareVideoDecoder> CreatePs5VideoDecoder() {
     return std::make_unique<Ps5VideoDecoder>();
 }
-} // namespace
 
 void RegisterPs5VideoDecoder() {
     FFmpeg::RegisterHardwareVideoDecoder(CreatePs5VideoDecoder);

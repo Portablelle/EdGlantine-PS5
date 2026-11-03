@@ -1,7 +1,7 @@
-"""Compile real native-video and DecodeApi selection/fallback with mock decoders, on dedie only.
+"""Compile standalone production session and the real PS5 backend on dedie.
 
-FFmpeg and the native backend are recording shims; this checks routing, recovery and
-frame contracts, not Sony ABI correctness or decoded pixels.
+Only external frame storage/allocation and Sony exports are recording dependencies.
+No production declarations, functions or translation units are reconstructed.
 """
 from pathlib import Path
 import os
@@ -11,93 +11,35 @@ import tempfile
 
 assert platform.system() == 'Linux', 'Compile on dedie'
 root = Path(__file__).resolve().parents[1]
-# The optional module must not appear in the eboot's import facade/wiring.
+source = Path((root / '.local/headless-cache').read_text().strip()) / 'source/src'
+host1x = source / 'video_core/host1x'
+native = (source / 'core/hle/service/am/service/native_video_decoder.cpp').read_text()
+assert 'h264_backend.Decode(' in native, 'native video hardware selection hook missing'
+assert (host1x / 'hardware_video_decoder.cpp').is_file(), 'standalone hardware session missing'
+# Integration points requiring the full emulator/FFmpeg build remain presence checks only.
+for hook in ('h264_backend.Reset(', 'h264_backend.Finish(', 'h264_backend.TakeRestartPacket(',
+             'h264_backend.SoftwareResult(', 'h264_backend.ConfigureH264('):
+    assert hook in native, hook
+ffmpeg_source = (host1x / 'ffmpeg.cpp').read_text()
+for hook in ('m_backend.Decode(', 'm_backend.Reset(', 'm_backend.TakeRestartPacket(',
+             'm_backend.SoftwareResult(', 'bool IsBackendFrameValid('):
+    assert hook in ffmpeg_source, hook
+cmake = (source / 'video_core/CMakeLists.txt').read_text()
+for unit in ('hardware_video_decoder.cpp', 'hardware_video_decoder.h', 'video_decode.h'):
+    assert 'host1x/' + unit in cmake, unit
 for name in ('headless/CMakeLists.txt', 'tools/prepare-build.sh', 'tools/package-headless-native.sh'):
     wiring = (root / name).read_text()
     assert 'libSceVideodec2.so' not in wiring and 'build-videodec2-stub' not in wiring, name
 assert 'libSceVideodec2.sprx' not in (root / 'headless/check_package.py').read_text()
 assert not (root / 'tools/build-videodec2-stub.sh').exists()
 assert not (root / 'tools/stubs/libSceVideodec2.c').exists()
-source = Path((root / '.local/headless-cache').read_text().strip()) / 'source/src'
-host1x = source / 'video_core/host1x'
-header = (host1x / 'ffmpeg.h').read_text()
-implementation = (host1x / 'ffmpeg.cpp').read_text()
-native = (source / 'core/hle/service/am/service/native_video_decoder.cpp').read_text()
-assert 'h264_backend.Decode(' in native, 'native video hardware selection hook missing'
-assert (host1x / 'video_decode.h').exists(), 'shared Annex-B and ID-indexed recovery helper missing'
-for removed in ('h264_parameter_sets', 'h264_hardware_used', 'h264_profile', 'UpdateH264HardwareConfiguration'):
-    assert removed not in native, 'native service duplicates recovery: ' + removed
-assert 'Eden::VideoDecode::IsIdr(packet)' in implementation
-assert 'AnnexBNals(bytes)' in (root / 'headless/ps5_video_decoder.cpp').read_text()
 
-
-
-def block(text, signature):
-    start = text.index(signature)
-    brace = text.index('{', start)
-    end, depth = brace + 1, 1
-    while depth:
-        depth += (text[end] == '{') - (text[end] == '}')
-        end += 1
-    return text[start:end] + '\n'
-
-
-assert 'void RegisterHardwareVideoDecoder(' in header, 'hardware decoder registration hook missing'
-assert 'class HardwareVideoDecoder' in header, 'hardware decoder interface missing'
-# Include the real declarations (including private state), not a second selection implementation.
-declarations = header[header.index('struct FrameOffsets'):header.rindex('} // namespace FFmpeg')]
-start = implementation.index('namespace {\nstd::atomic<HardwareVideoDecoderFactory>')
-production = implementation[start:implementation.rindex('\n}')]
-codec = (host1x / 'nvdec_common.h').read_text()
-codec = codec[codec.index('enum class VideoCodec'):codec.index('\n};') + 3]
-# Check the metadata producers that the real selection code consumes.
-assert 's32 profile = -1' in (host1x / 'codecs/decoder.h').read_text()
-assert 'FrameDimensions{width, height, profile}' in (host1x / 'codecs/decoder.cpp').read_text()
-assert 'params.chroma_format_idc.Value() == 1 ? 100 : -1' in (host1x / 'codecs/h264.cpp').read_text()
-assert 'current_frame_info.frame_size.height, 0)' in (host1x / 'codecs/vp9.cpp').read_text()
-
-cpp = r'''
+ffmpeg = r'''#pragma once
 #include <array>
-#include <atomic>
-#include <cassert>
-#include <cstdlib>
-#include <cstdint>
-#include <cstring>
-#include <chrono>
-#include <deque>
-#include <map>
-#include <string>
-#include <thread>
-#include <set>
-#include <unistd.h>
-#include <memory>
-#include <optional>
-#include <queue>
-#include <span>
-#include <string_view>
-#include <utility>
-#include <vector>
-#include "video_core/host1x/video_decode.h"
-using u8 = uint8_t; using u32 = uint32_t; using u64 = uint64_t; using s32 = int32_t; using s64 = int64_t;
-#define YUZU_NON_COPYABLE(...)
-#define YUZU_NON_MOVEABLE(...)
-int warnings = 0;
-#define LOG_WARNING(...) (++warnings)
-#define LOG_ERROR(...) ((void)0)
-#define LOG_DEBUG(...) ((void)0)
-using Result = int;
-namespace Kernel { constexpr int ResultInvalidArgument = -1; }
-#define R_SUCCEED() return 0
-#define R_THROW(result) return result
-namespace Settings {
-enum class NvdecEmulation { Cpu, Gpu };
-struct Value { NvdecEmulation GetValue() const { return NvdecEmulation::Cpu; } };
-struct { Value nvdec_emulation; } values;
-}
+#include "video_core/host1x/hardware_video_decoder.h"
 constexpr int AV_PIX_FMT_NV12 = 1, AV_PIX_FMT_YUV420P = 2, AV_PIX_FMT_YUVJ420P = 3;
 using AVColorSpace = int;
 constexpr int AVCOL_SPC_UNSPECIFIED = 2, AVCOL_RANGE_JPEG = 2, AVCOL_RANGE_MPEG = 1;
-constexpr int AV_INPUT_BUFFER_PADDING_SIZE = 64;
 struct AVFrame {
     int width{}, height{}, format{}, colorspace = 1, color_range{};
     s64 pts{};
@@ -105,17 +47,8 @@ struct AVFrame {
     std::array<u8*, 3> data{};
     std::array<int, 3> linesize{};
 };
-int av_frame_get_buffer(AVFrame*, int) { return 0; } // Frame shim already owns padded planes.
-bool delay_receive = false, reject_software = false;
-std::vector<u8> last_software_packet, last_hardware_extradata;
-struct Counts { int factories{}, supports{}, opens{}, decodes{}, closes{}, software{}, frames{}, drains{}, flushes{}; } counts;
-'''
-cpp += '\nnamespace Tegra::Host1x::NvdecCommon {\n' + codec + '\n}\n'
-cpp += r'''
+inline int av_frame_get_buffer(AVFrame*, int) { return 0; } // Recording Frame already owns planes.
 namespace FFmpeg {
-using Tegra::Host1x::NvdecCommon::VideoCodec;
-// Recording shims for FFmpeg allocations and software decode. Reference pictures are
-// deliberately unavailable until the software decoder receives a keyframe.
 class Frame {
 public:
     Frame() {
@@ -144,97 +77,49 @@ public:
     }
     bool IsHardwareDecoded() const { return hardware; }
 };
-struct RawPacket { s64 pts{}, dts{}; };
-class Packet {
-public:
-    explicit Packet(std::span<const u8> bytes) : data(bytes) {}
-    RawPacket* GetPacket() { return &raw; }
-    std::span<const u8> data;
-    RawPacket raw;
-};
-struct Decoder { explicit Decoder(VideoCodec c) : codec(c) {} VideoCodec codec; };
-bool IsShimKeyframe(VideoCodec codec, std::span<const u8> data) {
-    return codec == VideoCodec::H264 ? Eden::VideoDecode::IsIdr(data) : (data.front() & 4) == 0;
 }
-struct DecoderContext {
-    explicit DecoderContext(const Decoder& d) : codec(d.codec) {}
-    bool OpenContext(const Decoder&, std::span<const u8> = {}) { return true; }
-    bool UsingDecodeOrder() const { return false; }
-    bool SendPacket(const Packet& p) {
-        ++counts.software;
-        last_software_packet.assign(p.data.begin(), p.data.end());
-        if (reject_software) return false;
-        references |= IsShimKeyframe(codec, p.data);
-        if (!references) return false;
-        ++counts.frames;
-        auto frame = std::make_shared<Frame>();
-        frame->format = AV_PIX_FMT_YUV420P;
-        frame->native.pts = p.raw.pts;
-        ready.push(std::move(frame));
-        return true;
-    }
-    std::shared_ptr<Frame> ReceiveFrame() {
-        if (ready.empty() || delay_receive) return {};
-        auto frame = ready.front(); ready.pop(); return frame;
-    }
-    DecoderContext* GetCodecContext() { return this; }
-    VideoCodec codec;
-    bool references{};
-    std::queue<std::shared_ptr<Frame>> ready;
-};
-struct HardwareContext { void InitializeForDecoder(DecoderContext&, const Decoder&) {} };
 '''
-cpp += declarations + '\n' + production + '\n} // namespace FFmpeg\n'
-cpp += r'''
-int avcodec_send_packet(FFmpeg::DecoderContext*, const void*) {
-    ++counts.drains; delay_receive = false; return 0;
-}
-void avcodec_flush_buffers(FFmpeg::DecoderContext* context) {
-    ++counts.flushes; context->references = false;
-}
-// The real service methods and frame/input layouts, with IPC, memory pools and image upload
-// omitted. DecodePendingH264 below is the production entry reached by PumpOutput.
-class INativeVideoCodec {
-public:
-'''
-for signature in ('struct DecodedFrame {', 'struct PendingInput {'):
-    cpp += block(native, signature) + ';\n'
-cpp += r'''
-    using PerfClock = std::chrono::steady_clock;
-    enum PerfStage { Packet, Decode, Receive, Planes };
-    void PerfMark(PerfStage, PerfClock::time_point&) {}
-    std::deque<DecodedFrame> decoded_frames;
-    std::deque<PendingInput> pending_inputs;
-    u64 pending_input_bytes{};
-    std::unique_ptr<FFmpeg::Decoder> h264_decoder;
-    std::unique_ptr<FFmpeg::DecoderContext> h264_context;
-    std::map<u64, u64> h264_timestamps;
-    bool ffmpeg_vp9{};
-    struct Configuration { s32 width = 64, height = 32; };
-    std::optional<Configuration> configuration{Configuration{}};
-'''
-# V1's converter precedes this member and is unused by these extracted decode methods.
-start = native.index('    FFmpeg::HardwareVideoDecoderSession h264_backend;')
-end = native.index('    // The FFmpeg path also serves VP9', start)
-cpp += native[start:end]
-for signature in ('static std::vector<u8> ToAnnexB(',
-                  'void QueueH264Frame(', 'void CollectH264Frames(', 'void DrainH264(',
-                  'Result DecodePendingH264('):
-    cpp += block(native, signature)
-cpp += '};\n'
-# Lifecycle integration remains on the original drain/reset sites, with no extra IPC path.
-assert 'h264_backend.Finish();' in block(native, 'void DrainH264(')
-assert 'h264_backend.Reset();' in block(native, 'void Reset(')
-assert 'DrainH264();' in block(native, 'void Flush(')
-assert 'DrainH264();' in block(native, 'void Stop(')
-assert 'h264_extradata.assign(mime.begin(), mime.end());' in block(native, 'void Configure(')
 
-# Compile the entire real PS5 backend against C ABI recording mocks below.
-backend = (root / 'headless/ps5_video_decoder.cpp').read_text()
-backend = '\n'.join(line for line in backend.splitlines()
-                    if line not in ('#include "video_core/host1x/ffmpeg.h"',))
-cpp += '#define PS5_NATIVE 1\n' + backend + '\n'
-cpp += r'''
+cpp = r'''
+#include <algorithm>
+#include <cstdio>
+#include <array>
+#include <atomic>
+#include <cassert>
+#include <cstdlib>
+#include <cstdint>
+#include <cstring>
+#include <chrono>
+#include <deque>
+#include <map>
+#include <string>
+#include <thread>
+#include <set>
+#include <unistd.h>
+#include <memory>
+#include <optional>
+#include <queue>
+#include <span>
+#include <string_view>
+#include <utility>
+#include <vector>
+#include "video_core/host1x/ffmpeg.h"
+#include "ps5_video_decoder.h"
+#include "ps5_video_helpers.h"
+#include "ps5_videodec2_abi.h"
+
+struct Counts { int factories{}, supports{}, opens{}, decodes{}, closes{}, software{}; } counts;
+int warnings{};
+std::vector<u8> last_software_packet, last_hardware_extradata;
+namespace FFmpeg {
+void HardwareVideoDecoder::ReportFallback(const char*) { ++warnings; }
+// Recording FFmpeg frame facade delegates to the production validator.
+bool IsBackendFrameValid(const Frame& frame, const FrameDimensions& dimensions, s64 pts) {
+    return Eden::VideoDecode::ValidFrame(frame, dimensions.width, dimensions.height, pts,
+                                         AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P);
+}
+}
+
 using namespace FFmpeg;
 using Tegra::Host1x::NvdecCommon::VideoCodec;
 bool fail_open = false, fail_decode = false, no_frame = false, null_factory = false;
@@ -284,41 +169,45 @@ const FrameDimensions high{64, 32, 100}, vp9{64, 32, 0};
 FrameOffsets Offsets(u64 luma = 42) { FrameOffsets o; o.luma = luma; return o; }
 void Setup(bool registered = true) {
     counts = {}; warnings = 0;
-    delay_receive = reject_software = false;
     last_software_packet.clear(); last_hardware_extradata.clear();
     fail_open = fail_decode = no_frame = null_factory = false; bad_frame = 0;
     unsetenv("EDEN_PS5_HW_VIDEODEC");
     RegisterHardwareVideoDecoder(registered ? Factory : nullptr);
 }
-void ExpectFrame(DecodeApi& api, u64 luma = 42) {
-    auto result = api.ReceiveFrame();
-    assert(result && result->frame && result->offsets.luma == luma);
-    assert(!api.ReceiveFrame());
+
+using Route = HardwareVideoDecoderSession::Route;
+using State = HardwareVideoDecoderSession::State;
+Route Submit(HardwareVideoDecoderSession& session, std::span<const u8> packet,
+             VideoCodec codec = VideoCodec::H264, std::optional<FrameDimensions> dimensions = high,
+             FrameOffsets offsets = {}, s64 pts = 1) {
+    std::shared_ptr<Frame> frame;
+    const auto route = session.Decode(codec, packet, offsets, dimensions, pts, {}, frame);
+    if (route == Route::Software) {
+        ++counts.software;
+        last_software_packet = session.TakeRestartPacket();
+        if (last_software_packet.empty()) last_software_packet.assign(packet.begin(), packet.end());
+    } else if (route == Route::Hardware && !offsets.hidden) assert(frame && frame->GetFrame()->pts == pts);
+    else assert(!frame || offsets.hidden);
+    return route;
 }
-void CheckNativeVideo();
-void CheckVideodecApi();
-void CheckLoader(const std::string& mode);
-int main(int argc, char** argv) {
-    if (argc > 1) { CheckLoader(argv[1]); return 0; }
-    CheckNativeVideo();
+void CheckSession() {
     Setup(false);
-    { DecodeApi api; assert(api.Initialize(VideoCodec::H264));
-      assert(api.SendPacket(idr, Offsets(), high)); ExpectFrame(api);
-      assert(counts.factories == 0 && counts.software == 1 && !api.UsingDecodeOrder()); }
-    // Both allowed codecs reach hardware, with no packet sent to software.
+    { HardwareVideoDecoderSession session;
+      assert(session.GetState() == State::Selection);
+      assert(Submit(session, idr) == Route::Software && session.GetState() == State::Software);
+      assert(counts.factories == 0 && !session.SoftwareResult(false));
+      session.Finish(); assert(session.GetState() == State::Software);
+      session.Reset(); assert(session.GetState() == State::Selection); }
     for (auto codec : {VideoCodec::H264, VideoCodec::VP9}) {
-        Setup();
-        { DecodeApi api; assert(api.Initialize(codec));
-          assert(api.SendPacket(codec == VideoCodec::H264 ? std::span<const u8>{idr} : vp9_key,
-                                Offsets(), codec == VideoCodec::H264 ? high : vp9));
-          ExpectFrame(api); assert(api.UsingDecodeOrder());
-          assert(counts.opens == 1 && counts.decodes == 1 && counts.software == 0); }
-        assert(counts.closes == 1);
+        Setup(); HardwareVideoDecoderSession session;
+        assert(Submit(session, codec == VideoCodec::H264 ? std::span<const u8>{idr} : vp9_key,
+                      codec, codec == VideoCodec::H264 ? high : vp9) == Route::Hardware);
+        assert(session.GetState() == State::Hardware && counts.opens == 1 && !counts.software);
+        session.Finish(); assert(session.GetState() == State::Recovery && counts.closes == 1);
+        session.Finish(); assert(counts.closes == 1);
     }
-    // VP8, unsupported/unknown profile, oversized/missing dimensions, and interlace.
-    for (int mode = 0; mode != 8; ++mode) {
-        Setup(); DecodeApi api;
-        auto codec = mode == 0 ? VideoCodec::VP8 : VideoCodec::H264;
+    for (int mode = 0; mode < 8; ++mode) {
+        Setup(); HardwareVideoDecoderSession session;
         auto d = high; auto offsets = Offsets();
         if (mode == 1) d.profile = 244;
         if (mode == 2) d.width = 8192;
@@ -326,230 +215,62 @@ int main(int argc, char** argv) {
         if (mode == 4) d.height = 0;
         if (mode == 6) offsets.interlaced = true;
         if (mode == 7) d.height = 8192;
-        assert(api.Initialize(codec));
-        assert(api.SendPacket(idr, offsets, mode == 5 ? std::nullopt : std::optional{d}));
-        ExpectFrame(api); assert(counts.opens == 0 && counts.software == 1);
+        assert(Submit(session, idr, mode == 0 ? VideoCodec::VP8 : VideoCodec::H264,
+                      mode == 5 ? std::nullopt : std::optional{d}, offsets) == Route::Software);
+        assert(counts.opens == 0 && session.GetState() == State::Software);
     }
     Setup(); setenv("EDEN_PS5_HW_VIDEODEC", "0", 1);
-    { DecodeApi api; assert(api.Initialize(VideoCodec::H264));
-      assert(api.SendPacket(idr, Offsets(), high)); ExpectFrame(api);
-      assert(counts.factories == 0 && counts.software == 1); }
+    { HardwareVideoDecoderSession session;
+      assert(Submit(session, idr) == Route::Software && !counts.factories); }
     Setup(); null_factory = true;
-    { DecodeApi api; assert(api.Initialize(VideoCodec::H264));
-      assert(api.SendPacket(idr, Offsets(), high)); ExpectFrame(api);
-      assert(counts.software == 1); }
+    { HardwareVideoDecoderSession session; assert(Submit(session, idr) == Route::Software); }
     Setup(); fail_open = true;
-    { DecodeApi api; assert(api.Initialize(VideoCodec::H264));
-      assert(api.SendPacket(idr, Offsets(), high)); ExpectFrame(api);
+    { HardwareVideoDecoderSession session;
+      assert(Submit(session, inter) == Route::Software); // Open failure needs no IDR wait.
+      assert(session.GetState() == State::Fallback && counts.closes == 1 && warnings == 1);
       fail_open = false;
-      assert(api.SendPacket(inter, Offsets(99), high)); ExpectFrame(api, 99);
-      assert(counts.opens == 1 && counts.closes == 1 && counts.decodes == 0 && warnings == 1); }
-    // Mid-stream failure: don't feed missing reference pictures to software. Resume at the
-    // next real keyframe, retain offsets, and produce subsequent frames without reopening HW.
+      assert(Submit(session, inter) == Route::Software && counts.opens == 1);
+      assert(!counts.decodes); }
     for (auto codec : {VideoCodec::H264, VideoCodec::VP9}) {
-        Setup(); DecodeApi api; assert(api.Initialize(codec));
+        Setup(); HardwareVideoDecoderSession session;
         auto key = codec == VideoCodec::H264 ? std::span<const u8>{idr} : vp9_key;
         auto delta = codec == VideoCodec::H264 ? std::span<const u8>{inter} : vp9_inter;
         auto d = codec == VideoCodec::H264 ? high : vp9;
-        assert(api.SendPacket(key, Offsets(), d)); ExpectFrame(api);
+        assert(Submit(session, key, codec, d) == Route::Hardware);
         fail_decode = true;
-        assert(api.SendPacket(delta, Offsets(10), d)); assert(!api.ReceiveFrame());
+        assert(Submit(session, delta, codec, d) == Route::Skipped);
+        assert(session.GetState() == State::Recovery && !session.IsActive());
         fail_decode = false;
-        assert(api.SendPacket(delta, Offsets(11), d)); assert(!api.ReceiveFrame());
-        assert(counts.software == 0);
-        assert(api.SendPacket(key, Offsets(12), d)); ExpectFrame(api, 12);
-        for (int i = 0; i != 4; ++i) {
-            assert(api.SendPacket(delta, Offsets(13 + i), d)); ExpectFrame(api, 13 + i);
-        }
+        assert(Submit(session, delta, codec, d) == Route::Skipped && !counts.software);
+        assert(Submit(session, key, codec, d) == Route::Software);
+        assert(session.GetState() == State::Fallback);
+        for (int i = 0; i < 4; ++i) assert(Submit(session, delta, codec, d) == Route::Software);
         assert(counts.opens == 1 && counts.decodes == 2 && counts.closes == 1 && warnings == 1);
-        assert(counts.software == 5 && !api.UsingDecodeOrder());
+        assert(session.SoftwareResult(false) && session.GetState() == State::Recovery);
+        assert(Submit(session, delta, codec, d) == Route::Skipped);
+        assert(Submit(session, key, codec, d) == Route::Software);
+        assert(session.SoftwareResult(true) && session.GetState() == State::Fallback);
+        session.Reset(); assert(session.GetState() == State::Selection);
+        assert(Submit(session, key, codec, d) == Route::Hardware && counts.opens == 2);
     }
-    // Missing visible output and incompatible output each fall back on the current IDR.
-    for (int mode = 0; mode != 7; ++mode) {
+    for (int mode = 0; mode < 9; ++mode) {
         Setup(); no_frame = mode == 0; bad_frame = mode;
-        DecodeApi api; assert(api.Initialize(VideoCodec::H264));
-        assert(api.SendPacket(idr, Offsets(), high)); ExpectFrame(api);
-        assert(counts.software == 1 && counts.closes == 1 && warnings == 1);
+        HardwareVideoDecoderSession session;
+        const auto route = Submit(session, idr);
+        assert(route == (mode == 7 ? Route::Hardware : Route::Software));
+        assert(counts.closes == (mode == 7 ? 0 : 1));
     }
-    Setup(); bad_frame = 7;  // YUV420P is accepted too.
-    { DecodeApi api; assert(api.Initialize(VideoCodec::H264));
-      assert(api.SendPacket(idr, Offsets(), high)); ExpectFrame(api);
-      assert(counts.software == 0); }
     Setup(); no_frame = true;
-    { DecodeApi api; assert(api.Initialize(VideoCodec::VP9));
-      auto hidden = Offsets(); hidden.hidden = true;
-      assert(api.SendPacket(vp9_key, hidden, vp9)); assert(!api.ReceiveFrame());
-      assert(counts.decodes == 1 && counts.software == 0 && warnings == 0);
-      no_frame = false;
-      assert(api.SendPacket(vp9_inter, Offsets(73), vp9)); ExpectFrame(api, 73); }
-    // A changed stream configuration closes hardware permanently and resumes at a keyframe.
+    { HardwareVideoDecoderSession session; auto hidden = Offsets(); hidden.hidden = true;
+      assert(Submit(session, vp9_key, VideoCodec::VP9, vp9, hidden) == Route::Hardware);
+      assert(!counts.software && !warnings); }
     Setup();
-    { DecodeApi api; assert(api.Initialize(VideoCodec::H264));
-      assert(api.SendPacket(idr, Offsets(), high)); ExpectFrame(api);
+    { HardwareVideoDecoderSession session; assert(Submit(session, idr) == Route::Hardware);
       auto changed = high; changed.profile = 244;
-      assert(api.SendPacket(idr, Offsets(), changed)); ExpectFrame(api);
-      assert(counts.closes == 1 && counts.decodes == 1 && counts.software == 1);
-      api.Reset(); assert(api.Initialize(VideoCodec::H264));
-      assert(api.SendPacket(idr, Offsets(), high)); ExpectFrame(api);
-      assert(counts.opens == 2); }
-    CheckVideodecApi();
+      assert(Submit(session, idr, VideoCodec::H264, changed) == Route::Software);
+      assert(counts.closes == 1 && counts.decodes == 1); }
 }
-'''
-cpp += r'''
-void OpenNative(INativeVideoCodec& codec, bool configured = true) {
-    codec.h264_decoder = std::make_unique<Decoder>(VideoCodec::H264);
-    codec.h264_context = std::make_unique<DecoderContext>(*codec.h264_decoder);
-    // The configured CSD is an AVCDecoderConfigurationRecord. Actual Configure stores
-    // these same bytes for backend Open and reopens FFmpeg with them.
-    if (configured) {
-        codec.h264_extradata = {1, 100, 0, 40, 0xff, 0xe1, 0, 5, 0x67, 100, 0, 40, 0x80,
-                                1, 0, 2, 0x68, 0xe0};
-    }
-    assert(codec.h264_context->OpenContext(*codec.h264_decoder, codec.h264_extradata));
-}
-int SubmitNative(INativeVideoCodec& codec, std::span<const u8> bytes, u64 id, bool eos = false) {
-    assert(codec.pending_inputs.empty());
-    codec.pending_input_bytes += bytes.size();
-    codec.pending_inputs.push_back({std::vector<u8>{bytes.begin(), bytes.end()}, id, id * 1000, eos});
-    const auto result = codec.DecodePendingH264();
-    if (result == 0) assert(codec.pending_inputs.empty() && codec.pending_input_bytes == 0);
-    return result;
-}
-void NativeFrame(INativeVideoCodec& codec, u64 id, bool hardware) {
-    assert(codec.decoded_frames.size() == 1);
-    const auto& frame = codec.decoded_frames.front();
-    assert(!frame.eos && frame.submission_id == id && frame.timestamp == id * 1000);
-    assert(frame.bitdepth == 8 && frame.format == 0);
-    assert(frame.widths[0] == 64 && frame.heights[0] == 32);
-    for (int p = 0; p < 3; ++p) {
-        assert(frame.widths[p] == (p ? 32 : 64));
-        assert(frame.heights[p] == (p ? 16 : 32));
-        assert(frame.planes[p].size() == frame.widths[p] * frame.heights[p]);
-        // Every pixel, including row boundaries, catches padding or UV deinterleave errors.
-        for (u8 value : frame.planes[p]) assert(value == (p == 0 ? 0x11 : p == 1 ? 0x22 : 0x33));
-    }
-    assert(frame.full_range == hardware && frame.matrix == (hardware ? 9U : 1U));
-    assert(codec.h264_timestamps.empty());
-    codec.decoded_frames.pop_front();
-}
-void CheckNativeVideo() {
-    Setup(false);
-    { INativeVideoCodec codec; OpenNative(codec);
-      assert(SubmitNative(codec, idr, 1) == 0); NativeFrame(codec, 1, false);
-      assert(counts.software == 1 && counts.factories == 0); }
-    Setup();
-    { INativeVideoCodec codec; OpenNative(codec);
-      assert(SubmitNative(codec, idr, 2) == 0); NativeFrame(codec, 2, true);
-      assert(counts.opens == 1 && counts.decodes == 1 && counts.software == 0);
-      assert(last_hardware_extradata == codec.h264_extradata);
-      // The actual native adapter accepts length-prefixed H.264 too.
-      const std::vector<u8> length_prefixed{0, 0, 0, 2, 0x65, 0x88};
-      const std::vector<u8> annex_b{0, 0, 0, 1, 0x65, 0x88};
-      assert(INativeVideoCodec::ToAnnexB(length_prefixed) == annex_b);
-      assert(SubmitNative(codec, length_prefixed, 3) == 0); NativeFrame(codec, 3, true); }
-    assert(counts.closes == 1);
-    for (int mode = 0; mode < 4; ++mode) {
-        Setup(); INativeVideoCodec codec; OpenNative(codec, mode != 2);
-        if (mode == 0) codec.h264_extradata[9] = 244;
-        if (mode == 1) codec.configuration->width = 8192;
-        if (mode == 3) codec.configuration->height = 4320;
-        assert(SubmitNative(codec, idr, 4) == 0); NativeFrame(codec, 4, false);
-        assert(counts.opens == 0 && counts.software == 1);
-    }
-    Setup(); setenv("EDEN_PS5_HW_VIDEODEC", "0", 1);
-    { INativeVideoCodec codec; OpenNative(codec);
-      assert(SubmitNative(codec, idr, 5) == 0); NativeFrame(codec, 5, false);
-      assert(counts.factories == 0 && counts.software == 1); }
-    Setup(); fail_open = true;
-    { INativeVideoCodec codec; OpenNative(codec);
-      assert(SubmitNative(codec, idr, 6) == 0); NativeFrame(codec, 6, false);
-      fail_open = false;
-      assert(SubmitNative(codec, inter, 7) == 0); NativeFrame(codec, 7, false);
-      assert(counts.opens == 1 && counts.closes == 1 && counts.decodes == 0 && warnings == 1); }
-    Setup();
-    { INativeVideoCodec codec; OpenNative(codec, false);
-      const std::vector<u8> headers_and_idr{
-          0, 0, 0, 1, 0x67, 100, 0, 40, 0x80, // SPS 0
-          0, 0, 0, 1, 0x68, 0xe0, // PPS 0 -> SPS 0
-          0, 0, 0, 1, 0x67, 100, 0, 40, 0x50, // SPS 1
-          0, 0, 0, 1, 0x68, 0x4a, // PPS 1 -> SPS 1
-          0, 0, 0, 1, 0x65, 0xb8}; // IDR referencing the older PPS 0.
-      assert(SubmitNative(codec, headers_and_idr, 8) == 0); NativeFrame(codec, 8, true);
-      fail_decode = true;
-      assert(SubmitNative(codec, inter, 9) == 0); assert(codec.decoded_frames.empty());
-      fail_decode = false;
-      assert(SubmitNative(codec, inter, 10) == 0); assert(codec.decoded_frames.empty());
-      assert(counts.software == 0 && codec.h264_timestamps.empty());
-      assert(SubmitNative(codec, idr, 11) == 0); NativeFrame(codec, 11, false);
-      const std::vector<u8> restored{
-          0, 0, 0, 1, 0x67, 100, 0, 40, 0x80,
-          0, 0, 0, 1, 0x67, 100, 0, 40, 0x50,
-          0, 0, 0, 1, 0x68, 0xe0,
-          0, 0, 0, 1, 0x68, 0x4a,
-          0, 0, 0, 1, 0x65, 0xb8};
-      assert(last_software_packet == restored); // Both ID spaces retained; IDR repeats neither.
-      for (u64 i = 12; i < 16; ++i) {
-          assert(SubmitNative(codec, inter, i) == 0); NativeFrame(codec, i, false);
-      }
-      assert(counts.opens == 1 && counts.decodes == 2 && counts.closes == 1 && warnings == 1);
-      assert(counts.software == 5); }
-    // Missing output, invalid dimensions/layout, and incorrect pts are recoverable failures.
-    for (int mode : {0, 1, 2, 3, 4, 5, 6, 8}) {
-        Setup(); no_frame = mode == 0; bad_frame = mode;
-        INativeVideoCodec codec; OpenNative(codec);
-        assert(SubmitNative(codec, idr, 16) == 0); NativeFrame(codec, 16, false);
-        assert(counts.closes == 1 && counts.software == 1 && warnings == 1);
-    }
-    // Native planar output keeps the same metadata, with no NV12 interleaving assumption.
-    Setup(); bad_frame = 7;
-    { INativeVideoCodec codec; OpenNative(codec);
-      assert(SubmitNative(codec, idr, 17) == 0); NativeFrame(codec, 17, true); }
-    // No registered backend: original receive/drain/flush behavior, including delayed output
-    // before the EOS marker and original submission/timestamp mapping.
-    Setup(false); delay_receive = true;
-    { INativeVideoCodec codec; OpenNative(codec);
-      assert(SubmitNative(codec, idr, 18) == 0); assert(codec.decoded_frames.empty());
-      assert(SubmitNative(codec, {}, 19, true) == 0);
-      assert(codec.decoded_frames.size() == 2 && !codec.decoded_frames.front().eos);
-      auto eos = std::move(codec.decoded_frames.back()); codec.decoded_frames.pop_back();
-      NativeFrame(codec, 18, false);
-      assert(eos.eos && eos.submission_id == 19 && eos.timestamp == 19000);
-      assert(counts.drains == 1 && counts.flushes == 1 && counts.factories == 0);
-      codec.DrainH264(); assert(counts.drains == 2 && counts.flushes == 2);
-      assert(SubmitNative(codec, idr, 20) == 0); NativeFrame(codec, 20, false); }
-    // A hardware drain closes its synchronous session once and permanently resumes software
-    // on IDR. The same method is called by production EOS, Flush and Stop.
-    Setup();
-    { INativeVideoCodec codec; OpenNative(codec);
-      assert(SubmitNative(codec, idr, 21) == 0); NativeFrame(codec, 21, true);
-      codec.DrainH264(); assert(counts.closes == 1);
-      assert(SubmitNative(codec, inter, 22) == 0); assert(codec.decoded_frames.empty());
-      assert(SubmitNative(codec, idr, 23) == 0); NativeFrame(codec, 23, false);
-      assert(counts.opens == 1 && counts.decodes == 1 && counts.software == 1); }
-    // A software rejection during recovery must also consume the input and keep the queue
-    // moving. This does not change the original error path when no backend was attempted.
-    Setup();
-    { INativeVideoCodec codec; OpenNative(codec);
-      assert(SubmitNative(codec, idr, 24) == 0); NativeFrame(codec, 24, true);
-      fail_decode = true;
-      assert(SubmitNative(codec, inter, 25) == 0); fail_decode = false;
-      reject_software = true;
-      assert(SubmitNative(codec, idr, 26) == 0); assert(codec.decoded_frames.empty());
-      reject_software = false;
-      const auto submitted = counts.software;
-      assert(SubmitNative(codec, inter, 260) == 0 && codec.decoded_frames.empty());
-      assert(counts.software == submitted); // Adapter re-enters IDR wait after software rejection.
-      assert(SubmitNative(codec, idr, 27) == 0); NativeFrame(codec, 27, false); }
-    Setup();
-    { INativeVideoCodec codec; OpenNative(codec);
-      codec.ffmpeg_vp9 = true;
-      codec.h264_decoder = std::make_unique<Decoder>(VideoCodec::VP9);
-      codec.h264_context = std::make_unique<DecoderContext>(*codec.h264_decoder);
-      assert(SubmitNative(codec, vp9_key, 28) == 0); NativeFrame(codec, 28, false);
-      assert(counts.factories == 0 && counts.software == 1); }
-}
-'''
-cpp += r'''
+
 namespace Sony {
 constexpr int Error = static_cast<int>(0x811d0200U);
 struct Allocation { void* address{}; size_t bytes{}, alignment{}; };
@@ -765,21 +486,44 @@ struct BitWriter {
         U(0, count); U(value + 1, count + 1);
     }
 };
-std::vector<u8> Sps(bool crop = false) {
+std::vector<u8> Sps(bool crop = false, unsigned reorder = 0, bool vui = true,
+                    bool restriction = true, unsigned buffering = 4, bool hrd = false, unsigned profile = 100) {
     BitWriter w;
-    w.U(100, 8); w.U(0, 8); w.U(31, 8); w.UE(0);
-    w.UE(1); w.UE(0); w.UE(0); w.U(0, 1); w.U(0, 1);
+    w.U(profile, 8); w.U(0, 8); w.U(31, 8); w.UE(0);
+    if (profile == 100) { w.UE(1); w.UE(0); w.UE(0); w.U(0, 1); w.U(0, 1); }
     w.UE(0); w.UE(0); w.UE(0); w.UE(1); w.U(0, 1);
     w.UE(3); w.UE(1); w.U(1, 1); w.U(1, 1); w.U(crop, 1);
     if (crop) { w.UE(0); w.UE(0); w.UE(0); w.UE(1); }
-    w.U(1, 1); w.U(0, 1); w.U(0, 1); w.U(1, 1); w.U(5, 3); w.U(1, 1);
-    w.U(1, 1); w.U(1, 8); w.U(1, 8); w.U(1, 8); w.U(1, 1);
+    w.U(vui, 1);
+    if (vui) {
+        w.U(0, 1); w.U(0, 1); w.U(1, 1); w.U(5, 3); w.U(1, 1);
+        w.U(1, 1); w.U(1, 8); w.U(1, 8); w.U(1, 8);
+        w.U(0, 1); // chroma_loc_info_present_flag
+        w.U(hrd, 1); // timing_info_present_flag
+        if (hrd) { w.U(1, 32); w.U(60, 32); w.U(1, 1); }
+        w.U(hrd, 1); // nal_hrd_parameters_present_flag
+        if (hrd) { w.UE(0); w.U(0, 8); w.UE(0); w.UE(0); w.U(0, 1); w.U(0, 20); }
+        w.U(0, 1); // vcl_hrd_parameters_present_flag
+        if (hrd) w.U(1, 1); // low_delay_hrd_flag
+        w.U(0, 1); w.U(restriction, 1); // pic_struct_present, bitstream_restriction
+        if (restriction) {
+            w.U(1, 1); w.UE(2); w.UE(1); w.UE(16); w.UE(16);
+            w.UE(reorder); w.UE(buffering);
+        }
+    }
+    w.U(1, 1); // rbsp_stop_one_bit
     std::vector<u8> nal{0x67}; unsigned zeros = 0;
     for (auto byte : w.bytes) {
         if (zeros >= 2 && byte <= 3) { nal.push_back(3); zeros = 0; }
         nal.push_back(byte); zeros = byte == 0 ? zeros + 1 : 0;
     }
     return nal;
+}
+std::vector<u8> ParameterData(bool crop = false) {
+    std::vector<u8> result{0, 0, 0, 1}; const auto sps = Sps(crop);
+    result.insert(result.end(), sps.begin(), sps.end());
+    result.insert(result.end(), {0, 0, 1, 0x68, 0xce, 0x3c, 0x80});
+    return result;
 }
 std::vector<u8> AccessUnit(bool crop = false) {
     std::vector<u8> bytes{0, 0, 0, 1}; auto sps = Sps(crop);
@@ -831,7 +575,6 @@ void CheckPacketHelpers() {
     assert(escaped.profile == 100 && !escaped.sps[0].empty()); // Valid EPB preserves the parameter-set ID.
     const std::vector<u8> framed{0,0,0,0,1,0x67,100,0,40,0x80,0,0,1,0x65,0xb8,0,0};
     assert(AnnexBNals(framed).size() == 2 && IsIdr(framed));
-    assert(IsRandomAccessPacket(VideoCodec::H264, framed));
     H264ParameterSets framed_sets; framed_sets.Observe(framed);
     assert(!framed_sets.sps[0].empty());
     for (const std::vector<u8> bytes : {
@@ -842,23 +585,41 @@ void CheckPacketHelpers() {
         std::vector<u8>{9,0,0,1,0x65,0xb8}, // Nonzero leading garbage.
         std::vector<u8>{0,0,1,0xe5,0xb8}}) {
         assert(AnnexBNals(bytes).empty() && !IsIdr(bytes));
-        assert(!IsRandomAccessPacket(VideoCodec::H264, bytes));
         H264ParameterSets rejected; rejected.Observe(bytes); assert(rejected.Restore({}).empty());
         Sony::Setup(); CaptureLog log;
-        auto backend = Eden::CreatePs5VideoDecoder(); assert(backend->Open(VideoCodec::H264, high));
+        auto backend = Eden::CreatePs5VideoDecoder(); assert(backend->Open(VideoCodec::H264, high, ParameterData()));
         std::shared_ptr<Frame> frame; assert(!backend->Decode(bytes, 1, frame));
         assert(Sony::state.decodes == 0); backend->Close(); Sony::Clean();
+        Setup();
+        HardwareVideoDecoderSession session;
+        assert(Submit(session, idr) == Route::Hardware);
+        fail_decode = true; assert(Submit(session, inter) == Route::Skipped);
+        fail_decode = false;
+        assert(Submit(session, bytes) == Route::Skipped && !counts.software);
     }
-    // Both consumers use the adapter's identical restart preparation, not local recovery flags.
     Setup();
-    { DecodeApi api; assert(api.Initialize(VideoCodec::H264));
-      auto headers = ParameterNal(true, 0); auto pps = ParameterNal(false, 0);
-      headers.insert(headers.end(), pps.begin(), pps.end());
+    { HardwareVideoDecoderSession session;
+      session.ConfigureH264(ParameterData());
+      auto unknown = high; unknown.profile = -1;
+      assert(Submit(session, idr, VideoCodec::H264, unknown) == Route::Hardware);
+      assert(Eden::VideoDecode::AnnexBNals(last_hardware_extradata).size() == 2); }
+    // IDR refers to older PPS 0 after SPS/PPS 1 were introduced; both ID spaces survive.
+    Setup();
+    { HardwareVideoDecoderSession session;
+      auto headers = ParameterNal(true, 0); const auto pps0 = ParameterNal(false, 0);
+      const auto sps1 = ParameterNal(true, 1), pps1 = ParameterNal(false, 1, 1);
+      headers.insert(headers.end(), pps0.begin(), pps0.end());
+      headers.insert(headers.end(), sps1.begin(), sps1.end());
+      headers.insert(headers.end(), pps1.begin(), pps1.end());
       headers.insert(headers.end(), idr.begin(), idr.end());
-      assert(api.SendPacket(headers, Offsets(), high)); ExpectFrame(api);
-      fail_decode = true; assert(api.SendPacket(inter, Offsets(), high));
-      fail_decode = false; assert(api.SendPacket(idr, Offsets(), high)); ExpectFrame(api);
-      assert(last_software_packet == headers); }
+      assert(Submit(session, headers) == Route::Hardware);
+      assert(AnnexBNals(last_hardware_extradata).size() == 4);
+      fail_decode = true; assert(Submit(session, inter) == Route::Skipped);
+      fail_decode = false; assert(Submit(session, idr) == Route::Software);
+      auto expected = ParameterNal(true, 0);
+      for (const auto& nal : {sps1, pps0, pps1}) expected.insert(expected.end(), nal.begin(), nal.end());
+      expected.insert(expected.end(), idr.begin(), idr.end());
+      assert(last_software_packet == expected); }
     for (auto space : {0U, 1U, 2U, 3U, 4U, 5U}) {
         const auto h = ParseVp9(Vp9Frame(true, space));
         constexpr unsigned expected[]{2, 5, 1, 6, 7, 9};
@@ -869,9 +630,70 @@ void CheckPacketHelpers() {
     auto intra = ParseVp9(Vp9Frame(false, 0, true, false, true));
     assert(intra && intra->color_config && intra->matrix == 5 && !intra->full_range);
 }
+std::vector<u8> WithSps(std::span<const u8> sps) {
+    std::vector<u8> result{0, 0, 0, 1}; result.insert(result.end(), sps.begin(), sps.end());
+    result.insert(result.end(), {0, 0, 1, 0x68, 0xce, 0x3c, 0x80});
+    result.insert(result.end(), idr.begin(), idr.end());
+    return result;
+}
+void CheckSpsAdmission() {
+    using namespace Eden::VideoDecode;
+    auto malformed = Sps(); malformed.pop_back();
+    assert(!H264Sps(malformed));
+    assert(H264Sps(Sps())->no_reordering);
+    assert(H264Sps(Sps(false, 0, true, true, 4, true))->no_reordering); // Timing + bounded HRD.
+    assert(!H264Sps(Sps(false, 1))->no_reordering);
+    assert(!H264Sps(Sps(false, 0, false))->no_reordering);
+    assert(!H264Sps(Sps(false, 0, true, false))->no_reordering);
+    assert(!H264Sps(Sps(false, 0, true, true, 0))); // Buffering < max_num_ref_frames.
+    assert(!H264Sps(Sps(false, 0, true, true, 5))); // Beyond the configured four-frame DPB.
+    const auto baseline = Sps(false, 0, false, true, 4, false, 66);
+    assert(H264Sps(baseline) && !H264Sps(baseline)->no_reordering);
+    unsigned index = 0;
+    for (const auto& sps : {Sps(), Sps(false, 1), Sps(false, 0, false), malformed,
+                            Sps(false, 0, true, false), Sps(false, 0, true, true, 0), baseline}) {
+        Sony::Setup(); CaptureLog log; Eden::RegisterPs5VideoDecoder();
+        HardwareVideoDecoderSession session; std::shared_ptr<Frame> frame;
+        const auto route = session.Decode(VideoCodec::H264, WithSps(sps), {}, high, 51, {}, frame);
+        if (index++ == 0) {
+            assert(route == Route::Hardware && frame && frame->GetFrame()->pts == 51);
+            assert(Sony::state.decodes == 1);
+        } else {
+            assert(route == Route::Software && !frame && session.GetState() == State::Fallback);
+            assert(!Sony::state.creates && !Sony::state.decodes);
+            const auto text = log.Read();
+            assert(text.find("EDEN_HW_VIDEODEC fallback reason=h264-") != std::string::npos);
+            assert(text.find("fallback reason=") == text.rfind("fallback reason="));
+        }
+        session.Finish(); Sony::Clean();
+    }
+    Sony::Setup();
+    { CaptureLog log; Eden::RegisterPs5VideoDecoder();
+      HardwareVideoDecoderSession session; std::shared_ptr<Frame> frame;
+      assert(session.Decode(VideoCodec::H264, AccessUnit(), {}, high, 61, {}, frame) == Route::Hardware);
+      const auto unsafe = Sps(false, 1);
+      std::vector<u8> change{0,0,0,1}; change.insert(change.end(), unsafe.begin(), unsafe.end());
+      change.insert(change.end(), inter.begin(), inter.end());
+      assert(session.Decode(VideoCodec::H264, change, {}, high, 62, {}, frame) == Route::Skipped);
+      assert(!frame && session.GetState() == State::Recovery && Sony::state.decodes == 1);
+      assert(session.Decode(VideoCodec::H264, idr, {}, high, 63, {}, frame) == Route::Software);
+      const auto restored = session.TakeRestartPacket();
+      const auto nals = AnnexBNals(restored); assert(!nals.empty());
+      assert(std::vector<u8>(nals[0].begin(), nals[0].end()) == unsafe);
+      assert(Sony::state.decodes == 1 && Sony::state.deletes == 1);
+      const auto text = log.Read();
+      assert(text.find("EDEN_HW_VIDEODEC fallback reason=h264-reordering") != std::string::npos);
+      assert(text.find("fallback reason=") == text.rfind("fallback reason="));
+      Sony::Clean(); }
+    Sony::Setup();
+    { CaptureLog log; auto backend = Eden::CreatePs5VideoDecoder();
+      assert(!backend->Open(VideoCodec::H264, high)); // Missing SPS cannot establish admission.
+      assert(!Sony::state.creates && !Sony::state.decodes); Sony::Clean(); }
+}
 void CheckVideodecApi() {
     using namespace Eden::VideoDecode;
     CheckPacketHelpers();
+    CheckSpsAdmission();
     const auto au = AccessUnit();
     assert(AnnexBNals(au).size() == 3 && IsIdr(au));
     assert(AnnexBNals(std::array<u8, 3>{0, 0, 1}).empty());
@@ -954,7 +776,7 @@ void CheckVideodecApi() {
       backend->Close(); Sony::Clean(); }
     for (unsigned allocation = 2; allocation <= 5; ++allocation) {
         Sony::Setup(); Sony::state.fail_direct_index = allocation; CaptureLog log;
-        auto backend = Eden::CreatePs5VideoDecoder(); assert(!backend->Open(VideoCodec::H264, high));
+        auto backend = Eden::CreatePs5VideoDecoder(); assert(!backend->Open(VideoCodec::H264, high, ParameterData()));
         backend->Close(); Sony::Clean();
         assert(Sony::state.queues == Sony::state.releases);
     }
@@ -988,7 +810,7 @@ void CheckVideodecApi() {
       assert(deleted < cpu_freed && cpu_freed < queue_freed); }
     for (int mode = 0; mode < 5; ++mode) {
         Sony::Setup(); CaptureLog log;
-        auto backend = Eden::CreatePs5VideoDecoder(); assert(backend->Open(VideoCodec::H264, high));
+        auto backend = Eden::CreatePs5VideoDecoder(); assert(backend->Open(VideoCodec::H264, high, ParameterData()));
         Sony::state.no_picture = mode == 0; Sony::state.bad_pitch = mode == 1;
         Sony::state.bad_bounds = mode == 2; Sony::state.bad_size = mode == 3;
         Sony::state.output_error = mode == 4;
@@ -1000,7 +822,7 @@ void CheckVideodecApi() {
     }
     Sony::Setup();
     { CaptureLog log; auto backend = Eden::CreatePs5VideoDecoder();
-      assert(backend->Open(VideoCodec::H264, {64, 30, 100}));
+      assert(backend->Open(VideoCodec::H264, {64, 30, 100}, ParameterData(true)));
       Sony::state.buffered = true;
       std::shared_ptr<Frame> frame; assert(backend->Decode(AccessUnit(true), 11, frame));
       assert(frame->GetWidth() == 64 && frame->GetHeight() == 30 && frame->GetPlane(1)[0] == 0x22);
@@ -1027,7 +849,7 @@ void CheckVideodecApi() {
     for (bool vp : {false, true}) {
         Sony::Setup(); CaptureLog log;
         auto backend = Eden::CreatePs5VideoDecoder();
-        assert(backend->Open(vp ? VideoCodec::VP9 : VideoCodec::H264, vp ? vp9 : high));
+        assert(backend->Open(vp ? VideoCodec::VP9 : VideoCodec::H264, vp ? vp9 : high, vp ? std::vector<u8>{} : ParameterData()));
         std::shared_ptr<Frame> frame;
         if (vp) assert(!backend->Decode(std::array<u8, 1>{0xc1}, 1, frame));
         else assert(!backend->Decode(std::array<u8, 5>{0, 0, 1, 0x41, 0xa0}, 1, frame));
@@ -1036,8 +858,7 @@ void CheckVideodecApi() {
     assert(Sony::loader.loads == 1 && Sony::loader.resolves == 10);
     RegisterHardwareVideoDecoder(nullptr);
 }
-'''
-cpp += r'''
+
 size_t CountLog(const std::string& text, const std::string& needle) {
     size_t count = 0, pos = 0;
     while ((pos = text.find(needle, pos)) != std::string::npos) { ++count; pos += needle.size(); }
@@ -1059,16 +880,15 @@ void CheckLoader(const std::string& mode) {
     assert(candidate->Supports(VideoCodec::H264, high));
     assert(Sony::loader.loads == 0 && Sony::loader.resolves == 0); // Registration/Supports are lazy.
     if (mode == "--loader-concurrent") {
-        std::array<const void*, 8> tables{};
         std::array<std::thread, 8> threads;
-        for (size_t i = 0; i < threads.size(); ++i) {
-            threads[i] = std::thread([&, i] {
-                const auto& api = Eden::GetVideodec2Api();
-                assert(api.ready); tables[i] = &api;
-            });
-        }
+        for (auto& thread : threads) thread = std::thread([] {
+            auto backend = Eden::CreatePs5VideoDecoder();
+            backend->Open(VideoCodec::H264, high, ParameterData());
+            backend->Close();
+        });
         for (auto& thread : threads) thread.join();
-        for (auto* table : tables) assert(table == tables[0]);
+        assert(Sony::state.creates >= 1 && Sony::state.creates == Sony::state.deletes);
+        Sony::Setup(); // Loader cache survives while decoder resource counters reset.
     }
     for (unsigned attempt = 0; attempt < 2; ++attempt) {
         HardwareVideoDecoderSession session;
@@ -1104,20 +924,38 @@ void CheckLoader(const std::string& mode) {
     } else {
         assert(text.find("EDEN_HW_VIDEODEC module-load rc=0x0000002a") != std::string::npos);
         assert(CountLog(text, "EDEN_HW_VIDEODEC symbol-missing ") == 0);
-        assert(CountLog(text, "EDEN_HW_VIDEODEC fallback ") == 0);
+        if (mode == "--loader-concurrent") {
+            // Queue ownership may reject contenders; the shared loader must still succeed once.
+            assert(CountLog(text, "EDEN_HW_VIDEODEC fallback ") ==
+                   CountLog(text, "EDEN_HW_VIDEODEC fallback reason=queue-busy "));
+        } else assert(CountLog(text, "EDEN_HW_VIDEODEC fallback ") == 0);
         assert(Sony::state.creates == 2 && Sony::state.decodes == 2 && Sony::state.deletes == 2);
     }
 }
+
+int main(int argc, char** argv) {
+    if (argc > 1) { CheckLoader(argv[1]); return 0; }
+    CheckSession();
+    CheckVideodecApi();
+}
 '''
+
 with tempfile.TemporaryDirectory(prefix='hw-video-fallback-') as directory:
     temp = Path(directory)
+    shim = temp / 'video_core/host1x/ffmpeg.h'
+    shim.parent.mkdir(parents=True)
+    shim.write_text(ffmpeg)
     (temp / 'check.cpp').write_text(cpp)
     subprocess.run(['clang++-18', '-std=c++20', '-O1', '-g',
-                    '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
-                    '-pthread', '-I' + str(root / 'headless'), '-I' + str(source), str(temp / 'check.cpp'), '-o', str(temp / 'check')], check=True)
+                    '-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-pthread',
+                    '-DPS5_NATIVE=1', '-I' + str(temp), '-I' + str(source),
+                    '-I' + str(root / 'headless'),
+                    str(host1x / 'hardware_video_decoder.cpp'),
+                    str(root / 'headless/ps5_video_decoder.cpp'),
+                    str(temp / 'check.cpp'), '-o', str(temp / 'check')], check=True)
     for mode in (None, '--loader-module-fail', '--loader-symbol-missing',
                  '--loader-null-symbol', '--loader-success', '--loader-concurrent'):
         subprocess.run([str(temp / 'check')] + ([mode] if mode else []), check=True,
                        env={key: value for key, value in os.environ.items()
                             if key != 'EDEN_PS5_HW_VIDEODEC'})
-print('HW_VIDEO_DECODE_FALLBACK_PASS (ASan/UBSan; real native-video/DecodeApi/backend, mock Videodec2 API)')
+print('HW_VIDEO_DECODE_FALLBACK_PASS (ASan/UBSan; standalone production session/backend, recording dependencies)')

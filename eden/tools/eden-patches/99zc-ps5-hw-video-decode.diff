@@ -165,6 +165,19 @@ diff --git a/src/core/hle/service/am/service/native_video_decoder.cpp b/src/core
      // The FFmpeg path also serves VP9 (frames are passed through unchanged, no extradata).
      bool ffmpeg_vp9{};
      std::optional<GraphicsSupervisorProtocol::VideoDecoderConfiguration> configuration;
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -75,6 +75,9 @@
+     host1x/codec_types.h
+     host1x/ffmpeg.cpp
+     host1x/ffmpeg.h
++    host1x/hardware_video_decoder.cpp
++    host1x/hardware_video_decoder.h
++    host1x/video_decode.h
+     host1x/control.cpp
+     host1x/control.h
+     host1x/gpu_device_memory_manager.cpp
 diff --git a/src/video_core/host1x/codecs/decoder.cpp b/src/video_core/host1x/codecs/decoder.cpp
 --- a/src/video_core/host1x/codecs/decoder.cpp
 +++ b/src/video_core/host1x/codecs/decoder.cpp
@@ -226,57 +239,13 @@ diff --git a/src/video_core/host1x/codecs/vp9.cpp b/src/video_core/host1x/codecs
 diff --git a/src/video_core/host1x/ffmpeg.cpp b/src/video_core/host1x/ffmpeg.cpp
 --- a/src/video_core/host1x/ffmpeg.cpp
 +++ b/src/video_core/host1x/ffmpeg.cpp
-@@ -4,6 +4,8 @@
- // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
- // SPDX-License-Identifier: GPL-2.0-or-later
- 
-+#include <atomic>
-+#include <cstdlib>
- #include <cstring>
- #include <string_view>
- #include <vector>
-@@ -359,7 +361,156 @@
+@@ -359,7 +359,22 @@
      return std::move(m_final_frame);
  }
  
-+namespace {
-+std::atomic<HardwareVideoDecoderFactory> hardware_video_decoder_factory{};
-+
-+bool HardwareVideoDecoderEnabled() {
-+    const char* value = std::getenv("EDEN_PS5_HW_VIDEODEC");
-+    return !value || std::string_view{value} != "0";
-+}
-+
-+bool IsRandomAccessPacket(Tegra::Host1x::NvdecCommon::VideoCodec codec,
-+                          std::span<const u8> packet) {
-+    using Tegra::Host1x::NvdecCommon::VideoCodec;
-+    if (codec == VideoCodec::VP9) {
-+        // Composed VP9 profile 0 header: marker 10, profile 00, show_existing 0, frame_type 0.
-+        return !packet.empty() && (packet[0] & 0xfc) == 0x80;
-+    }
-+    if (codec == VideoCodec::H264) return Eden::VideoDecode::IsIdr(packet);
-+    return false;
-+}
-+
-+bool IsBackendFrameValid(const Frame& frame, const FrameDimensions& dimensions) {
-+    const auto* av = frame.GetFrame();
-+    if (frame.IsHardwareDecoded() || frame.GetWidth() != dimensions.width ||
-+        frame.GetHeight() != dimensions.height || av->crop_top || av->crop_bottom ||
-+        av->crop_left || av->crop_right || !frame.GetPlane(0) || !frame.GetPlane(1) ||
-+        frame.GetStride(0) < dimensions.width) {
-+        return false;
-+    }
-+    const s32 chroma_width = dimensions.width / 2 + dimensions.width % 2;
-+    if (frame.GetPixelFormat() == AV_PIX_FMT_NV12) {
-+        return frame.GetStride(1) >= s64{2} * chroma_width;
-+    }
-+    return frame.GetPixelFormat() == AV_PIX_FMT_YUV420P && frame.GetPlane(2) &&
-+           frame.GetStride(1) >= chroma_width && frame.GetStride(2) >= chroma_width;
-+}
-+} // namespace
-+
-+void RegisterHardwareVideoDecoder(HardwareVideoDecoderFactory factory) {
-+    hardware_video_decoder_factory.store(factory);
++bool IsBackendFrameValid(const Frame& frame, const FrameDimensions& dimensions, s64 pts) {
++    return Eden::VideoDecode::ValidFrame(frame, dimensions.width, dimensions.height, pts,
++                                         AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P);
 +}
 +
 +DecodeApi::~DecodeApi() {
@@ -287,112 +256,13 @@ diff --git a/src/video_core/host1x/ffmpeg.cpp b/src/video_core/host1x/ffmpeg.cpp
 +    LOG_WARNING(HW_GPU, "EDEN_HW_VIDEODEC fallback reason={}", reason);
 +}
 +
-+bool HardwareVideoDecoderAvailable() {
-+    return hardware_video_decoder_factory.load() && HardwareVideoDecoderEnabled();
-+}
-+
-+HardwareVideoDecoderSession::~HardwareVideoDecoderSession() {
-+    Reset();
-+}
-+
-+void HardwareVideoDecoderSession::Reset() {
-+    Finish();
-+    m_checked = false;
-+    m_wait_for_keyframe = false;
-+    m_fell_back = false;
-+    m_restore = false;
-+    m_h264 = {};
-+    m_restart_packet.clear();
-+}
-+
-+void HardwareVideoDecoderSession::Finish() {
-+    if (m_backend) {
-+        m_backend->Close();
-+        m_backend.reset();
-+        m_dimensions.reset();
-+        m_wait_for_keyframe = true;
-+        m_fell_back = true;
-+        m_restore = true;
-+    }
-+}
-+
-+void HardwareVideoDecoderSession::ConfigureH264(std::span<const u8> extradata) {
-+    if (HardwareVideoDecoderAvailable() || m_restore) {
-+        if (const auto extra = Eden::VideoDecode::H264Extradata(extradata)) m_h264.Observe(*extra);
-+    }
-+}
-+
-+bool HardwareVideoDecoderSession::SoftwareResult(bool accepted) {
-+    if (!accepted && m_fell_back) {
-+        m_wait_for_keyframe = true;
-+        m_restore = true;
-+    }
-+    return accepted || m_fell_back;
-+}
-+
-+HardwareVideoDecoderSession::Route HardwareVideoDecoderSession::Decode(
-+    Tegra::Host1x::NvdecCommon::VideoCodec codec, std::span<const u8> packet,
-+    const FrameOffsets& offsets, std::optional<FrameDimensions> dimensions, s64 pts,
-+    std::span<const u8> extradata, std::shared_ptr<Frame>& frame) {
-+    using Tegra::Host1x::NvdecCommon::VideoCodec;
-+    frame.reset();
-+    m_restart_packet.clear();
-+    if (codec == VideoCodec::H264 &&
-+        ((!m_checked && HardwareVideoDecoderAvailable()) || m_backend || m_restore)) {
-+        if (!m_checked) ConfigureH264(extradata);
-+        m_h264.Observe(packet);
-+        if (dimensions && dimensions->profile < 0) dimensions->profile = m_h264.profile;
-+    }
-+    if (!m_checked) {
-+        m_checked = true;
-+        const auto factory = hardware_video_decoder_factory.load();
-+        if (factory && HardwareVideoDecoderEnabled() && !offsets.interlaced && dimensions &&
-+            dimensions->width > 0 && dimensions->height > 0 && dimensions->profile >= 0 &&
-+            (codec == VideoCodec::H264 || codec == VideoCodec::VP9)) {
-+            auto backend = factory();
-+            if (backend && backend->Supports(codec, *dimensions)) {
-+                m_backend = std::move(backend);
-+                m_dimensions = dimensions;
-+                if (!m_backend->Open(codec, *dimensions, extradata)) {
-+                    m_backend->ReportFallback("open-failed");
-+                    Finish();
-+                    // No hardware references have been consumed yet; FFmpeg can take this packet.
-+                    m_wait_for_keyframe = false;
-+                }
-+            }
-+        }
-+    }
-+    if (m_backend) {
-+        if (dimensions == m_dimensions && !offsets.interlaced &&
-+            m_backend->Decode(packet, pts, frame) &&
-+            (offsets.hidden || (frame && frame->GetFrame()->pts == pts &&
-+                                IsBackendFrameValid(*frame, *dimensions)))) {
-+            return Route::Hardware;
-+        }
-+        frame.reset();
-+        m_backend->ReportFallback("decode-or-output-failed");
-+        Finish();
-+    }
-+    if (m_wait_for_keyframe) {
-+        if (!IsRandomAccessPacket(codec, packet)) {
-+            return Route::Skipped;
-+        }
-+        m_wait_for_keyframe = false;
-+    }
-+    if (m_restore) {
-+        if (codec == VideoCodec::H264) m_restart_packet = m_h264.Restore(packet);
-+        m_restore = false;
-+    }
-+    return Route::Software;
-+}
-+
  void DecodeApi::Reset() {
 +    m_backend.Reset();
 +    m_backend_frames = {};
      m_hardware_context.reset();
      m_decoder_context.reset();
      m_decoder.reset();
-@@ -374,6 +525,7 @@
+@@ -374,6 +389,7 @@
  
  bool DecodeApi::Initialize(Tegra::Host1x::NvdecCommon::VideoCodec codec) {
      this->Reset();
@@ -400,7 +270,7 @@ diff --git a/src/video_core/host1x/ffmpeg.cpp b/src/video_core/host1x/ffmpeg.cpp
      m_decoder.emplace(codec);
      m_decoder_context.emplace(*m_decoder);
  
-@@ -387,6 +539,7 @@
+@@ -387,6 +403,7 @@
  
      // Enable GPU decoding if requested.
      if (!is_mediacodec &&
@@ -408,7 +278,7 @@ diff --git a/src/video_core/host1x/ffmpeg.cpp b/src/video_core/host1x/ffmpeg.cpp
          Settings::values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu) {
          m_hardware_context.emplace();
          m_hardware_context->InitializeForDecoder(*m_decoder_context, *m_decoder);
-@@ -412,6 +565,22 @@
+@@ -412,6 +429,22 @@
  
  bool DecodeApi::SendPacket(std::span<const u8> packet_data, const FrameOffsets& offsets,
                             std::optional<FrameDimensions> dimensions) {
@@ -431,7 +301,7 @@ diff --git a/src/video_core/host1x/ffmpeg.cpp b/src/video_core/host1x/ffmpeg.cpp
      if (!m_opened) {
          std::vector<u8> extradata;
  #if defined(__ANDROID__)
-@@ -440,17 +609,24 @@
+@@ -440,17 +473,24 @@
          }
          m_opened = true;
      }
@@ -472,14 +342,199 @@ diff --git a/src/video_core/host1x/ffmpeg.h b/src/video_core/host1x/ffmpeg.h
  #include "common/common_funcs.h"
  #include "common/common_types.h"
  #include "video_core/host1x/nvdec_common.h"
-+#include "video_core/host1x/video_decode.h"
++#include "video_core/host1x/hardware_video_decoder.h"
  
  extern "C" {
  #if defined(__GNUC__) || defined(__clang__)
-@@ -208,6 +210,71 @@
- struct FrameDimensions {
-     s32 width{};
-     s32 height{};
+@@ -198,31 +200,19 @@
+     bool m_decode_order{};
+ };
+ 
+-struct FrameOffsets {
+-    bool interlaced{};
+-    bool hidden{};
+-    u64 luma{};
+-    u64 luma_bottom{};
+-};
+-
+-struct FrameDimensions {
+-    s32 width{};
+-    s32 height{};
+-};
+-
+ class DecodeApi {
+ public:
+     YUZU_NON_COPYABLE(DecodeApi);
+     YUZU_NON_MOVEABLE(DecodeApi);
+ 
+     DecodeApi() = default;
+-    ~DecodeApi() = default;
++    ~DecodeApi();
+ 
+     bool Initialize(Tegra::Host1x::NvdecCommon::VideoCodec codec);
+     void Reset();
+ 
+     bool UsingDecodeOrder() const {
+-        return m_decoder_context->UsingDecodeOrder();
++        return m_backend.IsActive() || m_decoder_context->UsingDecodeOrder();
+     }
+ 
+     bool SendPacket(std::span<const u8> packet_data, const FrameOffsets& offsets,
+@@ -235,6 +225,9 @@
+     std::optional<DecodedFrame> ReceiveFrame();
+ 
+ private:
++    Tegra::Host1x::NvdecCommon::VideoCodec m_codec{};
++    HardwareVideoDecoderSession m_backend;
++    std::queue<DecodedFrame> m_backend_frames;
+     std::optional<FFmpeg::Decoder> m_decoder;
+     std::optional<FFmpeg::DecoderContext> m_decoder_context;
+     std::optional<FFmpeg::HardwareContext> m_hardware_context;
+diff --git a/src/video_core/host1x/hardware_video_decoder.cpp b/src/video_core/host1x/hardware_video_decoder.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/video_core/host1x/hardware_video_decoder.cpp
+@@ -0,0 +1,109 @@
++// SPDX-License-Identifier: GPL-3.0-only
++#include "video_core/host1x/hardware_video_decoder.h"
++#include <atomic>
++#include <cstdlib>
++#include <string_view>
++
++namespace FFmpeg {
++namespace {
++std::atomic<HardwareVideoDecoderFactory> hardware_video_decoder_factory{};
++bool Enabled() {
++    const char* value = std::getenv("EDEN_PS5_HW_VIDEODEC");
++    return !value || std::string_view{value} != "0";
++}
++bool IsRandomAccess(Tegra::Host1x::NvdecCommon::VideoCodec codec, std::span<const u8> packet) {
++    using Tegra::Host1x::NvdecCommon::VideoCodec;
++    return codec == VideoCodec::H264 ? Eden::VideoDecode::IsIdr(packet) :
++           codec == VideoCodec::VP9 && !packet.empty() && (packet[0] & 0xfc) == 0x80;
++}
++}
++
++void RegisterHardwareVideoDecoder(HardwareVideoDecoderFactory factory) {
++    hardware_video_decoder_factory.store(factory);
++}
++bool HardwareVideoDecoderAvailable() {
++    return hardware_video_decoder_factory.load() && Enabled();
++}
++HardwareVideoDecoderSession::~HardwareVideoDecoderSession() { Reset(); }
++
++void HardwareVideoDecoderSession::Transition(State next) {
++    if (m_state == State::Hardware && next != State::Hardware) {
++        m_backend->Close();
++        m_backend.reset();
++        m_dimensions = {};
++    }
++    m_state = next;
++}
++void HardwareVideoDecoderSession::Reset() {
++    Transition(State::Selection);
++    m_h264 = {};
++    m_restart_packet.clear();
++}
++void HardwareVideoDecoderSession::Finish() {
++    if (m_state == State::Hardware) Transition(State::Recovery);
++}
++void HardwareVideoDecoderSession::ConfigureH264(std::span<const u8> extradata) {
++    if (HardwareVideoDecoderAvailable() || IsWaiting()) {
++        if (const auto extra = Eden::VideoDecode::H264Extradata(extradata)) m_h264.Observe(*extra);
++    }
++}
++bool HardwareVideoDecoderSession::SoftwareResult(bool accepted) {
++    if (!accepted && HasFallenBack()) Transition(State::Recovery);
++    return accepted || HasFallenBack();
++}
++
++HardwareVideoDecoderSession::Route HardwareVideoDecoderSession::Decode(
++    Tegra::Host1x::NvdecCommon::VideoCodec codec, std::span<const u8> packet,
++    const FrameOffsets& offsets, std::optional<FrameDimensions> dimensions, s64 pts,
++    std::span<const u8> extradata, std::shared_ptr<Frame>& frame) {
++    using Tegra::Host1x::NvdecCommon::VideoCodec;
++    frame.reset();
++    m_restart_packet.clear();
++    if (codec == VideoCodec::H264 &&
++        ((m_state == State::Selection && HardwareVideoDecoderAvailable()) || IsActive() || IsWaiting())) {
++        if (m_state == State::Selection) ConfigureH264(extradata);
++        m_h264.Observe(packet);
++        if (dimensions && dimensions->profile < 0) dimensions->profile = m_h264.profile;
++    }
++    if (m_state == State::Selection) {
++        const auto factory = hardware_video_decoder_factory.load();
++        if (factory && Enabled() && !offsets.interlaced && dimensions &&
++            dimensions->width > 0 && dimensions->height > 0 && dimensions->profile >= 0 &&
++            (codec == VideoCodec::H264 || codec == VideoCodec::VP9)) {
++            auto backend = factory();
++            if (backend && backend->Supports(codec, *dimensions)) {
++                // Include in-band SPS before Open so admission can verify its VUI restrictions.
++                const auto parameters = codec == VideoCodec::H264 ? m_h264.Restore({}) : std::vector<u8>{};
++                if (!backend->Open(codec, *dimensions,
++                                   codec == VideoCodec::H264 ? std::span<const u8>{parameters} : extradata)) {
++                    backend->ReportFallback("open-failed");
++                    backend->Close();
++                    Transition(State::Fallback); // No references consumed: submit current packet.
++                    if (codec == VideoCodec::H264) m_restart_packet = m_h264.Restore(packet);
++                } else {
++                    m_backend = std::move(backend);
++                    m_dimensions = *dimensions;
++                    Transition(State::Hardware);
++                }
++            }
++        }
++        if (m_state == State::Selection) Transition(State::Software);
++    }
++    if (m_state == State::Hardware) {
++        if (dimensions == m_dimensions && !offsets.interlaced &&
++            m_backend->Decode(packet, pts, frame) &&
++            (offsets.hidden || (frame && IsBackendFrameValid(*frame, *dimensions, pts)))) {
++            return Route::Hardware;
++        }
++        frame.reset();
++        m_backend->ReportFallback("decode-or-output-failed");
++        Transition(State::Recovery);
++    }
++    if (m_state == State::Recovery) {
++        if (!IsRandomAccess(codec, packet)) return Route::Skipped;
++        if (codec == VideoCodec::H264) m_restart_packet = m_h264.Restore(packet);
++        Transition(State::Fallback);
++    }
++    return Route::Software;
++}
++} // namespace FFmpeg
+diff --git a/src/video_core/host1x/hardware_video_decoder.h b/src/video_core/host1x/hardware_video_decoder.h
+new file mode 100644
+--- /dev/null
++++ b/src/video_core/host1x/hardware_video_decoder.h
+@@ -0,0 +1,95 @@
++// SPDX-License-Identifier: GPL-3.0-only
++#pragma once
++#include <memory>
++#include <optional>
++#include <span>
++#include <utility>
++#include <vector>
++#include "common/common_types.h"
++#include "video_core/host1x/nvdec_common.h"
++#include "video_core/host1x/video_decode.h"
++
++namespace FFmpeg {
++class Frame;
++struct FrameDimensions;
++bool IsBackendFrameValid(const Frame& frame, const FrameDimensions& dimensions, s64 pts);
++
++struct FrameOffsets {
++    bool interlaced{};
++    bool hidden{};
++    u64 luma{};
++    u64 luma_bottom{};
++};
++
++struct FrameDimensions {
++    s32 width{};
++    s32 height{};
 +    // Profile of the bitstream; unknown profiles stay on FFmpeg.
 +    s32 profile{-1};
 +
@@ -493,7 +548,7 @@ diff --git a/src/video_core/host1x/ffmpeg.h b/src/video_core/host1x/ffmpeg.h
 +// propagate pts and signal colorspace/color_range on the AVFrame. Native-video consumes 8-bit
 +// planar 4:2:0 plus that metadata (NV12 is deinterleaved). Delayed/reordered output is not
 +// supported by this synchronous contract: return failure rather than attach a wrong pts.
-+// Open receives codec-specific extradata when supplied by the native service.
++// Open receives codec-specific extradata; the session supplies cached Annex-B SPS/PPS for AVC.
 +class HardwareVideoDecoder {
 +public:
 +    virtual ~HardwareVideoDecoder() = default;
@@ -517,8 +572,8 @@ diff --git a/src/video_core/host1x/ffmpeg.h b/src/video_core/host1x/ffmpeg.h
 +// submit this packet to FFmpeg; Skipped consumes it while waiting for a reference-safe restart.
 +class HardwareVideoDecoderSession {
 +public:
-+    YUZU_NON_COPYABLE(HardwareVideoDecoderSession);
-+    YUZU_NON_MOVEABLE(HardwareVideoDecoderSession);
++    HardwareVideoDecoderSession(const HardwareVideoDecoderSession&) = delete;
++    HardwareVideoDecoderSession& operator=(const HardwareVideoDecoderSession&) = delete;
 +    HardwareVideoDecoderSession() = default;
 +    ~HardwareVideoDecoderSession();
 +    enum class Route { Software, Hardware, Skipped };
@@ -529,56 +584,31 @@ diff --git a/src/video_core/host1x/ffmpeg.h b/src/video_core/host1x/ffmpeg.h
 +    // Synchronous backends have no queued output. Drain closes them and subsequent packets
 +    // use FFmpeg from the next IDR/keyframe; it does not retry hardware after EOS/Flush/Stop.
 +    void Finish();
-+    bool IsActive() const { return m_backend != nullptr; }
-+    bool IsWaiting() const { return m_wait_for_keyframe; }
-+    bool HasFallenBack() const { return m_fell_back; }
++    // Fallback is software after a hardware attempt; Software was never admitted to hardware.
++    enum class State { Selection, Hardware, Recovery, Software, Fallback };
++    State GetState() const { return m_state; }
++    bool IsActive() const { return m_state == State::Hardware; }
++    bool IsWaiting() const { return m_state == State::Recovery; }
++    bool HasFallenBack() const { return m_state == State::Recovery || m_state == State::Fallback; }
 +    std::vector<u8> TakeRestartPacket() { return std::exchange(m_restart_packet, {}); }
 +    bool SoftwareResult(bool accepted);
 +    void ConfigureH264(std::span<const u8> extradata);
 +
 +private:
 +    std::unique_ptr<HardwareVideoDecoder> m_backend;
-+    std::optional<FrameDimensions> m_dimensions;
++    FrameDimensions m_dimensions{};
 +    Eden::VideoDecode::H264ParameterSets m_h264;
 +    std::vector<u8> m_restart_packet;
-+    bool m_restore{};
-+    bool m_checked{};
-+    bool m_wait_for_keyframe{};
-+    bool m_fell_back{};
- };
- 
- class DecodeApi {
-@@ -216,13 +283,13 @@
-     YUZU_NON_MOVEABLE(DecodeApi);
- 
-     DecodeApi() = default;
--    ~DecodeApi() = default;
-+    ~DecodeApi();
- 
-     bool Initialize(Tegra::Host1x::NvdecCommon::VideoCodec codec);
-     void Reset();
- 
-     bool UsingDecodeOrder() const {
--        return m_decoder_context->UsingDecodeOrder();
-+        return m_backend.IsActive() || m_decoder_context->UsingDecodeOrder();
-     }
- 
-     bool SendPacket(std::span<const u8> packet_data, const FrameOffsets& offsets,
-@@ -235,6 +302,9 @@
-     std::optional<DecodedFrame> ReceiveFrame();
- 
- private:
-+    Tegra::Host1x::NvdecCommon::VideoCodec m_codec{};
-+    HardwareVideoDecoderSession m_backend;
-+    std::queue<DecodedFrame> m_backend_frames;
-     std::optional<FFmpeg::Decoder> m_decoder;
-     std::optional<FFmpeg::DecoderContext> m_decoder_context;
-     std::optional<FFmpeg::HardwareContext> m_hardware_context;
++    void Transition(State next);
++    State m_state{State::Selection};
++};
++
++} // namespace FFmpeg
 diff --git a/src/video_core/host1x/video_decode.h b/src/video_core/host1x/video_decode.h
 new file mode 100644
 --- /dev/null
 +++ b/src/video_core/host1x/video_decode.h
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,264 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +// Adapted from sainsaji/EVO-PLAYER-PS5 a54dcf516e9cfda4c26d78733bf5ccb8c10e7e0b (GPL-3.0)
 +// Shared, bounded packet framing for backend validation and software recovery.
@@ -691,6 +721,119 @@ new file mode 100644
 +        zeros = nal[i] == 0 ? zeros + 1 : 0;
 +    }
 +    return result;
++}
++// H.264 E.1.2 HRD syntax; cpb_cnt_minus1 is bounded to 31 by the specification.
++inline bool H264Hrd(Bits& b) {
++    const auto count = b.UE();
++    if (!b.valid || count > 31) return false;
++    b.Read(4); b.Read(4);
++    for (unsigned i = 0; i <= count; ++i) { b.UE(); b.UE(); b.Read(1); }
++    b.Read(5); b.Read(5); b.Read(5); b.Read(5);
++    return b.valid;
++}
++
++struct Picture {
++    std::uint32_t coded_width{}, coded_height{}, width{}, height{}, left{}, top{}, level{};
++    std::uint32_t matrix{2}; // AVCOL_SPC_UNSPECIFIED, native service keeps its BT.709 default.
++    bool full_range{}, no_reordering{};
++};
++inline std::optional<Picture> H264Sps(Bytes nal) {
++    auto data = Rbsp(nal);
++    Bits b{data};
++    const auto profile = b.Read(8);
++    b.Read(8); const auto level = b.Read(8);
++    if (b.UE() > 31) return {}; // constraints, level, SPS id
++    if (!level || level > 52) return {};
++    if (profile == 100) {
++        if (b.UE() != 1 || b.UE() != 0 || b.UE() != 0) return {}; // 8-bit 4:2:0 only
++        b.Read(1);
++        if (b.Read(1)) {
++            for (int list = 0; list < 8; ++list) {
++                if (!b.Read(1)) continue;
++                int last = 8, next = 8;
++                for (int i = 0; i < (list < 6 ? 16 : 64); ++i) {
++                    if (next) next = static_cast<int>((std::int64_t{last} + b.SE() + 256) & 255);
++                    last = next ? next : last;
++                }
++            }
++        }
++    } else if (profile != 66 && profile != 77) return {};
++    if (b.UE() > 12) return {};
++    const auto poc = b.UE();
++    if (poc == 0) { if (b.UE() > 12) return {}; }
++    else if (poc == 1) {
++        b.Read(1); b.SE(); b.SE();
++        const auto cycle = b.UE();
++        if (cycle > 256) return {};
++        for (unsigned i = 0; i < cycle; ++i) b.SE();
++    } else if (poc != 2) return {};
++    const auto references = b.UE();
++    if (references > 4) return {}; // The documented depth-one decoder has four DPB frames.
++    b.Read(1);
++    const auto mw = b.UE(), mh = b.UE();
++    if (mw >= 240 || mh >= 136 || !b.Read(1)) return {}; // progressive only
++    b.Read(1);
++    Picture p;
++    p.level = level;
++    p.coded_width = (mw + 1) * 16; p.coded_height = (mh + 1) * 16;
++    std::uint32_t right = 0, bottom = 0;
++    if (b.Read(1)) { p.left = b.UE(); right = b.UE(); p.top = b.UE(); bottom = b.UE(); }
++    if (p.left >= p.coded_width / 2 || right >= p.coded_width / 2 - p.left ||
++        p.top >= p.coded_height / 2 || bottom >= p.coded_height / 2 - p.top) return {};
++    p.left *= 2; p.top *= 2;
++    p.width = p.coded_width - p.left - right * 2;
++    p.height = p.coded_height - p.top - bottom * 2;
++    if (b.Read(1)) { // vui_parameters_present_flag
++        if (b.Read(1) && b.Read(8) == 255) { b.Read(16); b.Read(16); }
++        if (b.Read(1)) b.Read(1);
++        if (b.Read(1)) {
++            b.Read(3); p.full_range = b.Read(1);
++            if (b.Read(1)) { b.Read(8); b.Read(8); p.matrix = b.Read(8); }
++        }
++        if (b.Read(1)) { // chroma_loc_info_present_flag
++            if (b.UE() > 5 || b.UE() > 5) return {};
++        }
++        if (b.Read(1)) { // timing_info_present_flag
++            if (!b.Read(32) || !b.Read(32)) return {};
++            b.Read(1);
++        }
++        const bool nal_hrd = b.Read(1);
++        if (nal_hrd && !H264Hrd(b)) return {};
++        const bool vcl_hrd = b.Read(1);
++        if (vcl_hrd && !H264Hrd(b)) return {};
++        if (nal_hrd || vcl_hrd) b.Read(1); // low_delay_hrd_flag
++        b.Read(1); // pic_struct_present_flag
++        if (b.Read(1)) { // bitstream_restriction_flag
++            b.Read(1); // motion_vectors_over_pic_boundaries_flag
++            for (int i = 0; i < 4; ++i) if (b.UE() > 16) return {};
++            const auto reorder = b.UE(), buffering = b.UE();
++            if (buffering < references || buffering > 4 || reorder > buffering) return {};
++            p.no_reordering = reorder == 0;
++        }
++    }
++    // Require the complete bounded syntax, including rbsp_trailing_bits. Absence of VUI or
++    // bitstream restrictions is valid SPS syntax but never proves decode-order output.
++    if (!b.Read(1)) return {};
++    while (b.valid && b.pos % 8) if (b.Read(1)) return {};
++    if (!b.valid || b.pos != data.size() * 8 || p.matrix > 14) return {};
++    return p;
++}
++
++template <class Frame>
++inline bool ValidFrame(const Frame& frame, int width, int height, std::int64_t pts, int nv12, int yuv420p) {
++    const auto* av = frame.GetFrame();
++    if (!av || av->pts != pts || frame.IsHardwareDecoded() || frame.GetWidth() != width ||
++        frame.GetHeight() != height || av->crop_top || av->crop_bottom ||
++        av->crop_left || av->crop_right || !frame.GetPlane(0) || !frame.GetPlane(1) ||
++        frame.GetStride(0) < width) {
++        return false;
++    }
++    const std::int32_t chroma_width = width / 2 + width % 2;
++    if (frame.GetPixelFormat() == nv12) {
++        return frame.GetStride(1) >= std::int64_t{2} * chroma_width;
++    }
++    return frame.GetPixelFormat() == yuv420p && frame.GetPlane(2) &&
++           frame.GetStride(1) >= chroma_width && frame.GetStride(2) >= chroma_width;
 +}
 +// Fixed ID spaces from H.264 7.4.2.1/7.4.2.2. No eviction of still-active IDs.
 +struct H264ParameterSets {
