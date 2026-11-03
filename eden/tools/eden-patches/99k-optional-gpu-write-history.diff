@@ -1,0 +1,37 @@
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 138606f..ac2e976 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -561,6 +561,10 @@ void Maxwell3D::DumpRecentWrites(u32 method) {
+     }
+     LOG_ERROR(HW_GPU, "Write to {:#x} while macro {:#x} collects parameters ({} so far); last writes:",
+               method, executing_macro, macro_params.size());
++    if (!record_write_history) {
++        LOG_ERROR(HW_GPU, "Register write history disabled; EDEN_NX2_3D_HISTORY=1 enables it");
++        return;
++    }
+     for (size_t i = 0; i < recent_writes.size(); ++i) {
+         const auto& w = recent_writes[(recent_write_index + i) % recent_writes.size()];
+         if (w.amount != 0) {
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+index 9e6df6d..99613fb 100644
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3338,7 +3338,17 @@ private:
+     };
+     std::array<RecentWrite, 48> recent_writes{};
+     size_t recent_write_index = 0;
++    const bool record_write_history{
++#ifdef NDEBUG
++        std::getenv("EDEN_NX2_3D_HISTORY") != nullptr
++#else
++        true
++#endif
++    };
+     void RecordWrite(u32 method, u32 argument, u32 amount, u32 pending) {
++        if (!record_write_history) {
++            return;
++        }
+         recent_writes[recent_write_index++ % recent_writes.size()] = {method, argument, amount, pending};
+     }
+     void DumpRecentWrites(u32 method);

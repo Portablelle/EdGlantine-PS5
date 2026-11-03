@@ -1,6 +1,6 @@
 """Production DMA admission and readback cache contracts; compile only on dedie."""
 from pathlib import Path
-import platform,subprocess,tempfile
+import os,platform,subprocess,tempfile
 assert platform.system()=='Linux','Compile on dedie'
 r=Path(__file__).resolve().parents[1];src=Path((r/'.local/headless-cache').read_text().strip())/'source/src'
 cpp=r'''
@@ -195,3 +195,53 @@ with tempfile.TemporaryDirectory(prefix='native-low-parameter-refresh-') as td:
  t=Path(td);(t/'check.cpp').write_text(code)
  subprocess.run(['clang++-18','-std=c++20','-O1','-g','-fsanitize=address,undefined','-DEDEN_NX2_PS5_PROTO','-I'+str(src),str(t/'check.cpp'),'-o',str(t/'check')],check=True)
  subprocess.run([str(t/'check')],check=True)
+# Compile the actual history storage/inline writer and diagnostic in both build modes.
+header=(src/'video_core/engines/maxwell_3d.h').read_text()
+assert '#include <cstdlib>' in header
+history=header[header.index('    struct RecentWrite {'):header.index('    void DumpRecentWrites(')]
+code=r'''
+#include <array>
+#include <cstdlib>
+#include <cstdint>
+#include <string>
+#include <vector>
+using u32=uint32_t;
+std::vector<std::string> logs;
+#define LOG_ERROR(category,message,...) logs.emplace_back(message)
+#define CHECK(x) do {if(!(x)) std::abort();} while(false)
+struct Maxwell3D {
+ u32 executing_macro=7;std::vector<u32> macro_params{1,2};
+ void DumpRecentWrites(u32);
+'''+history+'};\n'+extract('void Maxwell3D::DumpRecentWrites(')+r'''
+int main(int argc,char**argv){
+ const bool enabled=std::string(argv[1])=="enabled";
+ // Match PS5 dev-settings: set the environment after startup, before construction.
+ if(argc>2)CHECK(setenv("EDEN_NX2_3D_HISTORY",argv[2],1)==0);
+ Maxwell3D engine;
+ for(u32 i=1;i<=50;++i)engine.RecordWrite(i,i+100,1,i+200);
+ CHECK(engine.recent_write_index==(enabled?50U:0U));
+ if(enabled){
+  for(size_t i=0;i<engine.recent_writes.size();++i){
+   const auto& w=engine.recent_writes[(engine.recent_write_index+i)%engine.recent_writes.size()];
+   CHECK(w.method==i+3&&w.argument==i+103&&w.amount==1&&w.pending==i+203);
+  }
+ }else for(const auto& w:engine.recent_writes)CHECK(w.amount==0);
+ engine.DumpRecentWrites(9);
+ CHECK(logs.size()==(enabled?49U:2U));
+ CHECK(logs[0].find("collects parameters")!=std::string::npos);
+ if(!enabled)CHECK(logs[1]=="Register write history disabled; EDEN_NX2_3D_HISTORY=1 enables it");
+ // Preserve the existing diagnostic rate limit.
+ for(unsigned i=0;i<3;++i)engine.DumpRecentWrites(9);
+ const auto count=logs.size();engine.DumpRecentWrites(9);CHECK(logs.size()==count);
+}
+'''
+with tempfile.TemporaryDirectory(prefix='gpu-write-history-') as td:
+ t=Path(td);(t/'check.cpp').write_text(code)
+ env=dict(os.environ);env.pop('EDEN_NX2_3D_HISTORY',None)
+ for release in (False,True):
+  subprocess.run(['clang++-18','-std=c++20','-O1','-g','-fsanitize=address,undefined',
+                  *(['-DNDEBUG'] if release else []),str(t/'check.cpp'),'-o',str(t/'check')],check=True)
+  subprocess.run([str(t/'check'),'disabled' if release else 'enabled'],env=env,check=True)
+  for value in ('1','0',''):
+   subprocess.run([str(t/'check'),'enabled',value],env=env,check=True)
+print('GPU_WRITE_HISTORY_DEBUG_RELEASE_AND_OPT_IN_PASS')
