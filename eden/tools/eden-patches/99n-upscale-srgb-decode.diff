@@ -1,0 +1,252 @@
+diff --git a/src/video_core/engines/fermi_2d.h b/src/video_core/engines/fermi_2d.h
+index 7fddf9f..f3ec35a 100644
+--- a/src/video_core/engines/fermi_2d.h
++++ b/src/video_core/engines/fermi_2d.h
+@@ -70,6 +70,8 @@ public:
+         ROP = 4,
+         SrcCopyPremult = 5,
+         BlendPremult = 6,
++        // Not a hardware operation: decode sRGB for an upscale program that decodes its output.
++        SrcCopySrgbToLinear = 7,
+     };
+ 
+     enum class MemoryLayout : u32 {
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index e8a25b1..23fe403 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -23,6 +23,7 @@
+ #include "common/assert.h"
+ #include "common/logging.h"
+ #include "shader_recompiler/exception.h"
++#include "shader_recompiler/frontend/ampere/program_capture.h"
+ #include "core/core.h"
+ #include "video_core/gpu_split.h"
+ #include "video_core/nx2_profile.h"
+@@ -682,6 +683,80 @@ void KeplerCompute::DescribeNativeResources(const NativeQmdScheduler::Descriptor
+ 
+ std::atomic<u32> g_nx2_trace_draws_after_upscale{};
+ 
++// Match the half-precision threshold and exponent used by the program's sRGB decode.
++static Fermi2D::Operation UpscaleOperation(MemoryManager& memory_manager, GPUVAddr program,
++                                         std::unordered_map<GPUVAddr, UpscaleProgramDetection>& decodes_srgb) {
++    std::array<u32, 0x400> block{};
++    if (!memory_manager.IsFullyMappedRange(program, sizeof(block))) {
++        return Fermi2D::Operation::SrcCopy;
++    }
++    constexpr u64 hash_seed = 0xcbf29ce484222325ULL;
++    const auto hash_bytes = [](u64 hash, const void* data, size_t size) {
++        const auto* bytes = static_cast<const unsigned char*>(data);
++        for (size_t byte = 0; byte < size; ++byte) {
++            hash = (hash ^ bytes[byte]) * 0x100000001b3ULL;
++        }
++        return hash;
++    };
++    // Validate exactly the bytes inspected last time, including a partial final block.
++    const auto known = decodes_srgb.find(program);
++    if (known != decodes_srgb.end() &&
++        memory_manager.IsFullyMappedRange(program, known->second.length)) {
++        u64 hash = hash_seed;
++        for (u32 offset = 0; offset < known->second.length; offset += sizeof(block)) {
++            const size_t size = std::min<size_t>(sizeof(block), known->second.length - offset);
++            memory_manager.ReadBlock(program + offset, block.data(), size);
++            hash = hash_bytes(hash, block.data(), size);
++        }
++        if (hash == known->second.hash) {
++            return known->second.decodes ? Fermi2D::Operation::SrcCopySrgbToLinear
++                                         : Fermi2D::Operation::SrcCopy;
++        }
++    }
++    bool threshold = false, exponent = false;
++    u64 hash = hash_seed;
++    u32 length = 0;
++    Shader::Ampere::ProgramCaptureState capture;
++    using CaptureResult = Shader::Ampere::ProgramCaptureState::Result;
++    auto status = CaptureResult::Continue;
++    // Follow the native capture boundary without BRX table tail extension.
++    for (u64 offset = 0; offset < 0x20000 && status == CaptureResult::Continue;
++         offset += sizeof(block)) {
++        if (!memory_manager.IsFullyMappedRange(program + offset, sizeof(block))) break;
++        memory_manager.ReadBlock(program + offset, block.data(), sizeof(block));
++        for (size_t word = 0; word < block.size(); word += 4) {
++            const u32 opcode = block[word] & 0xfff;
++            threshold |= opcode == 0x434 && block[word + 1] == 0x292d292d;
++            exponent |= opcode == 0x832 && block[word + 1] == 0x40cc40cc;
++            const Shader::Ampere::Instruction instruction{
++                {block[word], block[word + 1], block[word + 2], block[word + 3]}};
++            hash = hash_bytes(hash, &instruction, sizeof(instruction));
++            length += sizeof(instruction);
++            const u32 index = static_cast<u32>((offset + word * sizeof(u32)) / sizeof(instruction));
++            status = capture.Observe(instruction, index);
++            if (status == CaptureResult::InvalidTarget) {
++                threshold = exponent = false;
++                break;
++            }
++            if (status == CaptureResult::Complete) break;
++        }
++    }
++    const bool decodes = threshold && exponent;
++    if (status == CaptureResult::Continue && length < 0x20000) {
++        // An unmapped tail may appear later. Retry without caching or logging each frame.
++        decodes_srgb.erase(program);
++        return decodes ? Fermi2D::Operation::SrcCopySrgbToLinear : Fermi2D::Operation::SrcCopy;
++    }
++    // Bound retained program addresses; an evicted program is scanned again on its next use.
++    if (known == decodes_srgb.end() && decodes_srgb.size() >= 16) {
++        decodes_srgb.clear();
++    }
++    decodes_srgb[program] = {hash, length, decodes};
++    LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: {}", program,
++             decodes ? "decodes sRGB like the program" : "plain copy");
++    return decodes ? Fermi2D::Operation::SrcCopySrgbToLinear : Fermi2D::Operation::SrcCopy;
++}
++
+ // Title 4's upscaler reads the tonemapped frame through the texture handle at cbuf0+0x90 and
+ // writes the output resolution image through the surface handle at cbuf0+0xa0 (from its
+ // TLD/SUST operands). Blit one to the other with bilinear filtering when both are plain 2D images
+@@ -699,6 +774,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+         output->Address() == 0 || output->Width() <= input->Width() || !input->IsBlockLinear() ||
+         !output->IsBlockLinear())
+         return false;
++    // Use linear views: the optional decode shader must be the only sRGB conversion.
+     using RTFormat = Tegra::RenderTargetFormat;
+     RTFormat format{};
+     switch (input->format) {
+@@ -723,7 +799,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+         return result;
+     };
+     const Fermi2D::Config config{
+-        .operation = Fermi2D::Operation::SrcCopy,
++        .operation = UpscaleOperation(memory_manager, regs.code_loc.Address(), upscale_srgb_programs),
+         .filter = Fermi2D::Filter::Bilinear,
+         .must_accelerate = true,
+         .dst_x0 = 0,
+diff --git a/src/video_core/engines/kepler_compute.h b/src/video_core/engines/kepler_compute.h
+index b525636..c1306c3 100644
+--- a/src/video_core/engines/kepler_compute.h
++++ b/src/video_core/engines/kepler_compute.h
+@@ -12,6 +12,7 @@
+ #include <memory>
+ #include <optional>
+ #include <span>
++#include <unordered_map>
+ #include <vector>
+ #include "common/bit_field.h"
+ #include "common/common_funcs.h"
+@@ -43,6 +44,12 @@ namespace Tegra::Engines {
+ /// Draws left to trace after an upscale fallback (debug aid).
+ extern std::atomic<u32> g_nx2_trace_draws_after_upscale;
+ 
++struct UpscaleProgramDetection {
++    u64 hash{};
++    u32 length{};
++    bool decodes{};
++};
++
+ /**
+  * This Engine is known as GK104_Compute. Documentation can be found in:
+  * https://github.com/envytools/envytools/blob/master/rnndb/graph/gk104_compute.xml
+@@ -267,6 +274,7 @@ private:
+     void ProcessNativeReportSemaphore(u32 argument);
+     void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
+     bool UpscaleInsteadOfNativeProgram();
++    std::unordered_map<GPUVAddr, UpscaleProgramDetection> upscale_srgb_programs;
+     bool ProcessNativeMethod(Core::System& system, u32 method, u32 argument, bool is_last_call);
+     NativeQmdScheduler native_qmd;
+     std::array<u32, 0xc00>* native_data_ram{};
+diff --git a/src/video_core/host_shaders/CMakeLists.txt b/src/video_core/host_shaders/CMakeLists.txt
+index 4a3731a..8a43472 100644
+--- a/src/video_core/host_shaders/CMakeLists.txt
++++ b/src/video_core/host_shaders/CMakeLists.txt
+@@ -17,6 +17,7 @@ set(SHADER_FILES
+     ${CMAKE_CURRENT_SOURCE_DIR}/astc_decoder.comp
+     ${CMAKE_CURRENT_SOURCE_DIR}/bc_encoder.comp
+     ${CMAKE_CURRENT_SOURCE_DIR}/blit_color_float.frag
++    ${CMAKE_CURRENT_SOURCE_DIR}/blit_color_srgb_to_linear.frag
+     ${CMAKE_CURRENT_SOURCE_DIR}/block_linear_unswizzle_2d.comp
+     ${CMAKE_CURRENT_SOURCE_DIR}/blit_color_msaa.frag
+     ${CMAKE_CURRENT_SOURCE_DIR}/blit_depth.frag
+diff --git a/src/video_core/host_shaders/blit_color_srgb_to_linear.frag b/src/video_core/host_shaders/blit_color_srgb_to_linear.frag
+new file mode 100644
+index 0000000..1a38cb5
+--- /dev/null
++++ b/src/video_core/host_shaders/blit_color_srgb_to_linear.frag
+@@ -0,0 +1,18 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#version 450
++
++layout(binding = 0) uniform sampler2D tex;
++
++layout(location = 0) in vec2 texcoord;
++layout(location = 0) out vec4 color;
++
++// Copy of an sRGB-encoded source into a linear destination: the piecewise sRGB decode on the
++// color channels, alpha unchanged.
++void main() {
++    const vec4 value = textureLod(tex, texcoord, 0);
++    const vec3 low = value.rgb / 12.92;
++    const vec3 high = pow((value.rgb + 0.055) / 1.055, vec3(2.4));
++    color = vec4(mix(high, low, lessThan(value.rgb, vec3(0.04045))), value.a);
++}
+diff --git a/src/video_core/renderer_vulkan/blit_image.cpp b/src/video_core/renderer_vulkan/blit_image.cpp
+index dc0465c..d14b991 100644
+--- a/src/video_core/renderer_vulkan/blit_image.cpp
++++ b/src/video_core/renderer_vulkan/blit_image.cpp
+@@ -11,6 +11,7 @@
+ #include "common/div_ceil.h"
+ #include "common/settings.h"
+ #include "video_core/host_shaders/blit_color_float_frag_spv.h"
++#include "video_core/host_shaders/blit_color_srgb_to_linear_frag_spv.h"
+ #include "video_core/host_shaders/blit_color_msaa_frag_spv.h"
+ #include "video_core/host_shaders/blit_depth_frag_spv.h"
+ #include "video_core/host_shaders/blit_depth_msaa_frag_spv.h"
+@@ -614,6 +615,7 @@ BlitImageHelper::BlitImageHelper(const Device& device_, Scheduler& scheduler_,
+               PUSH_CONSTANT_RANGE<VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(MSAACopyPushConstants)>))),
+       full_screen_vert(BuildShader(device, FULL_SCREEN_TRIANGLE_VERT_SPV)),
+       blit_color_to_color_frag(BuildShader(device, BLIT_COLOR_FLOAT_FRAG_SPV)),
++      blit_color_srgb_to_linear_frag(BuildShader(device, BLIT_COLOR_SRGB_TO_LINEAR_FRAG_SPV)),
+       blit_color_msaa_frag(BuildShader(device, BLIT_COLOR_MSAA_FRAG_SPV)),
+       blit_depth_stencil_frag(device.IsExtShaderStencilExportSupported()
+                              ? BuildShader(device, VULKAN_BLIT_DEPTH_STENCIL_FRAG_SPV)
+@@ -1255,7 +1257,10 @@ VkPipeline BlitImageHelper::FindOrEmplaceColorPipeline(const BlitImagePipelineKe
+     }
+     blit_color_keys.push_back(key);
+ 
+-    const std::array stages = MakeStages(*full_screen_vert, *blit_color_to_color_frag);
++    const bool srgb_to_linear =
++        key.operation == Tegra::Engines::Fermi2D::Operation::SrcCopySrgbToLinear;
++    const std::array stages = MakeStages(
++        *full_screen_vert, srgb_to_linear ? *blit_color_srgb_to_linear_frag : *blit_color_to_color_frag);
+     const VkPipelineColorBlendAttachmentState blend_attachment{
+         .blendEnable = VK_FALSE,
+         .srcColorBlendFactor = VK_BLEND_FACTOR_ZERO,
+diff --git a/src/video_core/renderer_vulkan/blit_image.h b/src/video_core/renderer_vulkan/blit_image.h
+index afdacaf..d53ffe8 100644
+--- a/src/video_core/renderer_vulkan/blit_image.h
++++ b/src/video_core/renderer_vulkan/blit_image.h
+@@ -220,6 +220,7 @@ private:
+     vk::PipelineLayout msaa_copy_depth_stencil_pipeline_layout;
+     vk::ShaderModule full_screen_vert;
+     vk::ShaderModule blit_color_to_color_frag;
++    vk::ShaderModule blit_color_srgb_to_linear_frag;
+     vk::ShaderModule blit_color_msaa_frag;
+     vk::ShaderModule blit_depth_stencil_frag;
+     vk::ShaderModule blit_depth_frag;
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 76babcb..c6f633d 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -2453,7 +2453,10 @@ std::optional<typename TextureCache<P>::BlitImages> TextureCache<P>::GetBlitImag
+     const Tegra::Engines::Fermi2D::Surface& dst, const Tegra::Engines::Fermi2D::Surface& src,
+     const Tegra::Engines::Fermi2D::Config& copy) {
+ 
+-    constexpr auto FIND_OPTIONS = RelaxedOptions::Samples;
++    // The sRGB decode shader samples a plain 2D color view, not an MSAA image.
++    const auto FIND_OPTIONS =
++        copy.operation == Tegra::Engines::Fermi2D::Operation::SrcCopySrgbToLinear
++            ? RelaxedOptions{} : RelaxedOptions::Samples;
+     const GPUVAddr dst_addr = dst.Address();
+     const GPUVAddr src_addr = src.Address();
+     ImageInfo dst_info(dst);
