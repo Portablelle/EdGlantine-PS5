@@ -33,7 +33,7 @@ cpp = r'''
 #include <memory>
 #include <optional>
 #include <vector>
-using u32 = uint32_t; using s32 = int32_t; using u64 = uint64_t;
+using u8 = uint8_t; using u32 = uint32_t; using s32 = int32_t; using u64 = uint64_t;
 struct Result { u32 raw; bool IsSuccess() const { return raw == 0; } };
 constexpr Result ResultSuccess{0};
 namespace Kernel {
@@ -94,6 +94,13 @@ struct Codec {
     struct RegisteredImage { u32 id; u64 completion_value; bool available; };
     std::vector<RegisteredImage> registered_images{{10, 41, false}, {11, 42, false}};
     std::vector<int> pending_inputs, output_properties, decoded_frames, h264_timestamps;
+    // Optional hardware state touched by the real Reset; these shims keep this check
+    // focused on guest fences and teardown, independently of the Videodec2 API.
+    struct HardwareSession { void Reset() {} } h264_backend;
+    std::vector<u8> h264_extradata;
+    std::array<std::vector<u8>, 2> h264_parameter_sets;
+    s32 h264_profile{-1};
+    bool h264_hardware_used{};
     unsigned pumps{}, drains{};
     bool Initialized() const { return decoder || h264_context; }
     void DrainH264() { ++drains; }
