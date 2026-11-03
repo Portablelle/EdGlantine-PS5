@@ -52,6 +52,21 @@
 #include "core/loader/nso.h"
 
 namespace {
+// Match the loose-dump loader: prefer exact lowercase, then any matching subdirectory.
+std::filesystem::path FindLooseRomFSDirectory(const std::filesystem::path& root) {
+    std::error_code error;
+    const auto exact = root / "romfs";
+    if (std::filesystem::is_directory(exact, error)) return exact;
+    for (std::filesystem::directory_iterator it(root, error), end; !error && it != end;
+         it.increment(error)) {
+        const auto name = it->path().filename().string();
+        if (name.size() == 5 && std::equal(name.begin(), name.end(), "romfs", [](unsigned char a, char b) {
+                return std::tolower(a) == b;
+            }) && it->is_directory(error) && !error) return it->path();
+    }
+    return {};
+}
+
 constexpr std::array<const char*, 18> language_names{
     "AmericanEnglish", "BritishEnglish", "Japanese", "French", "German",
     "LatinAmericanSpanish", "Spanish", "Italian", "Dutch", "CanadianFrench",
@@ -137,7 +152,8 @@ uint32_t ReadLanguages(const FileSys::VirtualDir& game, const FileSys::VirtualDi
 uint32_t ReadDumpLanguages(const std::filesystem::path& entry) {
     FileSys::RealVfsFilesystem vfs;
     const auto root = entry.parent_path().parent_path();
-    for (const auto& candidate : {root, root/"control", root/"exefs", root/"romfs"}) {
+    for (const auto& candidate : {root, root/"control", root/"exefs", FindLooseRomFSDirectory(root)}) {
+        if (candidate.empty()) continue;
         const auto directory = vfs.OpenDirectory(candidate.string(), FileSys::OpenMode::Read);
         if (directory) if (const auto flags = ReadLanguages(directory)) return flags;
     }
@@ -245,9 +261,7 @@ std::uint64_t ProgramId(const std::filesystem::path& entry) {
     return LoadDumpMetadata(entry, metadata) ? metadata.GetTitleID() : 0;
 }
 bool Ready(const std::filesystem::path& entry) {
-    std::error_code error;
-    return std::filesystem::is_directory(entry.parent_path().parent_path() / "romfs", error) &&
-           !error && ProgramId(entry) != 0;
+    return !FindLooseRomFSDirectory(entry.parent_path().parent_path()).empty() && ProgramId(entry) != 0;
 }
 } // namespace Eden::DumpMetadata
 
@@ -289,7 +303,8 @@ int eden_extract_game_metadata(const char* rom_path, const char* keys_dir,
         FileSys::RealVfsFilesystem dump_vfs;
         const auto root=std::filesystem::path(rom_path).parent_path().parent_path();
         int result=0;
-        for(const auto& candidate : {root,root/"control",root/"exefs",root/"romfs"}) {
+        for(const auto& candidate : {root,root/"control",root/"exefs",FindLooseRomFSDirectory(root)}) {
+            if(candidate.empty()) continue;
             const auto directory=dump_vfs.OpenDirectory(candidate.string(),FileSys::OpenMode::Read);
             if(!directory) continue;
             if(!(result&EDEN_METADATA_TITLE)) {
