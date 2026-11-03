@@ -38,7 +38,14 @@ ProgramMetadata::ProgramMetadata()=default;
 ProgramMetadata::~ProgramMetadata()=default;
 '''+function(metadata,'Loader::ResultStatus ProgramMetadata::Load(')+function(metadata,'u64 ProgramMetadata::GetTitleID(')+'}\n'+function((source/'core/loader/nso.cpp').read_text(),'FileType AppLoader_NSO::IdentifyType(').replace('FileType AppLoader_NSO::','Loader::FileType Loader::AppLoader_NSO::')
 bridge=(r/'headless/metadata_bridge.cpp').read_text()
-canonical+='\n'+function(bridge,'bool LoadDumpMetadata(')+'namespace Eden::DumpMetadata {\n'+function(bridge,'std::uint64_t ProgramId(')+function(bridge,'bool Ready(')+'}\n'
+# Keep the harness runnable against main too: the mixed-case Ready assertion must fail there.
+romfs_helper=function(bridge,'std::filesystem::path FindLooseRomFSDirectory(') if 'std::filesystem::path FindLooseRomFSDirectory(' in bridge else ''
+canonical+='\n'+romfs_helper+function(bridge,'bool LoadDumpMetadata(')+'namespace Eden::DumpMetadata {\n'+function(bridge,'std::uint64_t ProgramId(')+function(bridge,'bool Ready(')+'}\n'
+preference_check=r'''
+ fs::create_directory(base/"RomFS");
+ assert(FindLooseRomFSDirectory(base)==base/"romfs");
+ fs::remove(base/"RomFS");
+''' if romfs_helper else ''
 put=fixtures[fixtures.index('template <typename T>'):fixtures.index('std::vector<u8> MakeMetadata(')]
 fixture=put+function(fixtures,'std::vector<u8> MakeMetadata(').replace('MakeMetadata(bool extended)','npdm(bool extended=true)').replace('0x0100123456780000','0x0400a3a01ee4c000ULL')
 
@@ -62,6 +69,7 @@ void check_launcher(){
 code=r'''
 #include "dump_paths.h"
 #include "dump_metadata.h"
+#include <algorithm>
 #include <cassert>
 #include <cctype>
 #include <set>
@@ -98,6 +106,16 @@ int main(){
  write(root/"roms/Incomplete/exefs/main",{'N','S','O','0'});write(root/"roms/Incomplete/exefs/main.npdm",npdm());
  const auto entry=root/"roms/Pokopia/exefs/main";
  assert(Eden::DumpMetadata::Ready(entry));assert(Eden::DumpMetadata::ProgramId(entry)==0x0400a3a01ee4c000ULL);
+ const auto base=entry.parent_path().parent_path();
+ for(const auto& name:{"RomFS","ROMFS"}){
+  fs::rename(base/"romfs",base/name);assert(Eden::DumpMetadata::Ready(entry));
+  fs::rename(base/name,base/"romfs");
+ }
+ fs::remove(base/"romfs");assert(!Eden::DumpMetadata::Ready(entry));
+ write(base/"ROMFS",{1});assert(!Eden::DumpMetadata::Ready(entry));fs::remove(base/"ROMFS");
+ fs::create_directory(base/"romfs");
+'''+preference_check+r'''
+ assert(!Eden::DumpMetadata::Ready(root/"roms/Incomplete/exefs/main"));
  auto files=GameFiles();assert((std::set<std::string>(files.begin(),files.end())==std::set<std::string>{"Pokopia/exefs/main","Welcome Tour/exefs/main","Loose.nsp","Container/Game.xci"}));
  auto b=npdm();b[0x70]=0xff;b[0x71]=0xff;write(entry.parent_path()/"main.npdm",b);assert(!Eden::DumpMetadata::Ready(entry));
  b=npdm();b[0x74]=0xff;b[0x75]=0xff;write(entry.parent_path()/"main.npdm",b);assert(!Eden::DumpMetadata::Ready(entry));
@@ -112,4 +130,4 @@ p=out/'test.cpp';p.write_text(code)
 subprocess.run(['c++','-std=c++20','-O1','-g','-fsanitize=address,undefined','-pthread','-I'+str(r/'headless'),'-I'+str(source),str(p),'-o',str(out/'test')],check=True)
 subprocess.run([str(out/'test')],check=True)
 main=(r/'headless/main.cpp').read_text();assert 'const std::string nx2_main' not in main;assert 'selected_game = SelectProsperoEdenGame(rooms, launch_error)' in main
-print('PASS: actual path validation/library enumeration, two folder dumps, containers, hidden/incomplete folders, canonical NPDM parsing, explicit library startup (ASan/UBSan)')
+print('PASS: actual path validation/library enumeration, mixed-case RomFS directories and lowercase preference, missing/file RomFS rejection, containers, hidden/incomplete folders, canonical NPDM parsing, explicit library startup (ASan/UBSan)')
