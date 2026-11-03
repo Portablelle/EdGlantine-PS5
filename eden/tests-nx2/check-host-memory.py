@@ -94,8 +94,78 @@ with tempfile.TemporaryDirectory(prefix='host-memory-') as tmp:
   if line.startswith('#include "') and 'descriptor_memory' not in line:header=header.replace(line,'')
  fixture='''#include <cassert>\n#include <cstdint>\n#include <utility>\n#include <cstring>\n#include <memory>\nusing GPUVAddr=uint64_t;using u32=uint32_t;using u64=uint64_t;\n#define DEBUG_ASSERT assert\nnamespace Common{template<class A,class B> auto DivCeil(A a,B b){return (a+b-1)/b;}}\nnamespace Tegra{struct MemoryManager{void ReadBlockUnsafe(GPUVAddr addr,void* out,size_t n)const{std::memset(out,int(addr%251),n);}};}\n'''
  test=r'''
+// Exercise the real Read path; no template<MemoryManager> production change is needed.
+#include <array>
+#include <limits>
+#include <random>
 struct Entry{unsigned char bytes[32];bool operator==(const Entry&)const=default;};
 int main(){Tegra::MemoryManager memory;
+ // Sentinel words outside the inclusive limit must survive both clear paths.
+ for(u32 limit:{0U,63U,64U,127U,128U,255U,256U,0x7ffffU,0x80000U,0x80001U,0x100000U}){
+  VideoCommon::DescriptorTable<Entry> t;t.Refresh(0x1000,limit);
+  const size_t exposed=size_t(limit)/64+1;
+  constexpr u64 sentinel=~u64{0};
+  std::fill(t.read_descriptors.begin(),t.read_descriptors.end(),sentinel);
+  t.Invalidate();t.Invalidate();
+  assert(t.read_descriptors.front()==sentinel); // Still deferred.
+  assert(t.Read(memory,0).second);
+  for(size_t word=0;word<t.read_descriptors.size();++word)
+   assert(t.read_descriptors[word]==(word<exposed?(word==0?u64{1}:u64{0}):sentinel));
+  assert(!t.Read(memory,0).second);
+  std::fill(t.read_descriptors.begin(),t.read_descriptors.end(),sentinel);
+  t.Refresh(0x1000,limit);
+  for(size_t word=0;word<t.read_descriptors.size();++word)
+   assert(t.read_descriptors[word]==(word<exposed?u64{0}:sentinel));
+  assert(t.Read(memory,limit).second);assert(!t.Read(memory,limit).second);
+ }
+ // Shrink/regrow in the same bitmap allocation, across and within words.
+ for(auto limits:{std::pair{191U,128U},std::pair{127U,64U},std::pair{256U,0U}}){
+  VideoCommon::DescriptorTable<Entry> t;t.Refresh(0x1000,limits.first);
+  assert(t.Read(memory,limits.first).second);assert(!t.Read(memory,limits.first).second);
+  const auto* allocation=t.read_descriptors.data();
+  t.Refresh(0x1000,limits.second);t.Invalidate();assert(t.Read(memory,0).second);
+  t.Refresh(0x1000,limits.first);assert(t.read_descriptors.data()==allocation);
+  assert(t.Read(memory,limits.first).second);assert(!t.Read(memory,limits.first).second);
+ }
+ // Malformed advertised limits must clamp clearing to actual storage. Avoid a
+ // multi-GiB Refresh allocation: only the clearing bound is under test here.
+ for(u32 limit:{std::numeric_limits<u32>::max(),std::numeric_limits<u32>::max()-0x1000}){
+  VideoCommon::DescriptorTable<Entry> t;t.Refresh(0x1000,64);
+  std::fill(t.read_descriptors.begin(),t.read_descriptors.end(),~u64{0});
+  t.current_limit=limit;t.Invalidate();assert(t.Read(memory,0).second);
+  assert(t.read_descriptors[0]==1&&t.read_descriptors[1]==0);
+  assert(!t.Read(memory,0).second);
+ }
+ // Upstream 1e37847: compare deferred reads with an eager seen/value oracle
+ // over 40,000 mutations, invalidations, limit changes and table switches.
+ {
+  VideoCommon::DescriptorTable<Entry> t;std::array<bool,128> seen{};
+  std::array<Entry,128> previous{};std::mt19937 random{0x5080};
+  u32 limit=127;GPUVAddr address=0x1000;t.Refresh(address,limit);
+  for(unsigned i=0;i<40000;++i){
+   switch(random()%5){
+   case 0:t.Invalidate();seen.fill(false);break;
+   case 1:{
+    const u32 index=random()%(limit+1);Entry entry{};entry.bytes[0]=random();
+    assert(t.UpdateDescriptor(index,entry)==(!seen[index]||previous[index]!=entry));
+    seen[index]=true;previous[index]=entry;break;
+   }
+   case 2:{
+    const GPUVAddr next_address=0x1000+(random()%2)*0x1000;
+    const u32 next_limit=random()%2?63:127;
+    const bool changed=next_address!=address||next_limit!=limit;
+    assert(t.Synchronize(next_address,next_limit)==changed);
+    if(changed)seen.fill(false);
+    address=next_address;limit=next_limit;break;
+   }
+   default:{
+    const u32 index=random()%(limit+1);const auto actual=t.Read(memory,index);
+    assert(actual.second==(!seen[index]||previous[index]!=actual.first));
+    seen[index]=true;previous[index]=actual.first;break;
+   }
+   }
+  }
+ }
  {VideoCommon::DescriptorTable<Entry> t;size_t maximum=64;
  for(u32 limit:{0U,63U,64U,511U,0x80ffU,0x80000U,31U}){
   assert(t.Synchronize(0x1000,limit));auto a=t.Read(memory,limit);assert(a.second);assert(!t.Read(memory,limit).second);
@@ -113,8 +183,8 @@ int main(){Tegra::MemoryManager memory;
  assert(Eden::HostMemory::descriptor_live>0);
  auto moved=std::move(t);assert(!moved.Read(memory,31).second);
  }assert(Eden::HostMemory::descriptor_live==0);
- puts("PASS descriptor inclusive limits, high TIC index, shrink/regrowth, invalidation, move and memory accounting");}
+ puts("PASS bounded descriptor clearing, boundaries, shrink/regrowth, malformed limits, eager oracle, move and memory accounting");}
 '''
  cpp=p/'descriptors.cpp';cpp.write_text(fixture+header+test)
- subprocess.run(['c++','-std=c++20','-O1','-g','-fsanitize=address,undefined','-I'+str(r/'headless'),'-I'+str(src/'src'),str(cpp),'-o',str(p/'descriptors')],check=True)
+ subprocess.run(['clang++-18','-std=c++20','-O1','-g','-fsanitize=address,undefined','-I'+str(r/'headless'),'-I'+str(src/'src'),str(cpp),'-o',str(p/'descriptors')],check=True)
  subprocess.run([str(p/'descriptors')],check=True)

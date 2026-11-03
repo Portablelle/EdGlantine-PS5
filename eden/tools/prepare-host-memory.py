@@ -9,7 +9,7 @@ def replace_once(text, old, new):
 def adapt_descriptors(s):
     s=replace_once(s, '#include <algorithm>', '#include <algorithm>\n#include <bit>\n#include "descriptor_memory.h"')
     begin=s.index('        // Geometric growth')
-    end=s.index('        size_t old_size',begin)
+    end=s.index(';\n',s.index('const size_t num_descriptors',begin))+2
     s=s[:begin]+'''        // Geometric growth retains spare capacity without allocating 16 MiB
         // for every tiny table. Widen before adding the inclusive last index.
         const size_t num_descriptors = std::bit_ceil(std::max<size_t>(64, size_t(limit) + 1));

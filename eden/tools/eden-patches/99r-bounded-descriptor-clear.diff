@@ -1,0 +1,39 @@
+diff --git a/src/video_core/texture_cache/descriptor_table.h b/src/video_core/texture_cache/descriptor_table.h
+index 175700b..f7cdf21 100644
+--- a/src/video_core/texture_cache/descriptor_table.h
++++ b/src/video_core/texture_cache/descriptor_table.h
+@@ -49,7 +49,7 @@ public:
+     [[nodiscard]] bool UpdateDescriptor(u32 index, const T& descriptor) noexcept {
+         DEBUG_ASSERT(index <= current_limit);
+         if (invalidated) {
+-            std::ranges::fill(read_descriptors, 0);
++            ClearReadDescriptors();
+             invalidated = false;
+         }
+         auto& bits = read_descriptors[index / 64];
+@@ -68,10 +68,8 @@ public:
+         // Geometric growth retains amortized allocation without a 16 MiB minimum per table.
+         // Widen before adding so an inclusive u32 limit cannot wrap.
+         const size_t num_descriptors = std::bit_ceil(static_cast<size_t>(limit) + 1);
+-        size_t old_size = read_descriptors.size();
+         read_descriptors.resize(Common::DivCeil(num_descriptors, 64U));
+-        old_size = (std::min)(old_size, read_descriptors.size());
+-        std::fill(read_descriptors.begin(), read_descriptors.begin() + old_size, 0);
++        ClearReadDescriptors();
+         invalidated = false;
+         if (descriptors.size() < num_descriptors) {
+             descriptors.resize(num_descriptors);
+@@ -85,6 +83,13 @@ public:
+     GPUVAddr current_gpu_addr{};
+     u32 current_limit{};
+     bool invalidated{};
++
++private:
++    void ClearReadDescriptors() noexcept {
++        // A later limit increase also clears any newly exposed words.
++        const size_t words = (std::min)(read_descriptors.size(), size_t{current_limit} / 64 + 1);
++        std::fill_n(read_descriptors.begin(), words, u64{0});
++    }
+ };
+ 
+ } // namespace VideoCommon
