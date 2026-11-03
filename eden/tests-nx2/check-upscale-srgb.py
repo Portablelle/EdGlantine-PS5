@@ -28,7 +28,7 @@ fallback = extract(compute, 'bool KeplerCompute::UpscaleInsteadOfNativeProgram()
 assert '.operation = UpscaleOperation(memory_manager, regs.code_loc.Address(), upscale_srgb_programs)' in fallback
 assert '.must_accelerate = true' in fallback
 header = (src / 'video_core/engines/kepler_compute.h').read_text()
-assert 'std::unordered_map<GPUVAddr, std::pair<u64, bool>> upscale_srgb_programs;' in header
+assert 'std::unordered_map<GPUVAddr, UpscaleProgramDetection> upscale_srgb_programs;' in header
 
 cpp = r'''
 #include <array>
@@ -38,24 +38,26 @@ cpp = r'''
 #include <cstring>
 #include <iostream>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 #include "shader_recompiler/frontend/ampere/program_capture.h"
 #define LOG_INFO(...) ((void)0)
 struct Fermi2D {
 ''' + operation + r'''
 };
+''' + extract(header, 'struct UpscaleProgramDetection') + r''';
 struct MemoryManager {
     static constexpr GPUVAddr base = 0x100000;
     std::vector<u32> words = std::vector<u32>(0x21000 / 4);
     size_t mapped = 0x20000;
     unsigned reads = 0;
+    size_t read_bytes = 0;
     bool IsFullyMappedRange(GPUVAddr address, size_t size) const {
         return address >= base && address - base <= mapped && size <= mapped - (address - base);
     }
     void ReadBlock(GPUVAddr address, void* out, size_t size) {
         assert(IsFullyMappedRange(address, size));
         ++reads;
+        read_bytes += size;
         std::memcpy(out, reinterpret_cast<const char*>(words.data()) + address - base, size);
     }
     void instruction(size_t word, u32 opcode, u32 immediate) {
@@ -80,33 +82,67 @@ int main() {
     // Both markers are required, including when they occur in different read blocks.
     for (unsigned mask = 0; mask < 4; ++mask) {
         MemoryManager memory;
-        std::unordered_map<GPUVAddr, std::pair<u64, bool>> cache;
+        std::unordered_map<GPUVAddr, UpscaleProgramDetection> cache;
         if (mask & 1) memory.instruction(0x3fc, 0xabc00434, 0x292d292d);
         if (mask & 2) memory.instruction(0x400, 0xdef00832, 0x40cc40cc);
         const auto expected = mask == 3 ? Op::SrcCopySrgbToLinear : Op::SrcCopy;
         assert(UpscaleOperation(memory, memory.base, cache) == expected);
         const auto reads = memory.reads;
         assert(reads <= 32);
+        const auto bytes = memory.read_bytes;
+        const auto length = cache.at(memory.base).length;
+        assert(length == 0x20000); // No EXIT: the existing cases retain the scan cap.
         assert(UpscaleOperation(memory, memory.base, cache) == expected);
-        assert(memory.reads == reads + 1); // Validate the first block without rescanning.
+        assert(memory.reads == reads + (length + 0xfff) / 0x1000);
+        assert(memory.read_bytes == bytes + length); // Validate the entire inspected range.
         // A different program address must not inherit the previous result.
         assert(UpscaleOperation(memory, memory.base + 0x2000, cache) == Op::SrcCopy);
     }
     // Reusing an address for rewritten code invalidates both negative and positive results.
     MemoryManager rewritten;
     rewritten.exit(2);
-    std::unordered_map<GPUVAddr, std::pair<u64, bool>> rewritten_cache;
+    std::unordered_map<GPUVAddr, UpscaleProgramDetection> rewritten_cache;
     for (const auto expected : {Op::SrcCopy, Op::SrcCopySrgbToLinear, Op::SrcCopy}) {
         const bool decode = expected == Op::SrcCopySrgbToLinear;
         rewritten.instruction(0, decode ? 0x434 : 0, decode ? 0x292d292d : 0);
         rewritten.instruction(4, decode ? 0x832 : 0, decode ? 0x40cc40cc : 0);
         rewritten.reads = 0;
+        const bool cached = !rewritten_cache.empty();
         assert(UpscaleOperation(rewritten, rewritten.base, rewritten_cache) == expected);
-        assert(rewritten.reads == 1); // Reuse the first-block read through the EXIT.
+        assert(rewritten.reads == (cached ? 2U : 1U)); // Validation plus rescan on rewrites.
+        assert(rewritten_cache.at(rewritten.base).length == 48);
         rewritten.reads = 0;
         assert(UpscaleOperation(rewritten, rewritten.base, rewritten_cache) == expected);
         assert(rewritten.reads == 1); // Unchanged code never triggers a rescan.
     }
+    // Tail rewrites with an identical first block must invalidate the cached result.
+    MemoryManager tail;
+    tail.instruction(0, 0x434, 0x292d292d);
+    tail.exit(0x102);
+    const std::vector<u32> first_block(tail.words.begin(), tail.words.begin() + 0x400);
+    std::unordered_map<GPUVAddr, UpscaleProgramDetection> tail_cache;
+    for (const auto expected : {Op::SrcCopy, Op::SrcCopySrgbToLinear, Op::SrcCopy}) {
+        const bool decode = expected == Op::SrcCopySrgbToLinear;
+        tail.instruction(0x400, decode ? 0x832 : 0, decode ? 0x40cc40cc : 0);
+        assert(std::equal(first_block.begin(), first_block.end(), tail.words.begin()));
+        const bool cached = !tail_cache.empty();
+        tail.reads = 0;
+        assert(UpscaleOperation(tail, tail.base, tail_cache) == expected);
+        assert(tail.reads == (cached ? 4U : 2U)); // Hash validation plus one scan on changes.
+        assert(tail_cache.at(tail.base).length == 0x1030); // Through block 2's EXIT only.
+        tail.reads = 0;
+        tail.read_bytes = 0;
+        assert(UpscaleOperation(tail, tail.base, tail_cache) == expected);
+        assert(tail.reads == 2); // ceil(0x1030 / 0x1000), with no rescan.
+        assert(tail.read_bytes == 0x1030); // The cached read ends exactly after EXIT.
+    }
+    // Losing a mapped tail also invalidates a previously positive result.
+    tail.instruction(0x400, 0x832, 0x40cc40cc);
+    assert(UpscaleOperation(tail, tail.base, tail_cache) == Op::SrcCopySrgbToLinear);
+    tail.mapped = 0x1000;
+    tail.reads = 0;
+    assert(UpscaleOperation(tail, tail.base, tail_cache) == Op::SrcCopy);
+    assert(tail.reads == 1 && tail_cache.at(tail.base).length == 0x1000);
     // An unmapped first block must not reuse a cached positive result.
     rewritten.instruction(0, 0x434, 0x292d292d);
     rewritten.instruction(4, 0x832, 0x40cc40cc);
@@ -118,18 +154,25 @@ int main() {
     // Neither or just one marker before EXIT: neighbouring shaders must not supply the rest.
     for (unsigned mask = 0; mask < 4; ++mask) {
         MemoryManager memory;
-        std::unordered_map<GPUVAddr, std::pair<u64, bool>> cache;
+        std::unordered_map<GPUVAddr, UpscaleProgramDetection> cache;
         memory.instruction(mask & 1 ? 0 : 12, 0x434, 0x292d292d);
         memory.instruction(mask & 2 ? 4 : 16, 0x832, 0x40cc40cc);
         memory.exit(2);
         assert(UpscaleOperation(memory, memory.base, cache) ==
                (mask == 3 ? Op::SrcCopySrgbToLinear : Op::SrcCopy));
         assert(memory.reads == 1);
+        assert(cache.at(memory.base).length == 48);
+        memory.words[24] = 0x12345678; // Outside the inspected range, inside the same block.
+        memory.reads = 0;
+        memory.read_bytes = 0;
+        assert(UpscaleOperation(memory, memory.base, cache) ==
+               (mask == 3 ? Op::SrcCopySrgbToLinear : Op::SrcCopy));
+        assert(memory.reads == 1 && memory.read_bytes == 48);
     }
     // BRA and BSSY forward targets keep capture alive past an early EXIT, across blocks.
     for (const u32 opcode : {0x947U, 0x945U}) {
         MemoryManager memory;
-        std::unordered_map<GPUVAddr, std::pair<u64, bool>> cache;
+        std::unordered_map<GPUVAddr, UpscaleProgramDetection> cache;
         memory.branch(0, 0x102, opcode);
         memory.exit(1);
         memory.instruction(0x400, 0x434, 0x292d292d);
@@ -140,7 +183,7 @@ int main() {
     }
     // An unconditional CALL keeps scanning through the main EXIT until its callee's RET.
     MemoryManager called;
-    std::unordered_map<GPUVAddr, std::pair<u64, bool>> end_cache;
+    std::unordered_map<GPUVAddr, UpscaleProgramDetection> end_cache;
     called.branch(0, 4, 0x944);
     called.exit(1);
     called.instruction(16, 0x434, 0x292d292d);
@@ -156,14 +199,15 @@ int main() {
     invalid.instruction(8, 0x7947, 1); // Target is not aligned to a 16-byte instruction.
     assert(UpscaleOperation(invalid, invalid.base, end_cache) == Op::SrcCopy);
     assert(invalid.reads == 1);
-    assert(!end_cache.at(invalid.base).second);
+    assert(!end_cache.at(invalid.base).decodes);
+    assert(end_cache.at(invalid.base).length == 48);
     invalid.reads = 0;
     assert(UpscaleOperation(invalid, invalid.base, end_cache) == Op::SrcCopy);
     assert(invalid.reads == 1);
     // Wrong opcodes, wrong immediates and unaligned instruction words are not matches.
     for (unsigned mode = 0; mode < 3; ++mode) {
         MemoryManager memory;
-        std::unordered_map<GPUVAddr, std::pair<u64, bool>> cache;
+        std::unordered_map<GPUVAddr, UpscaleProgramDetection> cache;
         memory.instruction(mode == 2 ? 1 : 0, mode == 0 ? 0x435 : 0x434,
                            mode == 1 ? 0x292d292c : 0x292d292d);
         memory.instruction(4, 0x832, 0x40cc40cc);
@@ -174,7 +218,7 @@ int main() {
     short_memory.mapped = 0x1000;
     short_memory.instruction(0, 0x434, 0x292d292d);
     short_memory.instruction(0x400, 0x832, 0x40cc40cc);
-    std::unordered_map<GPUVAddr, std::pair<u64, bool>> cache;
+    std::unordered_map<GPUVAddr, UpscaleProgramDetection> cache;
     assert(UpscaleOperation(short_memory, short_memory.base, cache) == Op::SrcCopy);
     assert(short_memory.reads == 1);
     MemoryManager unmapped;

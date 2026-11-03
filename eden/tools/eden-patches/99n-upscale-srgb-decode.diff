@@ -12,7 +12,7 @@ index 7fddf9f..f3ec35a 100644
  
      enum class MemoryLayout : u32 {
 diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
-index e8a25b1..4d68e2e 100644
+index e8a25b1..63d5ce7 100644
 --- a/src/video_core/engines/kepler_compute.cpp
 +++ b/src/video_core/engines/kepler_compute.cpp
 @@ -23,6 +23,7 @@
@@ -23,69 +23,83 @@ index e8a25b1..4d68e2e 100644
  #include "core/core.h"
  #include "video_core/gpu_split.h"
  #include "video_core/nx2_profile.h"
-@@ -682,6 +683,61 @@ void KeplerCompute::DescribeNativeResources(const NativeQmdScheduler::Descriptor
+@@ -682,6 +683,75 @@ void KeplerCompute::DescribeNativeResources(const NativeQmdScheduler::Descriptor
  
  std::atomic<u32> g_nx2_trace_draws_after_upscale{};
  
 +// Match the half-precision threshold and exponent used by the program's sRGB decode.
 +static Fermi2D::Operation UpscaleOperation(MemoryManager& memory_manager, GPUVAddr program,
-+                                         std::unordered_map<GPUVAddr, std::pair<u64, bool>>& decodes_srgb) {
++                                         std::unordered_map<GPUVAddr, UpscaleProgramDetection>& decodes_srgb) {
 +    std::array<u32, 0x400> block{};
 +    if (!memory_manager.IsFullyMappedRange(program, sizeof(block))) {
 +        return Fermi2D::Operation::SrcCopy;
 +    }
-+    memory_manager.ReadBlock(program, block.data(), sizeof(block));
-+    // FNV-1a of the first block detects code replacement at a reused program address.
-+    u64 hash = 0xcbf29ce484222325ULL;
-+    const auto* bytes = reinterpret_cast<const unsigned char*>(block.data());
-+    for (size_t byte = 0; byte < sizeof(block); ++byte) {
-+        hash = (hash ^ bytes[byte]) * 0x100000001b3ULL;
++    constexpr u64 hash_seed = 0xcbf29ce484222325ULL;
++    const auto hash_bytes = [](u64 hash, const void* data, size_t size) {
++        const auto* bytes = static_cast<const unsigned char*>(data);
++        for (size_t byte = 0; byte < size; ++byte) {
++            hash = (hash ^ bytes[byte]) * 0x100000001b3ULL;
++        }
++        return hash;
++    };
++    // Validate exactly the bytes inspected last time, including a partial final block.
++    const auto known = decodes_srgb.find(program);
++    if (known != decodes_srgb.end() &&
++        memory_manager.IsFullyMappedRange(program, known->second.length)) {
++        u64 hash = hash_seed;
++        for (u32 offset = 0; offset < known->second.length; offset += sizeof(block)) {
++            const size_t size = std::min<size_t>(sizeof(block), known->second.length - offset);
++            memory_manager.ReadBlock(program + offset, block.data(), size);
++            hash = hash_bytes(hash, block.data(), size);
++        }
++        if (hash == known->second.hash) {
++            return known->second.decodes ? Fermi2D::Operation::SrcCopySrgbToLinear
++                                         : Fermi2D::Operation::SrcCopy;
++        }
++    }
++    bool threshold = false, exponent = false;
++    u64 hash = hash_seed;
++    u32 length = 0;
++    Shader::Ampere::ProgramCaptureState capture;
++    using CaptureResult = Shader::Ampere::ProgramCaptureState::Result;
++    auto status = CaptureResult::Continue;
++    // Follow the native capture boundary without BRX table tail extension.
++    for (u64 offset = 0; offset < 0x20000 && status == CaptureResult::Continue;
++         offset += sizeof(block)) {
++        if (!memory_manager.IsFullyMappedRange(program + offset, sizeof(block))) break;
++        memory_manager.ReadBlock(program + offset, block.data(), sizeof(block));
++        for (size_t word = 0; word < block.size(); word += 4) {
++            const u32 opcode = block[word] & 0xfff;
++            threshold |= opcode == 0x434 && block[word + 1] == 0x292d292d;
++            exponent |= opcode == 0x832 && block[word + 1] == 0x40cc40cc;
++            const Shader::Ampere::Instruction instruction{
++                {block[word], block[word + 1], block[word + 2], block[word + 3]}};
++            hash = hash_bytes(hash, &instruction, sizeof(instruction));
++            length += sizeof(instruction);
++            const u32 index = static_cast<u32>((offset + word * sizeof(u32)) / sizeof(instruction));
++            status = capture.Observe(instruction, index);
++            if (status == CaptureResult::InvalidTarget) {
++                threshold = exponent = false;
++                break;
++            }
++            if (status == CaptureResult::Complete) break;
++        }
 +    }
 +    // Bound retained program addresses; an evicted program is scanned again on its next use.
-+    if (!decodes_srgb.contains(program) && decodes_srgb.size() >= 16) {
++    if (known == decodes_srgb.end() && decodes_srgb.size() >= 16) {
 +        decodes_srgb.clear();
 +    }
-+    const auto [known, inserted] = decodes_srgb.try_emplace(program, hash, false);
-+    auto& [cached_hash, decodes] = known->second;
-+    if (inserted || cached_hash != hash) {
-+        bool threshold = false, exponent = false;
-+        Shader::Ampere::ProgramCaptureState capture;
-+        using CaptureResult = Shader::Ampere::ProgramCaptureState::Result;
-+        auto status = CaptureResult::Continue;
-+        // Follow the native capture boundary without BRX table tail extension.
-+        for (u64 offset = 0; offset < 0x20000 && status == CaptureResult::Continue;
-+             offset += sizeof(block)) {
-+            if (offset != 0) {
-+                if (!memory_manager.IsFullyMappedRange(program + offset, sizeof(block))) break;
-+                memory_manager.ReadBlock(program + offset, block.data(), sizeof(block));
-+            }
-+            for (size_t word = 0; word < block.size(); word += 4) {
-+                const u32 opcode = block[word] & 0xfff;
-+                threshold |= opcode == 0x434 && block[word + 1] == 0x292d292d;
-+                exponent |= opcode == 0x832 && block[word + 1] == 0x40cc40cc;
-+                const Shader::Ampere::Instruction instruction{
-+                    {block[word], block[word + 1], block[word + 2], block[word + 3]}};
-+                const u32 index = static_cast<u32>((offset + word * sizeof(u32)) / sizeof(instruction));
-+                status = capture.Observe(instruction, index);
-+                if (status == CaptureResult::InvalidTarget) {
-+                    threshold = exponent = false;
-+                    break;
-+                }
-+                if (status == CaptureResult::Complete) break;
-+            }
-+        }
-+        cached_hash = hash;
-+        decodes = threshold && exponent;
-+        LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: {}", program,
-+                 decodes ? "decodes sRGB like the program" : "plain copy");
-+    }
++    const bool decodes = threshold && exponent;
++    decodes_srgb[program] = {hash, length, decodes};
++    LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: {}", program,
++             decodes ? "decodes sRGB like the program" : "plain copy");
 +    return decodes ? Fermi2D::Operation::SrcCopySrgbToLinear : Fermi2D::Operation::SrcCopy;
 +}
 +
  // Title 4's upscaler reads the tonemapped frame through the texture handle at cbuf0+0x90 and
  // writes the output resolution image through the surface handle at cbuf0+0xa0 (from its
  // TLD/SUST operands). Blit one to the other with bilinear filtering when both are plain 2D images
-@@ -699,6 +755,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+@@ -699,6 +769,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
          output->Address() == 0 || output->Width() <= input->Width() || !input->IsBlockLinear() ||
          !output->IsBlockLinear())
          return false;
@@ -93,7 +107,7 @@ index e8a25b1..4d68e2e 100644
      using RTFormat = Tegra::RenderTargetFormat;
      RTFormat format{};
      switch (input->format) {
-@@ -723,7 +780,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+@@ -723,7 +794,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
          return result;
      };
      const Fermi2D::Config config{
@@ -103,23 +117,35 @@ index e8a25b1..4d68e2e 100644
          .must_accelerate = true,
          .dst_x0 = 0,
 diff --git a/src/video_core/engines/kepler_compute.h b/src/video_core/engines/kepler_compute.h
-index b525636..16babac 100644
+index b525636..c1306c3 100644
 --- a/src/video_core/engines/kepler_compute.h
 +++ b/src/video_core/engines/kepler_compute.h
-@@ -12,6 +12,8 @@
+@@ -12,6 +12,7 @@
  #include <memory>
  #include <optional>
  #include <span>
 +#include <unordered_map>
-+#include <utility>
  #include <vector>
  #include "common/bit_field.h"
  #include "common/common_funcs.h"
-@@ -267,6 +269,7 @@ private:
+@@ -43,6 +44,12 @@ namespace Tegra::Engines {
+ /// Draws left to trace after an upscale fallback (debug aid).
+ extern std::atomic<u32> g_nx2_trace_draws_after_upscale;
+ 
++struct UpscaleProgramDetection {
++    u64 hash{};
++    u32 length{};
++    bool decodes{};
++};
++
+ /**
+  * This Engine is known as GK104_Compute. Documentation can be found in:
+  * https://github.com/envytools/envytools/blob/master/rnndb/graph/gk104_compute.xml
+@@ -267,6 +274,7 @@ private:
      void ProcessNativeReportSemaphore(u32 argument);
      void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
      bool UpscaleInsteadOfNativeProgram();
-+    std::unordered_map<GPUVAddr, std::pair<u64, bool>> upscale_srgb_programs;
++    std::unordered_map<GPUVAddr, UpscaleProgramDetection> upscale_srgb_programs;
      bool ProcessNativeMethod(Core::System& system, u32 method, u32 argument, bool is_last_call);
      NativeQmdScheduler native_qmd;
      std::array<u32, 0xc00>* native_data_ram{};
