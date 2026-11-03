@@ -1,0 +1,121 @@
+diff --git a/src/video_core/native_indirect_reset.h b/src/video_core/native_indirect_reset.h
+--- a/src/video_core/native_indirect_reset.h
++++ b/src/video_core/native_indirect_reset.h
+@@ -64,39 +64,67 @@
+     return std::ranges::equal(code, Program);
+ }
+ 
++// Bound scratch storage and CPU work, not the number of records in a terrain chunk.
++// Two u64 vectors at this limit consume at most 1 MiB; observed streamed lists
++// exceed the old 1024-entry limit. Counts above this budget still fail closed.
++inline constexpr u32 MaxRecords = 65536;
++enum class Failure {
++    None, EmptyDraw, WorkBudget, ConstantBuffer, PointerTable, Record, SourceOverlap, RecordOverlap,
++};
++inline const char* FailureName(Failure failure) {
++    switch (failure) {
++    case Failure::None: return "none";
++    case Failure::EmptyDraw: return "empty_draw";
++    case Failure::WorkBudget: return "work_budget";
++    case Failure::ConstantBuffer: return "constant_buffer";
++    case Failure::PointerTable: return "pointer_table";
++    case Failure::Record: return "record_mapping_or_alignment";
++    case Failure::SourceOverlap: return "source_overlap";
++    case Failure::RecordOverlap: return "partial_record_overlap";
++    }
++    return "unknown";
++}
++
+ // This program loads table[VertexID] and stores {0,1,0,0,0} there. The caller
+-// admits only direct, single-instance point draws without additional shader stages,
+-// additional pre-raster stages, transform feedback or conditional rendering.
++// admits only direct, single-instance point draws without additional pre-raster
++// stages, transform feedback or conditional rendering.
+ // Preflight the complete operation before any store. Coherent reader/writer
+ // callbacks must retain ordering against previous GPU work and future draws.
+ template <class Mapped, class Read, class Write>
+-bool Execute(u64 cbuf, u32 cbuf_size, u32 count, Mapped&& mapped, Read&& read, Write&& write) {
++bool Execute(u64 cbuf, u32 cbuf_size, u32 count, Mapped&& mapped, Read&& read, Write&& write,
++             Failure* failure = nullptr) {
++    if (failure) *failure = Failure::None;
++    const auto reject = [&](Failure reason) {
++        if (failure) *failure = reason;
++        return false;
++    };
+     constexpr u64 RecordSize = 20;
+     const auto valid = [&](u64 address, u64 size) {
+         return address != 0 && size <= std::numeric_limits<u64>::max() - address &&
+                mapped(address, size);
+     };
+-    if (count == 0 || count > 1024 || cbuf_size < 0x118 ||
+-        !valid(cbuf, cbuf_size)) return false;
++    if (count == 0) return reject(Failure::EmptyDraw);
++    if (count > MaxRecords) return reject(Failure::WorkBudget);
++    if (cbuf_size < 0x118 || !valid(cbuf, cbuf_size)) return reject(Failure::ConstantBuffer);
+     u64 table{};
+     read(cbuf + 0x110, &table, sizeof(table));
+     const u64 bytes = u64{count} * sizeof(u64);
+-    if (!valid(table, bytes)) return false;
++    if (!valid(table, bytes)) return reject(Failure::PointerTable);
+     std::vector<u64> targets(count);
+     read(table, targets.data(), bytes);
+     const auto overlaps = [](u64 a, u64 as, u64 b, u64 bs) {
+         return a < b + bs && b < a + as;
+     };
+     for (u64 target : targets) {
+-        if (!valid(target, RecordSize) || (target & 3) ||
+-            overlaps(target, RecordSize, table, bytes) ||
+-            overlaps(target, RecordSize, cbuf, cbuf_size)) return false;
++        if (!valid(target, RecordSize) || (target & 3)) return reject(Failure::Record);
++        if (overlaps(target, RecordSize, table, bytes) ||
++            overlaps(target, RecordSize, cbuf, cbuf_size)) return reject(Failure::SourceOverlap);
+     }
+     auto ordered = targets;
+     std::ranges::sort(ordered);
+     for (size_t i = 1; i < ordered.size(); ++i) {
+         if (ordered[i] != ordered[i - 1] && ordered[i] - ordered[i - 1] < RecordSize)
+-            return false;
++            return reject(Failure::RecordOverlap);
+     }
+     constexpr std::array<u32, 5> record{0, 1, 0, 0, 0};
+     for (u64 target : targets) write(target, record.data(), sizeof(record));
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -389,6 +389,7 @@
+         pipeline_cache.IsNativeIndirectReset()) {
+         const auto& cbuf = maxwell3d->state.shader_stages[0].const_buffers[0];
+         if (cbuf.enabled) {
++            VideoCommon::NativeIndirectReset::Failure reset_failure{};
+             const bool restored = VideoCommon::NativeIndirectReset::Execute(
+                 cbuf.address, cbuf.size, reset_draw.vertex_buffer.count,
+                 [&](u64 address, u64 size) {
+@@ -397,17 +398,22 @@
+                            gpu_memory->IsFullyMappedRange(address, size);
+                 },
+                 [&](u64 address, void* dest, u64 size) { gpu_memory->ReadBlock(address, dest, size); },
+-                [&](u64 address, const void* src, u64 size) { gpu_memory->WriteBlock(address, src, size); });
++                [&](u64 address, const void* src, u64 size) { gpu_memory->WriteBlock(address, src, size); },
++                &reset_failure);
+             static u64 reset_count{};
+             if (restored && (++reset_count == 1 || reset_count % 600 == 0)) {
+-                LOG_INFO(HW_GPU, "NX2_INDIRECT_RESET draws={} records={} coherent=1",
+-                         reset_count, reset_draw.vertex_buffer.count);
++                LOG_INFO(HW_GPU, "NX2_INDIRECT_RESET draws={} records={} coherent=1 budget={}",
++                         reset_count, reset_draw.vertex_buffer.count,
++                         VideoCommon::NativeIndirectReset::MaxRecords);
+             }
+             if (!restored) {
+                 static u32 rejected{};
+-                if (++rejected <= 4) LOG_WARNING(HW_GPU,
+-                    "NX2_INDIRECT_RESET rejected unsafe table/range (records={})",
+-                    reset_draw.vertex_buffer.count);
++                ++rejected;
++                if (rejected <= 4 || rejected % 600 == 0) LOG_WARNING(HW_GPU,
++                    "NX2_INDIRECT_RESET rejected reason={} records={} budget={} total={}",
++                    VideoCommon::NativeIndirectReset::FailureName(reset_failure),
++                    reset_draw.vertex_buffer.count, VideoCommon::NativeIndirectReset::MaxRecords,
++                    rejected);
+             }
+         }
+     }

@@ -1,0 +1,66 @@
+diff --git a/src/video_core/native_dma_snapshot.h b/src/video_core/native_dma_snapshot.h
+--- a/src/video_core/native_dma_snapshot.h
++++ b/src/video_core/native_dma_snapshot.h
+@@ -35,4 +35,15 @@
+     ReadNativeDmaCommandSnapshot(memory, address, destination, bytes, safe || dirty);
+     return dirty;
+ }
++// Low GPU accuracy makes the default DMA policy optimistic. It must not
++// bypass GPU-produced command bytes. Explicit unsafe DMA retains its policy.
++template <class Memory>
++void ReadNativeDmaSoloSnapshot(Memory& memory, GPUVAddr address, void* destination,
++                                std::size_t bytes, bool coherent, bool default_dma) {
++    if (!coherent && default_dma) {
++        ReadOwnedNativeDmaSnapshot(memory, address, destination, bytes, false);
++    } else {
++        ReadNativeDmaCommandSnapshot(memory, address, destination, bytes, coherent);
++    }
++}
+ } // namespace Tegra
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -203,8 +203,9 @@
+                     });
+                 } else
+ #endif
+-                ReadNativeDmaCommandSnapshot(memory_manager, dma_state.dma_get,
+-                    command_headers.data(), size_t{header.size} * sizeof(CommandHeader), use_safe);
++                ReadNativeDmaSoloSnapshot(memory_manager, dma_state.dma_get,
++                    command_headers.data(), size_t{header.size} * sizeof(CommandHeader),
++                    use_safe, Settings::IsDMALevelDefault());
+             }
+             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
+ #ifdef EDEN_NX2_PS5_PROTO
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -227,12 +227,13 @@
+     // Nearly every call arrives whole in one method run (title 1 makes ~1,000,000 a second):
+     // copy it to the stack instead of growing the parameter vector. Still a copy: the command
+     // list is often guest memory read in place, which the guest may reuse while the macro runs
+-    // (and the macro memo stores the parameters after it ran). Only accurate GPU mode rewrites
+-    // the parameters in place (RefreshParameters), so it keeps the vector.
++    // (and the macro memo stores the parameters after it ran). Accurate GPU mode and native Default DMA refresh
++    // the parameters in place, so both retain vector-backed storage.
+     // EDEN_NX2_MACRO_COPY=1: always use the vector (for comparisons).
+     static const bool always_copy = std::getenv("EDEN_NX2_MACRO_COPY") != nullptr;
+     if (is_last_call && macro_params.empty() && amount <= 64 && !always_copy &&
+-        !Settings::IsGPULevelHigh()) {
++        !Settings::IsGPULevelHigh() &&
++        !(GetNativeMacroEngine().native_turing && Settings::IsDMALevelDefault())) {
+         std::array<u32, 64> parameters;
+         std::copy_n(base_start, amount, parameters.begin());
+         ConsumeSink(system);
+@@ -262,7 +263,10 @@
+ }
+ 
+ void Maxwell3D::RefreshParametersImpl() {
+-    if (!Settings::IsGPULevelHigh()) {
++    // Native command parameters can be generated or overwritten by earlier GPU work.
++    // Keep this coherence boundary even when the user lowers graphics accuracy.
++    if (!Settings::IsGPULevelHigh() &&
++        !(GetNativeMacroEngine().native_turing && Settings::IsDMALevelDefault())) {
+         return;
+     }
+     size_t current_index = 0;

@@ -1258,8 +1258,6 @@ set(tracked_new [=[        const bool detail = ::Eden::Performance::cpu_write_de
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
             auto& current_area = rasterizer_write_areas[core];
             PAddr subaddress = address >> YUZU_PAGEBITS;
-            if (detail && current_area.last_address == subaddress)
-                stats.passed.fetch_add(1, std::memory_order_relaxed);
             if (detail && current_area.last_address != subaddress) {
                 stats.sizes[size <= 8 ? 0 : size <= 64 ? 1 : size <= 4096 ? 2 : 3].fetch_add(1, std::memory_order_relaxed);
                 if (stats.last_page == subaddress)

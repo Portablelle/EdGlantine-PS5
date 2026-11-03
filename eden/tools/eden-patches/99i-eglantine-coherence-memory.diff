@@ -1,0 +1,938 @@
+diff --git a/src/common/paged_scalar.h b/src/common/paged_scalar.h
+new file mode 100644
+index 0000000..3ec1e35
+--- /dev/null
++++ b/src/common/paged_scalar.h
+@@ -0,0 +1,58 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <cstring>
++#include <limits>
++#include <type_traits>
++#include "common/common_types.h"
++
++namespace Common {
++
++// A translated pointer is valid only within its physical backing page, even when
++// the guest GPU mapping uses a larger page. Never memcpy a scalar across it.
++template <typename T, typename Translate>
++[[nodiscard]] T ReadPagedScalar(u64 address, Translate&& translate) {
++    static_assert(std::is_trivially_copyable_v<T>);
++    constexpr u64 page_size = 0x1000;
++    T value{};
++    auto* bytes = reinterpret_cast<u8*>(&value);
++    size_t remaining = sizeof(T);
++    while (remaining != 0) {
++        const size_t count = (std::min)(remaining, size_t{page_size - (address & (page_size - 1))});
++        if (const auto* pointer = translate(address)) {
++            std::memcpy(bytes, pointer, count);
++        }
++        remaining -= count;
++        bytes += count;
++        if (count > (std::numeric_limits<u64>::max)() - address) {
++            break; // Do not wrap an invalid trailing range back to address zero.
++        }
++        address += count;
++    }
++    return value;
++}
++
++template <typename T, typename Translate>
++void WritePagedScalar(u64 address, T value, Translate&& translate) {
++    static_assert(std::is_trivially_copyable_v<T>);
++    constexpr u64 page_size = 0x1000;
++    const auto* bytes = reinterpret_cast<const u8*>(&value);
++    size_t remaining = sizeof(T);
++    while (remaining != 0) {
++        const size_t count = (std::min)(remaining, size_t{page_size - (address & (page_size - 1))});
++        if (auto* pointer = translate(address)) {
++            std::memcpy(pointer, bytes, count);
++        }
++        remaining -= count;
++        bytes += count;
++        if (count > (std::numeric_limits<u64>::max)() - address) {
++            break;
++        }
++        address += count;
++    }
++}
++
++} // namespace Common
+\ No newline at end of file
+diff --git a/src/core/device_memory_manager.inc b/src/core/device_memory_manager.inc
+index f0df64d..5ef2f4a 100644
+--- a/src/core/device_memory_manager.inc
++++ b/src/core/device_memory_manager.inc
+@@ -16,6 +16,7 @@
+ #include "common/address_space.h"
+ #include "common/address_space.inc"
+ #include "common/alignment.h"
++#include "common/paged_scalar.h"
+ #include "common/assert.h"
+ #include "common/div_ceil.h"
+ #include "common/scope_exit.h"
+@@ -396,27 +397,25 @@ const T* DeviceMemoryManager<Traits>::GetPointer(DAddr address) const {
+ template <typename Traits>
+ template <typename T>
+ void DeviceMemoryManager<Traits>::Write(DAddr address, T value) {
+-    T* ptr = GetPointer<T>(address);
+-    if (!ptr) [[unlikely]] {
+-        return;
+-    }
+ #ifdef EDEN_NX2_PS5_PROTO
+-    NativeDmaWriteTrace::Record(this, address, sizeof(T), &value, "DeviceMemory::Write", reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)));
++    if (address < device_as_size && GetPointer<u8>(address))
++        NativeDmaWriteTrace::Record(this, address, sizeof(T), &value, "DeviceMemory::Write",
++            reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)));
+ #endif
+-    Core::HLE::DlssTrace::WriteWatch("DeviceMemoryManager::Write<T>", ptr, sizeof(T));
+-    std::memcpy(ptr, &value, sizeof(T));
++    Common::WritePagedScalar(address, value, [&](DAddr at) {
++        auto* pointer = at < device_as_size ? GetPointer<u8>(at) : nullptr;
++        if (pointer) Core::HLE::DlssTrace::WriteWatch("DeviceMemoryManager::Write<T>", pointer,
++            (std::min)(sizeof(T) - size_t(at - address), size_t{0x1000 - (at & 0xfff)}));
++        return pointer;
++    });
+ }
+ 
+ template <typename Traits>
+ template <typename T>
+ T DeviceMemoryManager<Traits>::Read(DAddr address) const {
+-    const T* ptr = GetPointer<T>(address);
+-    T result{};
+-    if (!ptr) [[unlikely]] {
+-        return result;
+-    }
+-    std::memcpy(&result, ptr, sizeof(T));
+-    return result;
++    return Common::ReadPagedScalar<T>(address, [&](DAddr at) {
++        return at < device_as_size ? GetPointer<u8>(at) : nullptr;
++    });
+ }
+ 
+ template <typename Traits>
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index f952f1e..4a6132d 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -831,11 +831,9 @@ struct Memory::Impl {
+         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
+             auto& current_area = rasterizer_write_areas[core];
+             PAddr subaddress = address >> YUZU_PAGEBITS;
+-            // Performance note:
+-            // It may not be a good idea to assume accesses are within the same subaddress (i.e same page)
+-            // It is often the case the games like to access wildly different addresses. Hence why I propose
+-            // we should let the compiler just do it's thing...
+-            if (current_area.last_address != subaddress) {
++            // Every write can supersede a pending fence copy, even on the same page.
++            // Keep last_address only for the PS5 write profiler.
++            if (size != 0) {
+                 // Short circuit the need to check for address/size
+                 auto const do_collection = (address != 0 && size != 0)
+                     && system.GPU().OnCPUWrite(address, size);
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index b5a3bab..25e476a 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -9,6 +9,7 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include "video_core/buffer_cache/pending_fence_copies.h"
+ #include <memory>
+ #include <numeric>
+ #include <stdexcept>
+@@ -126,12 +127,12 @@ void BufferCache<P>::TickFrame() {
+                                  channel_state->uniform_cache_hits.end());
+     const u32 shots = std::reduce(channel_state->uniform_cache_shots.begin(),
+                                   channel_state->uniform_cache_shots.end());
+-    std::copy_n(channel_state->uniform_cache_hits.begin(),
+-                channel_state->uniform_cache_hits.size() - 1,
+-                channel_state->uniform_cache_hits.begin() + 1);
+-    std::copy_n(channel_state->uniform_cache_shots.begin(),
+-                channel_state->uniform_cache_shots.size() - 1,
+-                channel_state->uniform_cache_shots.begin() + 1);
++    std::move_backward(channel_state->uniform_cache_hits.begin(),
++                       channel_state->uniform_cache_hits.end() - 1,
++                       channel_state->uniform_cache_hits.end());
++    std::move_backward(channel_state->uniform_cache_shots.begin(),
++                       channel_state->uniform_cache_shots.end() - 1,
++                       channel_state->uniform_cache_shots.end());
+     channel_state->uniform_cache_hits[0] = 0;
+     channel_state->uniform_cache_shots[0] = 0;
+ 
+@@ -201,6 +202,15 @@ void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
+ 
+ template <class P>
+ bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
++    DropPendingFenceCopies(device_addr, size, pending_downloads, async_downloads);
++    if (!IsRegionRegistered(device_addr, size)) return false;
++    if (memory_tracker.IsRegionGpuModified(device_addr, size)) return true;
++    WriteMemory(device_addr, size);
++    return false;
++}
++
++template <class P>
++bool BufferCache<P>::OnCPUWriteAhead(DAddr device_addr, u64 size) {
+     const bool is_dirty = IsRegionRegistered(device_addr, size);
+     if (!is_dirty) {
+         return false;
+@@ -208,7 +218,7 @@ bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
+     if (memory_tracker.IsRegionGpuModified(device_addr, size)) {
+         return true;
+     }
+-    WriteMemory(device_addr, size);
++    memory_tracker.MarkRegionAsCpuModified(device_addr, size);
+     return false;
+ }
+ 
+@@ -318,7 +328,7 @@ void BufferCache<P>::SynchronizeStoragePointers(std::span<const GPUVAddr> pointe
+ 
+ template <class P>
+ void BufferCache<P>::ClearDownload(DAddr device_addr, u64 size) {
+-    async_downloads.DeleteAll(device_addr, size);
++    DropPendingFenceCopies(device_addr, size, pending_downloads, async_downloads);
+     uncommitted_gpu_modified_ranges.Subtract(device_addr, size);
+     for (auto& interval_set : committed_gpu_modified_ranges) {
+         interval_set.Subtract(device_addr, size);
+@@ -524,23 +534,35 @@ void BufferCache<P>::BindHostStageBuffers(size_t stage) {
+         BindHostGraphicsUniformBuffers(stage);
+         runtime.EndHostBinding();
+         runtime.BeginHostBinding(1);
++        if (channel_state->enabled_storage_buffers[stage] != 0) {
+         BindHostGraphicsStorageBuffers(stage);
++    }
+         runtime.EndHostBinding();
+         runtime.BeginHostBinding(2);
++        if (channel_state->enabled_texture_buffers[stage] != 0) {
+         BindHostGraphicsTextureBuffers(stage);
++    }
+         runtime.EndHostBinding();
+     } else {
+         BindHostGraphicsUniformBuffers(stage);
++        if (channel_state->enabled_storage_buffers[stage] != 0) {
+         BindHostGraphicsStorageBuffers(stage);
++    }
++        if (channel_state->enabled_texture_buffers[stage] != 0) {
+         BindHostGraphicsTextureBuffers(stage);
+     }
++    }
+ }
+ 
+ template <class P>
+ void BufferCache<P>::BindHostComputeBuffers() {
+     BindHostComputeUniformBuffers();
+-    BindHostComputeStorageBuffers();
+-    BindHostComputeTextureBuffers();
++    if (channel_state->enabled_compute_storage_buffers != 0) {
++        BindHostComputeStorageBuffers();
++    }
++    if (channel_state->enabled_compute_texture_buffers != 0) {
++        BindHostComputeTextureBuffers();
++    }
+     if (any_buffer_uploaded) {
+         runtime.PostCopyBarrier();
+         any_buffer_uploaded = false;
+@@ -763,18 +785,12 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
+         return;
+     }
+ 
+-    auto it = committed_gpu_modified_ranges.begin();
+-    while (it != committed_gpu_modified_ranges.end()) {
+-        auto& current_intervals = *it;
+-        auto next_it = std::next(it);
+-        while (next_it != committed_gpu_modified_ranges.end()) {
+-            next_it->ForEach([&current_intervals](DAddr start, DAddr end) {
+-                current_intervals.Subtract(start, end - start);
+-            });
+-            next_it++;
+-        }
+-        it++;
++    Common::RangeSet<DAddr> merged;
++    for (const auto& ranges : committed_gpu_modified_ranges) {
++        ranges.ForEach([&](DAddr a, DAddr b) { merged.Add(a, b - a); });
+     }
++    committed_gpu_modified_ranges.clear();
++    committed_gpu_modified_ranges.emplace_back(std::move(merged));
+ 
+     boost::container::small_vector<std::pair<BufferCopy, BufferId>, 16> downloads;
+     u64 total_size_bytes = 0;
+@@ -852,6 +868,7 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
+         normalized_copies.push_back(second_copy);
+     }
+     runtime.PostCopyBarrier();
++    pending_download_epochs.push_back(download_selection_epochs.OldestSelection());
+     pending_downloads.emplace_back(std::move(normalized_copies));
+     async_buffers.emplace_back(download_staging);
+ }
+@@ -883,17 +900,17 @@ void BufferCache<P>::PopAsyncBuffers() {
+         const DAddr device_addr = static_cast<DAddr>(copy.src_offset);
+         const u64 dst_offset = copy.dst_offset - base_offset;
+         const u8* read_mapped_memory = base + dst_offset;
+-        async_downloads.ForEachInRange(device_addr, copy.size, [&](DAddr start, DAddr end, s32) {
+-            device_memory.WriteBlockUnsafe(start, &read_mapped_memory[start - device_addr],
+-                                           end - start);
+-        });
+-        async_downloads.Subtract(device_addr, copy.size, [&](DAddr start, DAddr end) {
+-            gpu_modified_ranges.Subtract(start, end - start);
+-        });
++        PublishFenceCopy(device_addr, copy.size, read_mapped_memory, async_downloads,
++            uncommitted_gpu_modified_ranges, committed_gpu_modified_ranges,
++            gpu_modified_ranges, download_selection_epochs.IsCurrent(pending_download_epochs.front()),
++            [&](DAddr address, const u8* bytes, u64 size) {
++                device_memory.WriteBlockUnsafe(address, bytes, size);
++            });
+     }
+     async_buffers_death_ring.emplace_back(*async_buffer);
+     async_buffers.pop_front();
+     pending_downloads.pop_front();
++    pending_download_epochs.pop_front();
+ }
+ 
+ template <class P>
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index a15b166..c5c7778 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -28,6 +28,7 @@
+ #include "common/literals.h"
+ #include "common/lru_cache.h"
+ #include "common/range_sets.h"
++#include "video_core/buffer_cache/pending_fence_copies.h"
+ #include "video_core/buffer_cache/readback_cache.h"
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
+@@ -250,6 +251,9 @@ public:
+ 
+     bool OnCPUWrite(DAddr device_addr, u64 size);
+ 
++    /// Speculative adjacent-page probe; a GPU-dirty page is left untouched.
++    bool OnCPUWriteAhead(DAddr device_addr, u64 size);
++
+     void DownloadMemory(DAddr device_addr, u64 size);
+ 
+     /// Makes a storage buffer pointer in guest memory current before it is read: GPU-driven
+@@ -550,7 +554,9 @@ private:
+     /// the native MME's DMA reads never touched those pages. Without them a fence costs ~1 us
+     /// instead of ~5 and draw setup ~7% less. EDEN_NX2_BUFFER_DOWNLOADS=0/1 forces it.
+     bool DownloadsAtFence(DAddr device_addr, u64 size) noexcept {
+-        return AsyncBufferDownloads() || memory_tracker.IsRegionPreflushable(device_addr, size);
++        const bool all = AsyncBufferDownloads();
++        download_selection_epochs.NoteSelection(all, !HasUncommittedFlushes());
++        return all || memory_tracker.IsRegionPreflushable(device_addr, size);
+     }
+ 
+     bool AsyncBufferDownloads() const {
+@@ -571,6 +577,8 @@ private:
+     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
+ 
+     // Async Buffers
++    DownloadSelectionEpochs download_selection_epochs;
++    std::deque<u64> pending_download_epochs;
+     Common::OverlapRangeSet<DAddr> async_downloads;
+     std::deque<std::optional<Async_Buffer>> async_buffers;
+     std::deque<boost::container::small_vector<BufferCopy, 4>> pending_downloads;
+diff --git a/src/video_core/buffer_cache/pending_fence_copies.h b/src/video_core/buffer_cache/pending_fence_copies.h
+new file mode 100644
+index 0000000..95bfab5
+--- /dev/null
++++ b/src/video_core/buffer_cache/pending_fence_copies.h
+@@ -0,0 +1,82 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++#include <algorithm>
++#include <cstddef>
++#include <deque>
++#include "common/range_sets.inc"
++#include "common/common_types.h"
++namespace VideoCommon {
++// Adapted from zortos293/Eglantine 5bef7354 fence_download_ranges.h.
++template<class Copies, class Counts>
++void DropPendingFenceCopies(u64 address, u64 size, Copies& fences, Counts& counts) {
++    if (size == 0) return;
++    bool pending = false;
++    counts.ForEachInRange(address, size, [&](auto, auto, auto) { pending = true; });
++    if (!pending) return;
++    const u64 end = address + size;
++    for (auto& copies : fences) {
++        for (size_t i = 0; i < copies.size();) {
++            const auto copy = copies[i];
++            const u64 begin = copy.src_offset, stop = begin + copy.size;
++            const u64 first = (std::max)(begin, address), last = (std::min)(stop, end);
++            if (first >= last) { ++i; continue; }
++            counts.Subtract(first, last - first);
++            auto left = copy, right = copy;
++            left.size = first - begin;
++            right.src_offset = last;
++            right.dst_offset += last - begin;
++            right.size = stop - last;
++            if (left.size && right.size) {
++                copies[i] = left;
++                copies.insert(copies.begin() + static_cast<std::ptrdiff_t>(i + 1), right);
++                i += 2;
++            } else if (left.size) { copies[i++] = left;
++            } else if (right.size) { copies[i++] = right;
++            } else { copies.erase(copies.begin() + static_cast<std::ptrdiff_t>(i)); }
++        }
++    }
++}
++// Selection mode may change when a different channel becomes current. Preserve
++// older fences' publication, but never use their old rule to retire newer writes.
++class DownloadSelectionEpochs {
++public:
++    void NoteSelection(bool download_all, bool nothing_selected) noexcept {
++        if (known && download_all != last) ++current;
++        known = true;
++        last = download_all;
++        if (nothing_selected) oldest = current;
++    }
++    u64 OldestSelection() const noexcept { return oldest; }
++    bool IsCurrent(u64 epoch) const noexcept { return epoch == current; }
++private:
++    bool known = false, last = false;
++    u64 current = 0, oldest = 0;
++};
++
++// Publish an earlier fence even if a later GPU binding has been announced.
++// Only CPU/inline overwrites clip its copy list. Newer selected GPU writes keep
++// their exact bytes dirty; after a selection-policy change retain dirtiness
++// conservatively until a fresh synchronous download or current fence.
++template<class Counts, class Modified, class Write>
++void PublishFenceCopy(DAddr address, u64 size, const u8* bytes, Counts& counts,
++                      const Common::RangeSet<DAddr>& uncommitted,
++                      const std::deque<Common::RangeSet<DAddr>>& committed,
++                      Modified& modified, bool selection_current, Write&& write) {
++    counts.ForEachInRange(address, size, [&](DAddr begin, DAddr end, s32) {
++        write(begin, bytes + (begin - address), end - begin);
++    });
++    counts.Subtract(address, size, [&](DAddr begin, DAddr end) {
++        if (!selection_current) return;
++        Common::RangeSet<DAddr> completed;
++        completed.Add(begin, end - begin);
++        const auto exclude = [&](const auto& ranges) {
++            ranges.ForEachInRange(begin, end - begin, [&](DAddr a, DAddr b) {
++                completed.Subtract(a, b - a);
++            });
++        };
++        exclude(uncommitted);
++        for (const auto& ranges : committed) exclude(ranges);
++        completed.ForEach([&](DAddr a, DAddr b) { modified.Subtract(a, b - a); });
++    });
++}
++}
+diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
+index e1bb833..cd1a9f7 100644
+--- a/src/video_core/memory_manager.cpp
++++ b/src/video_core/memory_manager.cpp
+@@ -8,6 +8,7 @@
+ #include <algorithm>
+ 
+ #include "common/alignment.h"
++#include "common/paged_scalar.h"
+ #include "common/assert.h"
+ #include "common/logging.h"
+ #include "core/core.h"
+@@ -284,31 +285,26 @@ T MemoryManager::Read(GPUVAddr addr) const {
+         }
+     }
+ 
+-    if (auto page_pointer{GetPointer(addr)}; page_pointer) {
+-        // NOTE: Avoid adding any extra logic to this fast-path block
+-        T value;
+-        std::memcpy(&value, page_pointer, sizeof(T));
+-        return value;
+-    }
+-
+-    static std::atomic<u32> reported{};
+-    if (reported.fetch_add(1) < 16) {
+-        LOG_ERROR(HW_GPU, "Read{} of unmapped GPU address {:#x}", sizeof(T) * 8, addr);
+-    }
+-
+-    return {};
++    return Common::ReadPagedScalar<T>(addr, [&](GPUVAddr at) {
++        const auto* pointer = GetPointer(at);
++        if (!pointer) {
++            static std::atomic<u32> reported{};
++            if (reported.fetch_add(1) < 16)
++                LOG_ERROR(HW_GPU, "Read{} of unmapped GPU address {:#x}", sizeof(T) * 8, at);
++        }
++        return pointer;
++    });
+ }
+ 
+ template <typename T>
+ void MemoryManager::Write(GPUVAddr addr, T data) {
+-    if (auto page_pointer{GetPointer(addr)}; page_pointer) {
+-        // NOTE: Avoid adding any extra logic to this fast-path block
+-        Core::HLE::DlssTrace::WriteWatch("MemoryManager(GPU)::Write<T>", page_pointer, sizeof(T));
+-        std::memcpy(page_pointer, &data, sizeof(T));
+-        return;
+-    }
+-
+-    ASSERT(false);
++    Common::WritePagedScalar(addr, data, [&](GPUVAddr at) {
++        auto* pointer = GetPointer(at);
++        ASSERT(pointer != nullptr);
++        if (pointer) Core::HLE::DlssTrace::WriteWatch("MemoryManager(GPU)::Write<T>", pointer,
++            (std::min)(sizeof(T) - size_t(at - addr), size_t{0x1000 - (at & 0xfff)}));
++        return pointer;
++    });
+ }
+ 
+ template u8 MemoryManager::Read<u8>(GPUVAddr addr) const;
+@@ -418,8 +414,7 @@ void MemoryManager::ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std:
+         if (!unsafe) {
+             rasterizer->FlushRegion(dev_addr_base, copy_amount, which);
+         }
+-        u8* physical = memory.GetPointer<u8>(dev_addr_base);
+-        std::memcpy(dest_buffer, physical, copy_amount);
++        memory.ReadBlockUnsafe(dev_addr_base, dest_buffer, copy_amount);
+         dest_buffer = static_cast<u8*>(dest_buffer) + copy_amount;
+     };
+     auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+@@ -427,12 +422,7 @@ void MemoryManager::ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std:
+         if (!unsafe) {
+             rasterizer->FlushRegion(dev_addr_base, copy_amount, which);
+         }
+-        if (!IsBigPageContinuous(page_index)) [[unlikely]] {
+-            memory.ReadBlockUnsafe(dev_addr_base, dest_buffer, copy_amount);
+-        } else {
+-            u8* physical = memory.GetPointer<u8>(dev_addr_base);
+-            std::memcpy(dest_buffer, physical, copy_amount);
+-        }
++        memory.ReadBlockUnsafe(dev_addr_base, dest_buffer, copy_amount);
+         dest_buffer = static_cast<u8*>(dest_buffer) + copy_amount;
+     };
+     auto read_short_pages = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+@@ -472,9 +462,7 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
+         if (!unsafe) {
+             rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
+         }
+-        u8* physical = memory.GetPointer<u8>(dev_addr_base);
+-        Core::HLE::DlssTrace::WriteWatch("MemoryManager(GPU)::WriteBlock", physical, copy_amount);
+-        std::memcpy(physical, src_buffer, copy_amount);
++        memory.WriteBlockUnsafe(dev_addr_base, src_buffer, copy_amount);
+         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
+     };
+     auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+@@ -482,13 +470,7 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
+         if (!unsafe) {
+             rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
+         }
+-        if (!IsBigPageContinuous(page_index)) [[unlikely]] {
+-            memory.WriteBlockUnsafe(dev_addr_base, src_buffer, copy_amount);
+-        } else {
+-            u8* physical = memory.GetPointer<u8>(dev_addr_base);
+-            Core::HLE::DlssTrace::WriteWatch("MemoryManager(GPU)::WriteBlock", physical, copy_amount);
+-        std::memcpy(physical, src_buffer, copy_amount);
+-        }
++        memory.WriteBlockUnsafe(dev_addr_base, src_buffer, copy_amount);
+         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
+     };
+     auto write_short_pages = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+index 332a0d5..7fd31c5 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -134,6 +134,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
+         if (pipeline_statistics) {
+             pipeline_statistics->Collect(device, *pipeline);
+         }
++        spv_module.reset();
+         std::scoped_lock lock{build_mutex};
+         is_built = true;
+         build_condvar.notify_one();
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 7fc437a..d3f25a5 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1495,9 +1495,9 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
+     {
+         for (const auto& [addr, size] : sequences) {
+             query_cache.InvalidateRegion(addr, size);
+-            pipeline_cache.InvalidateRegion(addr, size);
+         }
+     }
++    pipeline_cache.InvalidateRegions(sequences);
+ }
+ 
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+index 5154abd..8417067 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -365,6 +365,10 @@ public:
+ 
+     void AllocateComputeUnswizzleImage();
+ 
++    [[nodiscard]] auto MemoryBlock() const noexcept {
++        return current_image ? (this->*current_image).GetMemoryBlock() : vk::Image::MemoryBlock{};
++    }
++
+     [[nodiscard]] VkImage Handle() const noexcept {
+         return *(this->*current_image);
+     }
+diff --git a/src/video_core/shader_cache.cpp b/src/video_core/shader_cache.cpp
+index 3341276..7e5c8e8 100644
+--- a/src/video_core/shader_cache.cpp
++++ b/src/video_core/shader_cache.cpp
+@@ -34,6 +34,16 @@ void ShaderCache::InvalidateRegion(VAddr addr, size_t size) {
+     RemovePendingShaders();
+ }
+ 
++void ShaderCache::InvalidateRegions(std::span<const std::pair<DAddr, std::size_t>> sequences) {
++    if (sequences.empty()) return;
++    std::scoped_lock lock{invalidation_mutex};
++    for (const auto& [addr, size] : sequences) {
++        DropRejections(addr, size);
++        InvalidatePagesInRegion(addr, size);
++    }
++    RemovePendingShaders();
++}
++
+ void ShaderCache::OnCacheInvalidation(VAddr addr, size_t size) {
+     std::scoped_lock lock{invalidation_mutex};
+     DropRejections(addr, size);
+diff --git a/src/video_core/shader_cache.h b/src/video_core/shader_cache.h
+index c80d811..b6a72de 100644
+--- a/src/video_core/shader_cache.h
++++ b/src/video_core/shader_cache.h
+@@ -66,6 +66,8 @@ public:
+     /// @param addr Start address of the invalidation
+     /// @param size Number of bytes of the invalidation
+     void InvalidateRegion(VAddr addr, size_t size);
++    /// Invalidate all regions under one lock and retire affected shaders once.
++    void InvalidateRegions(std::span<const std::pair<DAddr, std::size_t>> sequences);
+ 
+     /// @brief Unmarks a memory region as cached and marks it for removal
+     /// @param addr Start address of the CPU write operation
+diff --git a/src/video_core/texture_cache/descriptor_table.h b/src/video_core/texture_cache/descriptor_table.h
+index e40c128..175700b 100644
+--- a/src/video_core/texture_cache/descriptor_table.h
++++ b/src/video_core/texture_cache/descriptor_table.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <bit>
+ #include <vector>
+ 
+ #include "common/alignment.h"
+@@ -18,7 +19,7 @@
+ 
+ namespace VideoCommon {
+ 
+-template <typename T>
++template <typename T, typename Id = u32>
+ class DescriptorTable {
+ public:
+     [[nodiscard]] bool Synchronize(GPUVAddr gpu_addr, u32 limit) noexcept {
+@@ -30,7 +31,9 @@ public:
+     }
+ 
+     void Invalidate() noexcept {
+-        std::ranges::fill(read_descriptors, 0);
++        // Deleting many images invalidates every channel repeatedly. Clear once on reuse,
++        // not once per eviction. Descriptor contents are still read from guest memory each time.
++        invalidated = true;
+     }
+ 
+     [[nodiscard]] std::pair<T, bool> Read(Tegra::MemoryManager const& gpu_memory, u32 index) noexcept {
+@@ -38,36 +41,50 @@ public:
+         const GPUVAddr gpu_addr = current_gpu_addr + index * sizeof(T);
+         std::pair<T, bool> result;
+         gpu_memory.ReadBlockUnsafe(gpu_addr, std::addressof(result.first), sizeof(T));
+-        if ((read_descriptors[index / 64] & (1ULL << (index % 64))) != 0) {
+-            result.second = result.first != descriptors[index];
+-        } else {
+-            read_descriptors[index / 64] |= 1ULL << (index % 64);
+-            result.second = true;
++        result.second = UpdateDescriptor(index, result.first);
++        return result;
++    }
++
++    // Return whether a freshly read descriptor needs its binding resolved again.
++    [[nodiscard]] bool UpdateDescriptor(u32 index, const T& descriptor) noexcept {
++        DEBUG_ASSERT(index <= current_limit);
++        if (invalidated) {
++            std::ranges::fill(read_descriptors, 0);
++            invalidated = false;
+         }
+-        if (result.second) {
+-            descriptors[index] = result.first;
++        auto& bits = read_descriptors[index / 64];
++        const u64 mask = 1ULL << (index % 64);
++        const bool changed = (bits & mask) == 0 || descriptor != descriptors[index];
++        bits |= mask;
++        if (changed) {
++            descriptors[index] = descriptor;
+         }
+-        return result;
++        return changed;
+     }
+ 
+     void Refresh(GPUVAddr gpu_addr, u32 limit) noexcept {
+         current_gpu_addr = gpu_addr;
+         current_limit = limit;
+-        // Mario Brothership reallocates a lot of times, so use aggressive pre-alloc sizes
+-        // std::vector<T> by default uses quadratic growth, but that isn't even enough to satisfy brothership
+-        const size_t num_descriptors = ((limit + 0x80000) & (~0x7ffff)) + 1;
++        // Geometric growth retains amortized allocation without a 16 MiB minimum per table.
++        // Widen before adding so an inclusive u32 limit cannot wrap.
++        const size_t num_descriptors = std::bit_ceil(static_cast<size_t>(limit) + 1);
+         size_t old_size = read_descriptors.size();
+         read_descriptors.resize(Common::DivCeil(num_descriptors, 64U));
+         old_size = (std::min)(old_size, read_descriptors.size());
+         std::fill(read_descriptors.begin(), read_descriptors.begin() + old_size, 0);
+-        //
+-        descriptors.resize(num_descriptors);
++        invalidated = false;
++        if (descriptors.size() < num_descriptors) {
++            descriptors.resize(num_descriptors);
++            bound_ids.resize(num_descriptors, Id{0});
++        }
+     }
+ 
+     std::vector<u64> read_descriptors;
+     std::vector<T> descriptors;
++    std::vector<Id> bound_ids;
+     GPUVAddr current_gpu_addr{};
+     u32 current_limit{};
++    bool invalidated{};
+ };
+ 
+ } // namespace VideoCommon
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 73f03e1..cd50c74 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -13,6 +13,7 @@
+ #include <cstdlib>
+ #include <limits>
+ #include <map>
++#include <unordered_map>
+ #include <vector>
+ #include <optional>
+ #include <bit>
+@@ -183,6 +184,49 @@ void TextureCache<P>::RunGarbageCollector() {
+     const auto EvictionCutoff = [&] {
+         return frame_tick - (evict_old_costly ? costly_age : ticks_to_destroy);
+     };
++    std::vector<ImageId> eviction_order;
++    size_t eviction_cursor = 0;
++    bool eviction_order_ready = false;
++    const auto ForEachEviction = [&](auto&& visit, bool consume = false) {
++        if constexpr (requires(const Image& image) { image.MemoryBlock(); }) {
++            if (gpu_memory && gpu_memory->UsesNativeTiling()) {
++                if (!eviction_order_ready) {
++                    std::vector<std::pair<double, ImageId>> candidates;
++                    lru_cache.ForEachItemBelow(EvictionCutoff(), [&](ImageId id) {
++                        candidates.emplace_back(0.5, id);
++                        return candidates.size() >= 8192;
++                    });
++                    if (block_fill_tick == ~0ULL || frame_tick - block_fill_tick >= 60) {
++                        block_fill_tick = frame_tick;
++                        block_image_bytes.clear();
++                        for (const auto [id, image] : slot_images) {
++                            const auto block = image->MemoryBlock();
++                            if (block.block) block_image_bytes[block.block] += block.size;
++                        }
++                    }
++                    for (auto& [fill, id] : candidates) {
++                        const auto block = slot_images[id].MemoryBlock();
++                        if (block.block && block.block_size)
++                            fill = double(block_image_bytes[block.block]) / double(block.block_size);
++                    }
++                    std::stable_sort(candidates.begin(), candidates.end(),
++                        [](const auto& a, const auto& b) { return a.first < b.first; });
++                    eviction_order.clear();
++                    for (const auto& [fill, id] : candidates) eviction_order.push_back(id);
++                    eviction_cursor = 0;
++                    eviction_order_ready = true;
++                }
++                // Prefetch observes the same live suffix that Cleanup will consume.
++                for (size_t i = eviction_cursor; i < eviction_order.size(); ++i) {
++                    const bool stop = visit(eviction_order[i]);
++                    if (consume) eviction_cursor = i + 1;
++                    if (stop) break;
++                }
++                return;
++            }
++        }
++        lru_cache.ForEachItemBelow(EvictionCutoff(), visit);
++    };
+     const auto Cleanup = [&, this](ImageId image_id) {
+         if (num_iterations == 0) {
+             return true;
+@@ -229,14 +273,17 @@ void TextureCache<P>::RunGarbageCollector() {
+     // as soon as the normal expected-memory budget is reached again.
+     costly_age = (std::max)(old_age, ticks_to_destroy);
+     if (high_priority_mode && old_age != 0 && frame_tick > costly_age) {
++        eviction_order_ready = false;
+         evict_old_costly = true;
+-        lru_cache.ForEachItemBelow(EvictionCutoff(), Cleanup);
++        ForEachEviction(Cleanup, true);
+         evict_old_costly = false;
+     }
+-    lru_cache.ForEachItemBelow(EvictionCutoff(), Cleanup);
++    eviction_order_ready = false;
++    ForEachEviction(Cleanup, true);
+     if (total_used_memory >= critical_memory) {
+         Configure(true);
+-        lru_cache.ForEachItemBelow(EvictionCutoff(), Cleanup);
++        eviction_order_ready = false;
++        ForEachEviction(Cleanup, true);
+     }
+ }
+ 
+@@ -512,15 +559,14 @@ SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
+         LOG_DEBUG(HW_GPU, "Invalid sampler index={}", index);
+         return NULL_SAMPLER_ID;
+     }
+-    auto const map_index = index | (compute ? Common::SlotId::TAGGED_VALUE : 0);
+     auto const [descriptor, is_new] = table.Read(*gpu_memory, index);
+     if (!compute && gpu_memory->UsesNativeTiling()) CaptureNativeSampler(index, descriptor);
+     if (is_new) {
+         auto const id = FindSampler(descriptor, compute);
+-        channel_state->sampler_ids.insert_or_assign(map_index, id);
++        table.bound_ids[index] = id;
+         return id;
+     }
+-    return channel_state->sampler_ids.find(map_index)->second;
++    return table.bound_ids[index];
+ }
+ 
+ template <class P>
+@@ -743,7 +789,6 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
+         LOG_DEBUG(HW_GPU, "Invalid image view index={}", index);
+         return NULL_IMAGE_VIEW_ID;
+     }
+-    auto const map_index = index | (compute ? Common::SlotId::TAGGED_VALUE : 0);
+     // Is new (on the tegra engine side)?
+     auto const [descriptor, is_new] = table.Read(*gpu_memory, index);
+     if (is_new) {
+@@ -753,16 +798,15 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
+             if (is_new_tc)
+                 pair->second = CreateImageView(descriptor);
+             PrepareImageView(pair->second, false, false);
+-            channel_state->image_view_ids.insert_or_assign(map_index, pair->second);
++            table.bound_ids[index] = pair->second;
+             return pair->second;
+         }
+-        channel_state->image_view_ids.insert_or_assign(map_index, NULL_IMAGE_VIEW_ID);
++        table.bound_ids[index] = NULL_IMAGE_VIEW_ID;
+         return NULL_IMAGE_VIEW_ID;
+     }
+-    auto const it = channel_state->image_view_ids.find(map_index);
+-    if (it->second != NULL_IMAGE_VIEW_ID)
+-        PrepareImageView(it->second, false, false);
+-    return it->second;
++    const auto id = table.bound_ids[index];
++    if (id != NULL_IMAGE_VIEW_ID) PrepareImageView(id, false, false);
++    return id;
+ }
+ 
+ template <class P>
+@@ -1852,9 +1896,10 @@ void TextureCache<P>::InvalidateScale(Image& image) {
+     for (size_t c : active_channel_ids) {
+         auto& channel_info = channel_storage[c];
+ 
+-        if constexpr (ENABLE_VALIDATION)
+-            for (auto& e : channel_info.image_view_ids)
+-                e.second = CORRUPT_ID;
++        if constexpr (ENABLE_VALIDATION) {
++            std::ranges::fill(channel_info.graphics_image_table.bound_ids, CORRUPT_ID);
++            std::ranges::fill(channel_info.compute_image_table.bound_ids, CORRUPT_ID);
++        }
+         channel_info.graphics_image_table.Invalidate();
+         channel_info.compute_image_table.Invalidate();
+     }
+@@ -3408,9 +3453,10 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+     }
+     for (size_t c : active_channel_ids) {
+         auto& channel_info = channel_storage[c];
+-        if constexpr (ENABLE_VALIDATION)
+-            for (auto& e : channel_info.image_view_ids)
+-                e.second = CORRUPT_ID;
++        if constexpr (ENABLE_VALIDATION) {
++            std::ranges::fill(channel_info.graphics_image_table.bound_ids, CORRUPT_ID);
++            std::ranges::fill(channel_info.compute_image_table.bound_ids, CORRUPT_ID);
++        }
+         channel_info.graphics_image_table.Invalidate();
+         channel_info.compute_image_table.Invalidate();
+     }
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 8879573..bd7c28f 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -84,18 +84,15 @@ public:
+     TextureCacheChannelInfo(const TextureCacheChannelInfo& state) = delete;
+     TextureCacheChannelInfo& operator=(const TextureCacheChannelInfo&) = delete;
+ 
+-    DescriptorTable<TICEntry> graphics_image_table;
+-    DescriptorTable<TSCEntry> graphics_sampler_table;
+-    DescriptorTable<TICEntry> compute_image_table;
+-    DescriptorTable<TSCEntry> compute_sampler_table;
++    DescriptorTable<TICEntry, ImageViewId> graphics_image_table;
++    DescriptorTable<TSCEntry, SamplerId> graphics_sampler_table;
++    DescriptorTable<TICEntry, ImageViewId> compute_image_table;
++    DescriptorTable<TSCEntry, SamplerId> compute_sampler_table;
+ 
+     // TODO: still relies on bad iterators :(
+     std::unordered_map<TICEntry, ImageViewId> image_views;
+     std::unordered_map<TSCEntry, SamplerId> samplers;
+ 
+-    ::Common::unordered_map<u32, SamplerId> sampler_ids;
+-    ::Common::unordered_map<u32, ImageViewId> image_view_ids;
+-
+     TextureCacheGPUMap* gpu_page_table = nullptr;
+     TextureCacheGPUMap* sparse_page_table = nullptr;
+ };
+@@ -575,6 +572,9 @@ private:
+     Common::ScratchBuffer<u8> unswizzle_data_buffer;
+ 
+     u64 modification_tick = 0;
++    // Occupancy is only an eviction-order heuristic; IDs/eligibility remain live.
++    u64 block_fill_tick = ~0ULL;
++    std::unordered_map<u64, u64> block_image_bytes;
+     u64 frame_tick = 0;
+ 
+     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
+diff --git a/src/video_core/vulkan_common/vulkan_wrapper.cpp b/src/video_core/vulkan_common/vulkan_wrapper.cpp
+index de495b2..1b413a2 100644
+--- a/src/video_core/vulkan_common/vulkan_wrapper.cpp
++++ b/src/video_core/vulkan_common/vulkan_wrapper.cpp
+@@ -532,6 +532,15 @@ void Image::SetObjectNameEXT(const char* name) const {
+     SetObjectName(dld, owner, handle, VK_OBJECT_TYPE_IMAGE, name);
+ }
+ 
++Image::MemoryBlock Image::GetMemoryBlock() const noexcept {
++    if (!handle || !allocation) return {};
++    VmaAllocationInfo2 info{};
++    vmaGetAllocationInfo2(allocator, allocation, &info);
++    if (info.dedicatedMemory) return {0, info.blockSize, info.allocationInfo.size};
++    return {reinterpret_cast<u64>(info.allocationInfo.deviceMemory), info.blockSize,
++            info.allocationInfo.size};
++}
++
+ void Image::Release() const noexcept {
+     if (handle && backing) {
+         backing->Release();
+diff --git a/src/video_core/vulkan_common/vulkan_wrapper.h b/src/video_core/vulkan_common/vulkan_wrapper.h
+index d4c71b0..411d7cc 100644
+--- a/src/video_core/vulkan_common/vulkan_wrapper.h
++++ b/src/video_core/vulkan_common/vulkan_wrapper.h
+@@ -738,6 +738,9 @@ public:
+         return handle != VkImage{};
+     }
+ 
++    struct MemoryBlock { u64 block{}, block_size{}, size{}; };
++    [[nodiscard]] MemoryBlock GetMemoryBlock() const noexcept;
++
+     void SetObjectNameEXT(const char* name) const;
+ 
+     [[nodiscard]] VkImageUsageFlags UsageFlags() const noexcept {

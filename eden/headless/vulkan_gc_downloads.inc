@@ -26,21 +26,34 @@
             size_t remaining = num_iterations;
             size_t bytes = 0;
             u64 usage = total_used_memory;
+            size_t visited = num_scanned;
+            const bool count_visits = ::Eden::Performance::gc_count_visits.load(std::memory_order_relaxed);
+            // Stop at the first pressure transition that changes eligibility.
+            // Costly old images stop being admitted below the expected budget,
+            // even if the dirty-download policy would otherwise continue.
+            u64 pressure_boundary = aggressive_mode || ::Eden::Performance::KeepDirtyTextures()
+                ? critical_memory : expected_memory;
+            if (evict_old_costly) pressure_boundary = (std::max)(pressure_boundary, expected_memory);
             // Only look ahead through independent dirty evictions. Leave all
             // deletion, alias updates and pressure-policy decisions to Cleanup.
             // ForEachItemBelow stops when the callback returns true (common/lru_cache.h).
-            lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, [&](ImageId id) {
-                if (remaining == 0) return true;
-                --remaining;
+            ForEachEviction([&](ImageId id) {
+                if (remaining == 0 || visited >= max_scanned) return true;
+                ++visited;
+                if (count_visits) --remaining;
                 auto& image = slot_images[id];
                 if (True(image.flags & ImageFlagBits::IsDecoding)) return false;
                 const bool dirty = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
-                if ((!aggressive_mode && True(image.flags & ImageFlagBits::CostlyLoad)) ||
+                if (!CanEvictCostly(image) ||
                     (!DirtyEvictions() && dirty)) return false;
+                if (!count_visits) --remaining;
                 // A clean image has nothing to copy back, and an image larger than a whole batch
                 // keeps the wait of its own that it has in Cleanup. Neither ends the lookahead:
                 // stopping there left every later dirty image to Cleanup, one wait each.
-                if (!dirty || image.unswizzled_size_bytes > kBatchBytes) return false;
+                if (!dirty || image.unswizzled_size_bytes > kBatchBytes) {
+                    usage -= (std::min)(usage, ReclaimedBytes(image));
+                    return usage < pressure_boundary;
+                }
                 // A full batch ends it. Cleanup asks for the next batch at the first image this
                 // one did not take (TakePrefetched), so a batch is always the next images to go.
                 if (gc_downloads.size() == kBatchImages ||
@@ -65,8 +78,7 @@
                 usage -= (std::min)(usage, ReclaimedBytes(image));
                 // The original policy changes at these thresholds. Stop looking
                 // ahead here so we never copy a texture that it would retain.
-                return usage < (aggressive_mode || ::Eden::Performance::KeepDirtyTextures() ? critical_memory
-                                                                                           : expected_memory);
+                return usage < pressure_boundary;
             });
             if (!gc_downloads.empty()) {
                 // One drain for the whole batch; the image count is the reported payload.

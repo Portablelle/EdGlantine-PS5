@@ -1,0 +1,108 @@
+diff --git a/src/video_core/buffer_cache/readback_cache.h b/src/video_core/buffer_cache/readback_cache.h
+--- a/src/video_core/buffer_cache/readback_cache.h
++++ b/src/video_core/buffer_cache/readback_cache.h
+@@ -11,13 +11,13 @@
+ #include "video_core/buffer_cache/readback_statistics.h"
+ 
+ namespace VideoCommon {
+-// Eligible only at the parameter-refresh boundary, outside GPU writer preparation.
+-struct ParameterReadbackRange { u64 address{}; size_t size{}; bool enabled{}; };
++// Eligible only at an explicit coherent read boundary, outside GPU writer preparation.
++struct ParameterReadbackRange { u64 address{}; size_t size{}; bool enabled{}; bool command_window{}; };
+ inline thread_local ParameterReadbackRange parameter_readback_range;
+ class ParameterReadbackScope {
+ public:
+-    ParameterReadbackScope(u64 address, size_t size, bool enabled = true)
+-        : previous{parameter_readback_range} { parameter_readback_range = {address, size, enabled}; }
++    ParameterReadbackScope(u64 address, size_t size, bool enabled = true, bool command_window = false)
++        : previous{parameter_readback_range} { parameter_readback_range = {address, size, enabled, command_window}; }
+     ~ParameterReadbackScope() { parameter_readback_range = previous; }
+     ParameterReadbackScope(const ParameterReadbackScope&) = delete;
+     ParameterReadbackScope& operator=(const ParameterReadbackScope&) = delete;
+@@ -28,6 +28,11 @@
+     const auto range = parameter_readback_range;
+     return range.enabled && address >= range.address && address - range.address <= range.size &&
+            size <= range.size - (address - range.address);
++}
++// Command headers can be GPU-written alongside frequently changing data. Bound
++// their speculative read to one page; ordinary parameter windows retain 64 KiB.
++inline size_t ReadbackWindowBytes() {
++    return parameter_readback_range.command_window ? 4096 : 64 * 1024;
+ }
+ // GPU snapshots only: callers still copy solely the exact requested dirty bytes.
+ // The dirty ledger invalidates every overlapping snapshot on every GPU write.
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -2322,7 +2322,8 @@
+             const u64 first = copies.front().src_offset;
+             u64 last = first;
+             for (const auto& copy : copies) last = std::max(last, copy.src_offset + copy.size);
+-            constexpr u64 window_bytes = ReadbackWindowCache<DAddr>::WindowBytes;
++            const u64 window_bytes = std::min<u64>(ReadbackWindowCache<DAddr>::WindowBytes,
++                                                       ReadbackWindowBytes());
+             const u64 window_offset = Common::AlignDown(first, window_bytes);
+             const u64 window_size = std::min(window_bytes, buffer.SizeBytes() - window_offset);
+             if (last <= window_offset + window_size) {
+diff --git a/src/video_core/native_dma_snapshot.h b/src/video_core/native_dma_snapshot.h
+--- a/src/video_core/native_dma_snapshot.h
++++ b/src/video_core/native_dma_snapshot.h
+@@ -2,16 +2,37 @@
+ #pragma once
+ #include <cstddef>
+ #include "common/common_types.h"
++#ifdef EDEN_NX2_PS5_PROTO
++#include "video_core/buffer_cache/readback_cache.h"
++#endif
+ 
+ namespace Tegra {
++// Own the command bytes before parsing, but permit the existing GPU-write-
++// invalidated readback cache for small contiguous coherent command reads only.
++// The scope ends before parsing can prepare writers or suspend an acquire.
++template <class Memory>
++void ReadNativeDmaCommandSnapshot(Memory& memory, GPUVAddr address, void* destination,
++                                   std::size_t bytes, bool coherent) {
++    if (!coherent) {
++        memory.ReadBlockUnsafe(address, destination, bytes);
++        return;
++    }
++#ifdef EDEN_NX2_PS5_PROTO
++    const auto device = bytes && bytes <= 4096 ? memory.GpuToCpuAddress(address) : std::nullopt;
++    const bool eligible = device && memory.IsContinuousRange(address, bytes);
++    const VideoCommon::ParameterReadbackScope readback_scope{
++        device.value_or(0), bytes, eligible, true};
++#endif
++    memory.ReadBlock(address, destination, bytes);
++}
++
+ // The split backend owns the cache. Invoke there, after preceding engine work,
+ // and retain the owned destination across any suspended acquire in the parser.
+ template <class Memory>
+ bool ReadOwnedNativeDmaSnapshot(Memory& memory, GPUVAddr address, void* destination,
+                                 std::size_t bytes, bool safe) {
+     const bool dirty = memory.IsMemoryDirty(address, bytes);
+-    if (safe || dirty) memory.ReadBlock(address, destination, bytes);
+-    else memory.ReadBlockUnsafe(address, destination, bytes);
++    ReadNativeDmaCommandSnapshot(memory, address, destination, bytes, safe || dirty);
+     return dirty;
+ }
+ } // namespace Tegra
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -203,13 +203,8 @@
+                     });
+                 } else
+ #endif
+-                if (use_safe) {
+-                    memory_manager.ReadBlock(dma_state.dma_get, command_headers.data(),
+-                                             size_t{header.size} * sizeof(CommandHeader));
+-                } else {
+-                    memory_manager.ReadBlockUnsafe(dma_state.dma_get, command_headers.data(),
+-                                                   size_t{header.size} * sizeof(CommandHeader));
+-                }
++                ReadNativeDmaCommandSnapshot(memory_manager, dma_state.dma_get,
++                    command_headers.data(), size_t{header.size} * sizeof(CommandHeader), use_safe);
+             }
+             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
+ #ifdef EDEN_NX2_PS5_PROTO

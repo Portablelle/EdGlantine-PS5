@@ -8,14 +8,18 @@ def replace_once(text, old, new):
 
 def adapt_descriptors(s):
     s=replace_once(s, '#include <algorithm>', '#include <algorithm>\n#include <bit>\n#include "descriptor_memory.h"')
-    begin=s.index('        // Mario Brothership reallocates')
+    begin=s.index('        // Geometric growth')
     end=s.index('        size_t old_size',begin)
     s=s[:begin]+'''        // Geometric growth retains spare capacity without allocating 16 MiB
         // for every tiny table. Widen before adding the inclusive last index.
         const size_t num_descriptors = std::bit_ceil(std::max<size_t>(64, size_t(limit) + 1));
 '''+s[end:]
-    s=replace_once(s, '        descriptors.resize(num_descriptors);', '''        descriptors.resize(num_descriptors);
-        accounting.Update(descriptors.capacity() * sizeof(T) + read_descriptors.capacity() * sizeof(u64));''')
+    s=replace_once(s, '    std::vector<u64> read_descriptors;', '''    void AccountCapacity() noexcept {
+        accounting.Update(descriptors.capacity() * sizeof(T) + bound_ids.capacity() * sizeof(Id) +
+                          read_descriptors.capacity() * sizeof(u64));
+    }
+    std::vector<u64> read_descriptors;''')
+    s=replace_once(s, '            bound_ids.resize(num_descriptors, Id{0});\n        }', '            bound_ids.resize(num_descriptors, Id{0});\n        }\n        AccountCapacity();')
     s=replace_once(s, '    std::vector<u64> read_descriptors;', '    Eden::HostMemory::DescriptorAccounting accounting;\n    std::vector<u64> read_descriptors;')
     return s
 

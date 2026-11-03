@@ -1,0 +1,190 @@
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -461,6 +461,10 @@
+ void BufferCache<P>::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
+                                                u32 size) {
+     const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
++    if (!device_addr) {
++        channel_state->uniform_buffers[stage][index] = NULL_BINDING;
++        return;
++    }
+     const Binding binding{
+         .device_addr = *device_addr,
+         .size = size,
+@@ -471,7 +475,11 @@
+ 
+ template <class P>
+ void BufferCache<P>::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
+-    channel_state->uniform_buffers[stage][index] = NULL_BINDING;
++    auto& current = channel_state->uniform_buffers[stage][index];
++    if (current.device_addr == 0 && current.size == 0 && !current.buffer_id) [[likely]] {
++        return;
++    }
++    current = NULL_BINDING;
+ }
+ 
+ template <class P>
+@@ -1739,6 +1747,9 @@
+ 
+ template <class P>
+ void BufferCache<P>::UpdateUniformBuffers(size_t stage) {
++    if (channel_state->enabled_uniform_buffer_masks[stage] == 0) [[likely]] {
++        return;
++    }
+     ForEachEnabledBit(channel_state->enabled_uniform_buffer_masks[stage], [&](u32 index) {
+         if (maxwell3d->GetNativeMacroEngine().native_turing && Tegra::NativeRootTables::IsBank(index)) return;
+         Binding& binding = channel_state->uniform_buffers[stage][index];
+@@ -1757,6 +1768,9 @@
+ 
+ template <class P>
+ void BufferCache<P>::UpdateStorageBuffers(size_t stage) {
++    if (channel_state->enabled_storage_buffers[stage] == 0) [[likely]] {
++        return;
++    }
+     ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
+         // Resolve buffer
+         Binding& binding = channel_state->storage_buffers[stage][index];
+@@ -1772,6 +1786,9 @@
+ 
+ template <class P>
+ void BufferCache<P>::UpdateTextureBuffers(size_t stage) {
++    if (channel_state->enabled_texture_buffers[stage] == 0) [[likely]] {
++        return;
++    }
+     ForEachEnabledBit(channel_state->enabled_texture_buffers[stage], [&](u32 index) {
+         Binding& binding = channel_state->texture_buffers[stage][index];
+         binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
+@@ -1868,7 +1885,8 @@
+ 
+ template <class P>
+ BufferId BufferCache<P>::FindBuffer(DAddr device_addr, u32 size, bool sparse_compatible) {
+-    if (device_addr == 0) {
++    constexpr u64 address_space = u64{1} << 36;
++    if (device_addr == 0 || device_addr >= address_space || size > address_space - device_addr) {
+         return NULL_BUFFER_ID;
+     }
+     const u64 page = device_addr >> CACHING_PAGEBITS;
+diff --git a/src/common/fiber.cpp b/src/common/fiber.cpp
+--- a/src/common/fiber.cpp
++++ b/src/common/fiber.cpp
+@@ -25,8 +25,9 @@
+     FiberImpl() {}
+ 
+     u32 canary_1 = CANARY_VALUE;
+-    std::array<u8, DEFAULT_STACK_SIZE> stack{};
+-    std::array<u8, DEFAULT_STACK_SIZE> rewind_stack{};
++    // Context setup writes its frame; unused stack pages need no eager clearing.
++    std::array<u8, DEFAULT_STACK_SIZE> stack;
++    std::array<u8, DEFAULT_STACK_SIZE> rewind_stack;
+     u32 canary_2 = CANARY_VALUE;
+ 
+     boost::context::detail::fcontext_t context{};
+diff --git a/src/video_core/renderer_vulkan/vk_update_descriptor.h b/src/video_core/renderer_vulkan/vk_update_descriptor.h
+--- a/src/video_core/renderer_vulkan/vk_update_descriptor.h
++++ b/src/video_core/renderer_vulkan/vk_update_descriptor.h
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include <memory>
+ #include <variant>
+ #include <vector>
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+@@ -122,7 +123,7 @@
+     DescriptorUpdateEntry* payload_cursor = nullptr;
+     DescriptorUpdateEntry* payload_start = nullptr;
+     const DescriptorUpdateEntry* upload_start = nullptr;
+-    std::vector<DescriptorUpdateEntry> payload;
++    std::unique_ptr<DescriptorUpdateEntry[]> payload;
+ };
+ 
+ // TODO: should these be separate classes instead?
+diff --git a/src/video_core/renderer_vulkan/vk_update_descriptor.cpp b/src/video_core/renderer_vulkan/vk_update_descriptor.cpp
+--- a/src/video_core/renderer_vulkan/vk_update_descriptor.cpp
++++ b/src/video_core/renderer_vulkan/vk_update_descriptor.cpp
+@@ -20,10 +20,10 @@
+                                              bool supports_descriptor_buffer_)
+     : device{device_}, frame_payload_size{frame_payload_size_},
+       supports_descriptor_buffer{supports_descriptor_buffer_},
+-      payload(frame_payload_size_ * FRAMES_IN_FLIGHT)
++      payload(std::make_unique_for_overwrite<DescriptorUpdateEntry[]>(frame_payload_size_ * FRAMES_IN_FLIGHT))
+ {
+-    payload_start = payload.data();
+-    payload_cursor = payload.data();
++    payload_start = payload.get();
++    payload_cursor = payload.get();
+ }
+ 
+ UpdateDescriptorQueue::~UpdateDescriptorQueue() = default;
+@@ -32,7 +32,7 @@
+     if (++frame_index >= FRAMES_IN_FLIGHT) {
+         frame_index = 0;
+     }
+-    payload_start = payload.data() + frame_index * frame_payload_size;
++    payload_start = payload.get() + frame_index * frame_payload_size;
+     payload_cursor = payload_start;
+ }
+ 
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -156,6 +156,12 @@
+ void TextureCache<P>::RunGarbageCollector() {
+     bool high_priority_mode = false;
+     bool aggressive_mode = false;
++    bool evict_old_costly = false;
++    u64 costly_age = 0;
++    static const u64 old_age = [] {
++        const char* value = std::getenv("EDEN_NX2_TC_OLD_AGE");
++        return value != nullptr ? std::strtoull(value, nullptr, 10) : 1800ULL;
++    }();
+     u64 ticks_to_destroy = 0;
+     size_t num_iterations = 0;
+     const auto Configure = [&](bool allow_aggressive) {
+@@ -170,7 +176,14 @@
+         ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
+         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
+     };
+-    const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode](ImageId image_id) {
++    const auto CanEvictCostly = [&](const Image& image) {
++        return aggressive_mode || (evict_old_costly && high_priority_mode) ||
++               False(image.flags & ImageFlagBits::CostlyLoad);
++    };
++    const auto EvictionCutoff = [&] {
++        return frame_tick - (evict_old_costly ? costly_age : ticks_to_destroy);
++    };
++    const auto Cleanup = [&, this](ImageId image_id) {
+         if (num_iterations == 0) {
+             return true;
+         }
+@@ -180,7 +193,7 @@
+             return false;
+         }
+         const bool must_download = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
+-        if ((!aggressive_mode && True(image.flags & ImageFlagBits::CostlyLoad)) || (!high_priority_mode && must_download)) {
++        if (!CanEvictCostly(image) || (!high_priority_mode && must_download)) {
+             return false;
+         }
+         if (must_download) {
+@@ -212,10 +225,18 @@
+         return false;
+     };
+     Configure(false);
+-    lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, Cleanup);
++    // Respect the existing minimum age and stop admitting costly evictions
++    // as soon as the normal expected-memory budget is reached again.
++    costly_age = (std::max)(old_age, ticks_to_destroy);
++    if (high_priority_mode && old_age != 0 && frame_tick > costly_age) {
++        evict_old_costly = true;
++        lru_cache.ForEachItemBelow(EvictionCutoff(), Cleanup);
++        evict_old_costly = false;
++    }
++    lru_cache.ForEachItemBelow(EvictionCutoff(), Cleanup);
+     if (total_used_memory >= critical_memory) {
+         Configure(true);
+-        lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, Cleanup);
++        lru_cache.ForEachItemBelow(EvictionCutoff(), Cleanup);
+     }
+ }
+ 

@@ -81,7 +81,10 @@ passed on the build server. Earlier Bananza tests measured about 10 FPS,
 falling to 4 with movement. In the latest player test, **the terrain and assets
 appear after a delay; the black areas disappear once they have loaded**.
 The remaining observed issue is delayed display, rather than persistent black
-terrain. No isolated FPS improvement has been established. See the
+terrain. The subsequent Bananza GPU-fast trial, still docked at 1×, measures about
+15.8 FPS over 25 seconds, with correct terrain and objects confirmed by the
+player. The previous High-accuracy sample measured 8.7 FPS; the scenes are not
+strictly paired, so an isolated gain is not established. See the
 [partial-texture/PGO integration](milestones/partial-textures-pgo/README.md) and
 [Bananza investigation](eden/docs/BANANZA_STARTUP_INVESTIGATION.md).
 
@@ -91,11 +94,25 @@ allocations, a better JIT constant pool, and contained texel-buffer and VP9 fixe
 The initial batch caused a startup crash when its constant store bypassed the
 PS5 writable-alias adapter. The adapter is fixed, and the player confirms
 Bananza starts. A targeted indirect-record initialization treatment is also
-installed. Its contribution to the delayed appearance of terrain is not yet
+installed, with a corrected work budget for larger streamed terrain lists and
+specific rejection diagnostics. Its contribution to the delayed appearance of terrain is not yet
 established: the log snapshot taken before the terrain appeared contained no
 activation marker. Installation changed only eboot.bin, with rollback retained
 and game data preserved. Validation and provenance:
 [upstream performance adaptations](eden/docs/UPSTREAM_PERFORMANCE_ADAPTATIONS.md).
+
+
+A further Eglantine performance candidate reduces empty-stage buffer work and
+eager initialization of fiber stacks/descriptor storage, and reclaims old costly
+textures under memory pressure. It retains the current coherent command reader
+and PS5 memory thresholds. See the [batch scope and validation](milestones/eglantine-performance/README.md).
+No PS5 performance improvement is established yet.
+
+A subsequent [coherence and memory batch](milestones/eglantine-refresh/README.md)
+protects newer writes from pending GPU copies, handles fragmented scalar memory,
+reduces descriptor and shader-cache work, and prioritizes less occupied texture
+allocation blocks. It preserves the PS5 memory and synchronization policies;
+console performance and rendering require player validation.
 
 
 ## Contributing

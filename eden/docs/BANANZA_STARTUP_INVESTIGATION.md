@@ -888,3 +888,279 @@ par Bananza sont **2880x1620**, et `wsi/videoout` enregistre des framebuffers
 **3840x2160**. Le libellé de configuration 1440p ne décrit donc pas à lui seul
 les dimensions effectives de cette session. L'image présentée peut inclure
 l'upscaler du jeu : la résolution 3D interne avant cette passe n'est pas établie.
+
+## Check-up après passage en mode portable, puis essai 0,5×
+
+Le joueur ressent un gain important et demande un check-up puis 720p, avant de
+confirmer EdGlantine fermé. Snapshot borné des logs et paramètres :
+`artifacts/bananza-handheld-check/`. Le profil et le lancement confirment
+**Handheld / 1×**. Cependant les images présentées par le jeu restent
+**2880×1620**, avec des framebuffers videoout 3840×2160. Le passage en portable
+ne permet donc pas d'annoncer un 1080p effectif ; il faut corriger cette cible
+précédemment supposée. La résolution de la scène avant upscaling reste inconnue.
+
+Les cinq derniers intervalles donnent **596 images en 25,136684 s = 23,710 FPS**,
+avec des moyennes d'intervalle entre 22,732 et 24,722 FPS. L'ancien relevé
+5,299 FPS n'est pas apparié à la même scène : amélioration observée, sans gain
+isolé attribuable à la résolution ou au mode portable. Dans cette fenêtre,
+les deltas cumulatifs donnent submit 1,673 s, semaphore_wait 4,888 s,
+guest_fence 1,152 s, buffer_sync 4,050 s ; pas de compilation pipeline/shader.
+Ces temps peuvent se recouvrir. Les marques CPU détaillées sont désactivées.
+Pas de VK_ERROR, bad_alloc ou échec de draw natif dans le snapshot ; 22 erreurs
+Unmapped Device ReadBlock et 20 avertissements de suivi storage subsistent.
+
+L'activation du reset est maintenant **confirmée dans ce relevé** :
+`draws=1 records=997` à 82,213 s, puis `draws=600 records=96` à 115,870 s et
+`draws=1200 records=96` à 141,148 s, tous `coherent=1`. Cela complète le
+snapshot antérieur pris avant l'apparition différée ; le rôle causal de ce
+traitement et du mode portable n'est toujours pas isolé par un A/B identique.
+
+Le réglage existant ne propose pas le ratio 4/9 nécessaire à 1280×720 depuis
+2880×1620. Après explication, le joueur choisit explicitement **« Tester 810p
+maintenant »**. Seuls les paramètres Bananza sont modifiés : console_mode
+`handheld` conservé, resolution `1x` → `0.5x`. Cible si l'image actuelle est
+redimensionnée : **1440×810**, pas 720p. Les critères de mise à l'échelle des
+images et l'upscaler du jeu empêchent de certifier la résolution 3D de toutes
+les passes avant le prochain relevé. Pas de nouveau binaire, réglage global,
+cache ou sauvegarde modifié. Configuration précédente sauvegardée sous
+`/data/eden-nx2/config/prosperoeden.json.before-bananza-810p-ce6513b8b4`.
+Journal : `artifacts/bananza-810p/journal.json`. Le joueur peut relancer et
+comparer le même passage une fois les assets apparus ; résultat encore attendu.
+
+## Relevé après relance portable / 0,5×
+
+À la demande du joueur, collecte passive du lancement et de deux fenêtres de
+logs, sans modification de configuration ni demande de readback GPU. Preuves :
+`artifacts/bananza-810p/retest/`, deuxième fenêtre dans `later/`, calcul dans
+`measurement.json`. Profil JSON **handheld / 0.5x**, marqueurs de lancement
+**Handheld / Resolution 0.5x** : confirmés. Images guest toujours **2880×1620**,
+videoout **3840×2160** ; toutes deux au ratio **16:9**. Ces dimensions guest
+précèdent l'éventuelle réduction des cibles GPU. Les logs ne donnent pas leur
+taille après rescale : **1440×810 effectif non directement confirmé**. Le code
+ImageCanRescale reste sélectif (rescaleable/downscaleable et aliases), donc le
+choix 0,5× ne permet pas de garantir la définition de toutes les passes.
+
+Première fenêtre de gameplay, encore en chargement : 15,150 FPS sur les quatre
+derniers intervalles. Deuxième fenêtre : **229 images en 25,347417 s = 9,034 FPS**,
+intervalles 14,759 / 7,694 / 7,311 / 7,560 / 7,829 FPS. Comparaison descriptive
+avec les 23,710 FPS de l'essai 1× : ce n'est pas une scène appariée, et les
+phases de streaming diffèrent. Aucun gain du 0,5× démontré ; ne pas conclure à
+une régression causée uniquement par le rescale.
+
+Deltas API sur la deuxième fenêtre : submit 2,198 s, semaphore_wait 6,154 s,
+buffer_sync 5,928 s, guest_fence 0,673 s. Pas de compilation de pipeline/shader
+sur cette fenêtre. Timings potentiellement imbriqués, marques CPU détaillées
+désactivées. Aucun VK_ERROR, bad_alloc ou échec de draw natif ; 23 Unmapped
+Device ReadBlock, 20 avertissements storage non suivis dans le snapshot.
+
+Point concret nouveau : le reset exact est reconnu, mais des listes de
+**1470, 1480, 1482 records** sont refusées à 72,252–72,813 s. Le helper impose
+`count > 1024` → refus, dont le message générique « unsafe table/range » ne
+permet pas de distinguer ce plafond d'un mapping invalide. Un reset accepté
+à 77,478 s comporte 1018 records. La borne de travail choisie à l'implémentation
+est donc inférieure aux listes réellement rencontrées. Cela justifie une
+correction du plafond et de son diagnostic ; le lien exact avec la dégradation
+FPS et le délai d'apparition nécessite encore validation. Pas de nouveau
+binaire ni de retour automatique à 1× pendant ce check-up.
+
+## Retour au mode télé natif et correction du budget de reset
+
+Le joueur quitte le jeu, demande de corriger le défaut puis précise **mode
+ télé, comme au tout début**. Profil Bananza rétabli à `console_mode=docked`,
+`resolution=1x` ; options globales et autres jeux inchangés. Configuration
+précédente conservée dans
+`/data/eden-nx2/config/prosperoeden.json.before-bananza-native-4335ebfa82`.
+Journal : `artifacts/bananza-reset-cap-fix/settings-journal.json`.
+Le joueur confirme ensuite l'application et son lanceur complètement fermés.
+
+Le patch `99e-native-indirect-reset-budget.diff`, après le patch initial 99d,
+relève le budget à **65 536 records** : les deux tableaux temporaires sont
+bornés à 1 Mio au total. Les listes réellement observées de 1470/1480/1482
+records ne sont plus écartées par le plafond de 1024. Ce n'est pas une
+suppression de la prévalidation : toutes les adresses, mappings, alignements,
+alias avec les sources et chevauchements partiels restent contrôlés avant le
+premier store. Une liste dépassant le nouveau budget est refusée avant lecture
+ou allocation des tableaux. Le nombre de destinations reste borné.
+
+Le résultat détaille maintenant le motif de refus : empty_draw, work_budget,
+constant_buffer, pointer_table, record_mapping_or_alignment, source_overlap ou
+partial_record_overlap. Les logs indiquent motif, taille, budget et nombre total
+de refus, d'abord quatre fois puis tous les 600 refus. Les resets acceptés
+indiquent aussi le budget. Le draw Vulkan normal reste conservé.
+
+Validation sur dedie ASan/UBSan : ancienne fonction extraite du patch 99d,
+refus de 1482 records reproduit avant toute lecture ; nouvelle fonction,
+96/1024/1025/1470/1480/1482/1600/65536 records corrects et voisins conservés.
+Les refus invalides restent sans écriture partielle ; raisons distinctes,
+budget excessif sans lecture, reset du motif après succès, adresses 64 bits,
+code exact/mutations et code après adaptation PS5 : PASS. Native build/package,
+headers sparse/multiplayer et isolation PPSA99862 : PASS, PGO conservé. Cubic
+ciblé : zéro signalement et aucune erreur (contexte dépôt distant indisponible).
+
+Installation terminée après confirmation : 69 accompagnements identiques,
+seul eboot.bin remplacé par staging vérifié puis rename. SHA256 installé :
+`de2d747415fc470256bf798aca2e33967b5c91aa3a09f4a32059c8b0bf061529`.
+Ancien binaire 8e5bcad0… sauvegardé sous
+`/data/ps5-diag/edglantine-reset-cap-fix-0bdbfb82bfd3/eboot.bin`.
+Paquet, ELF exact, revues et journaux : `artifacts/bananza-reset-cap-fix/`.
+Aucun cache, jeu ou sauvegarde modifié ; pas de lancement automatique.
+Le défaut de plafond est reproduit et corrigé sur hôte. L'effet sur le délai
+d'affichage et les FPS, maintenant en docked/1×, reste à mesurer après relance.
+
+## Noir disparu, FPS encore faibles : commandes DMA et readback
+
+Après le build budget corrigé, le joueur confirme ne plus observer de noir,
+puis signale des FPS toujours mauvais. Relevés passifs et profilage :
+`artifacts/bananza-reset-cap-fix/fps-retest/`. Lancement Docked / 1× confirmé.
+Reset accepté avec **1525 records** puis **1062 records**, budget 65536, aucun
+rejet relevé. Aucun VK_ERROR, bad_alloc ou échec de draw natif ; les lectures
+Device non mappées persistent (25 dans le premier snapshot). Des fenêtres de
+gameplay descendent à 4,476–6,782 FPS ; un relevé ultérieur donne **7,269 FPS
+sur 25,314261 s**. Les fenêtres à ~60 FPS des menus ne sont pas du gameplay.
+
+Le chemin du marqueur indiqué par l'ancien skill était périmé : le source
+réel utilise RuntimeControl avec Eden::AppFile, et non le data root. La demande
+non consommée est déplacée (même nonce) de `/data/eden-nx2/profile-refresh.request`
+vers `/data/homebrew/PPSA99862/profile-refresh.request`. Activation confirmée :
+`NX2_PROFILE_REFRESH epoch=2 mono_ns=16165433599361`. Les marques détaillées
+restent bornées à 20 s, indépendamment de la visibilité du HUD ; le skill a été
+corrigé sur ces points. Pas de réarmement répété ni de readback de capture.
+
+Sur cette fenêtre, préparation des dessins **5,106 s**, dont lecture ressources
+1,118 s, binding 1,924 s et descripteurs 1,709 s ; marques imbriquées à ne pas
+additionner. Pointer-sync : 0,097 s. Les compteurs readback cache restent nuls.
+Les sites d'attente sont symbolisés avec l'ELF exact de2d7474… et l'ancre du log
+(0x291bc60 vs ELF0x251bc60, relocation0x400000) : principal ReadBlock depuis
+DmaPusher::DispatchCalls, puis FlushRegion/BufferCacheRuntime::Finish ; distinguer
+le FenceManager sur son autre thread. Les compteurs epoch1 cumulatifs ne sont
+pas présentés comme des coûts exclusifs de la fenêtre epoch2.
+
+Piste testée : le cache de fenêtres GPU existant était admis seulement dans
+RefreshParametersImpl. Les snapshots cohérents de commandes natifs passaient
+par le loader sûr sans ce scope, d'où l'absence de cache dans ce profil.
+`99f-native-command-readback-cache.diff` ajoute une admission explicite autour
+des petites lectures de commandes **contiguës, de 1 à 4096 octets**. Le scope
+est terminé avant le parsing, ses writers et ses acquires suspendus ; les
+commandes restent copiées et possédées. Le chemin solo et le helper split
+conservent leur ordre et la sélection cohérente/unsafe existante.
+
+Pour ces commandes, fenêtre spéculative bornée à **4 Kio**, au lieu des 64 Kio
+des paramètres ordinaires. Seuls les octets demandés et réellement GPU-dirty
+sont publiés en RAM CPU. Le cache existant reste invalidé par le dirty ledger
+à chaque écriture GPU. Lectures grandes/non contiguës/non mappées et demandes
+traversant une fenêtre gardent le chemin cohérent normal. Pas de suppression
+ de synchronisation requise ni de conservation de spans directs vers l'invité.
+
+Sur dedie, ASan/UBSan : helper et cache de production, séquence simulée de
+64 lectures d'un producteur : **64 attentes anciennes → 1 attente mise en cache**.
+Comparaison des octets identiques, invalidation par nouveau producteur, voisins
+CPU conservés, écriture CPU plus récente, snapshot possédé immuable, fallback
+sparse/large/cross-window, unsafe/dirty split et restauration TLS après exception :
+PASS. Cette fixture ne simule pas le pilote PS5 et ne prouve aucun gain FPS.
+Compilation native/package, headers sparse/multiplayer et isolation : PASS,
+PGO conservé. Cubic ciblé : zéro signalement, sans erreur (contexte distant
+indisponible).
+
+Le joueur a fermé l'application. 69 accompagnements identiques ; seul eboot
+remplacé par staging vérifié et rename. Nouveau SHA256 :
+`02a4957ed94eac4dab51e212281aec767c5e67794779dd13410f3458c86457ff`.
+Ancien de2d7474… conservé sous
+`/data/ps5-diag/edglantine-command-readback-c58225a139b9/eboot.bin`.
+Paquet, ELF exact, revue, tests et journal : `artifacts/bananza-command-readback/`.
+Mode télé / 1×, paramètres et données inchangés. Résultat console de cette
+optimisation encore attendu ; vérifier hits/misses/fills/invalidations du cache
+et FPS dans le même passage après relance.
+
+## Cache actif sans gain global établi, puis essai GPU rapide
+
+Le joueur relance et constate « tout pareil », puis ferme l'application.
+Preuves : `artifacts/bananza-command-readback/retest/`. Le cache est bien
+sollicité : premier snapshot 76 692 hits / 6 996 misses (~91,6 %). Un nouveau
+profilage, justifié par cette activation réelle après le précédent patch,
+confirme la réutilisation ; deltas des rapports agrégés disponibles après
+réarmement : **235 033 hits / 16 800 misses (~93,3 %)**, 14 343 invalidations,
+2 157 clears et 336 évictions. Augmenter la capacité ne répond donc pas au
+motif principal des misses. Ces deltas agrégés couvrent les rapports disponibles
+après réarmement, pas nécessairement les seules 20 s de marques détaillées.
+
+Dernière fenêtre gameplay : **219 images / 25,284365 s = 8,661 FPS**, intervalles
+9,155 / 8,440 / 7,917 / 5,119 / 12,715. Deltas API : submit 0,852 s,
+semaphore_wait 1,887 s, buffer_sync 0,688 s, guest_fence 1,254 s. Les scènes ne
+sont pas appariées ; pas de gain global revendiqué contre le retour joueur.
+Marques détaillées : configuration des dessins 4,880 s, lecture 1,088 s,
+bindings 1,823 s, descripteurs 1,610 s ; ces coûts sont imbriqués. Les timers
+racine peuvent continuer après la fenêtre détaillée : ne pas additionner leurs
+totaux aux sous-phases. Cache actif ne signifie pas problème FPS résolu.
+
+Le joueur choisit explicitement **« Tester GPU rapide »** après explication du
+compromis de précision. Le réglage est `fast_gpu=true` → GPU accuracy Low.
+Audit préalable : Default DMA dérive son choix sûr de la précision GPU ; Low
+rendait donc les snapshots de commandes optimistes, et RefreshParametersImpl
+sautait les arguments natifs, y compris lorsqu'ils venaient d'un producteur GPU.
+
+Le patch `99g-native-default-dma-coherence.diff` conserve, pour les commandes
+natives Low+Default, le contrôle dirty sur le propriétaire des caches : lecture
+cohérente si un producteur GPU a modifié la plage, copie possédée ordinaire si
+elle est propre. High et la politique explicitement Unsafe des snapshots
+restent inchangés ; le chemin split garde son helper existant. Les paramètres
+MME natifs Low+Default restent rafraîchis au moment de leur consommation.
+
+Cubic a identifié un P1 dans une version intermédiaire **non installée** :
+ProcessMacro utilisait encore sa pile pour les appels Low de <=64 mots, alors
+que RefreshParametersImpl écrit dans macro_params. Correction : le même cas
+native+Default est exclu de ce raccourci, conservant un vecteur modifiable
+pendant l'exécution. Le test initial de la seule méthode ne couvrait pas cette
+interaction ; il est étendu aux deux vraies méthodes de production.
+
+Sur dedie ASan/UBSan : ancien snapshot Low+Default périmé reproduit, nouvelle
+politique lit les octets GPU frais ; chemin propre, High, explicitement Unsafe,
+cache et ordre split conservés. Test des vrais ProcessMacro/RefreshParametersImpl :
+incompatibilité intermédiaire pile/vecteur détectée, puis appels complets
+1/64/65 mots et appels fragmentés 2+3, pour toutes les combinaisons High/Low,
+natif/legacy et Default/explicite : PASS. Stockage, paramètres rafraîchis,
+nettoyage et restauration du scope vérifiés. Compilation/package natifs,
+headers et isolation : PASS ; PGO conservé. Revue Cubic finale : zéro
+signalement, sans erreur, après correction du P1 (contexte distant indisponible).
+
+Installation : accompagnements identiques (69), seul eboot remplacé après
+fermeture. SHA256 :
+`dae8638c99652d3c7d11920eadf021e22d1b1f98639ac775e69cb4dd2fc7aeb4`.
+Ancien 02a4957e… sous
+`/data/ps5-diag/edglantine-fast-gpu-5b18dd78990d/eboot.bin`.
+Puis activation uniquement dans le profil Bananza de `performance.fast_gpu=true` ;
+mode télé / 1× maintenu, options unsafe CPU/DMA et paramètres globaux inchangés.
+Ancienne configuration :
+`/data/eden-nx2/config/prosperoeden.json.before-bananza-fast-gpu-a357d13ad8`.
+Paquet, ELF exact, revues et journaux : `artifacts/bananza-fast-gpu/`.
+Ni lancement automatique ni gain FPS annoncé. Cet essai réduit la précision
+graphique ; vérifier au prochain lancement `fast GPU on`, mode Docked/1×,
+fluidité et absence de nouveaux défauts visuels dans le même passage.
+
+## Retest GPU rapide : activation et rendu confirmés
+
+Le joueur relance, puis confirme explicitement **« Oui, rendu correct »** pour
+le terrain et les objets. Logs : `artifacts/bananza-fast-gpu/retest/`, seconde
+fenêtre dans `later/`, résultats `measurement.json`. Lancement confirmé :
+**Docked / 1×, fast GPU on, unsafe CPU off, unsafe DMA off**, async shaders off,
+reactive flushing on, skip invalidation off, speed limit100 %. Les options
+« block list on » sont également rapportées ; ce relevé ne les isole pas.
+
+Premières fenêtres gameplay : 12,657 / 15,754 / 18,585 FPS, soit 15,665 FPS sur
+15,129095 s. Après une courte observation supplémentaire, cinq derniers
+intervalles : **396 images en 25,118886 s = 15,765 FPS**, moyennes de fenêtre
+15,171 / 16,995 / 9,976 / 19,312 / 17,346. Meilleur que les 8,661 FPS du dernier
+relevé High, mais les scènes/activités ne sont pas strictement appariées :
+amélioration observée, pas de gain isolé chiffré ni de 1% low déduit.
+
+Le cache reste actif : total 292164 hits / 22059 misses (~93 %), fenêtres de
+4 Kio. Reset accepté à 1525, 125 et 1446 records ; aucun rejet dans le relevé.
+Pas de VK_ERROR, bad_alloc ou échec de draw natif ; pas d'avertissement natif
+compute dans le premier snapshot. Les Device ReadBlock non mappés persistent
+(26 dans le second snapshot). Deltas API sur les 25,118886 s : submit1,181 s,
+semaphore_wait2,525 s, guest_fence1,529 s, buffer_sync1,060 s. Pas de compilation
+pipeline/shader dans cette fenêtre ; durées potentiellement imbriquées.
+
+Le profil Bananza GPU rapide / télé / 1× est conservé après ce retour joueur.
+Aucun réglage ni binaire modifié pendant les relevés, aucune capture GPU
+synchrone demandée. Activation et rendu validés pour cette session ; fluidité
+encore basse, généralisation et stabilité prolongée non établies.

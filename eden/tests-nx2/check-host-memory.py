@@ -96,11 +96,20 @@ with tempfile.TemporaryDirectory(prefix='host-memory-') as tmp:
  test=r'''
 struct Entry{unsigned char bytes[32];bool operator==(const Entry&)const=default;};
 int main(){Tegra::MemoryManager memory;
- {VideoCommon::DescriptorTable<Entry> t;
+ {VideoCommon::DescriptorTable<Entry> t;size_t maximum=64;
  for(u32 limit:{0U,63U,64U,511U,0x80ffU,0x80000U,31U}){
   assert(t.Synchronize(0x1000,limit));auto a=t.Read(memory,limit);assert(a.second);assert(!t.Read(memory,limit).second);
   t.Invalidate();assert(t.Read(memory,limit).second);assert(t.descriptors.size()>=size_t(limit)+1);
-  assert(t.descriptors.size()<=2*std::max<size_t>(64,size_t(limit)+1));}
+  maximum=std::max(maximum,size_t(limit)+1);
+  assert(t.descriptors.size()<=2*maximum);
+  assert(t.bound_ids.size()==t.descriptors.size());
+  t.bound_ids[limit]=limit+17;assert(!t.Read(memory,limit).second&&t.bound_ids[limit]==limit+17);
+  const auto bits=t.read_descriptors;t.Invalidate();t.Invalidate();assert(t.read_descriptors==bits);
+  assert(t.Read(memory,limit).second);t.bound_ids[limit]=limit+19;
+  assert(!t.Read(memory,limit).second&&t.bound_ids[limit]==limit+19);
+  const auto bytes=t.descriptors.capacity()*sizeof(Entry)+t.bound_ids.capacity()*sizeof(u32)+t.read_descriptors.capacity()*sizeof(u64);
+  assert(Eden::HostMemory::descriptor_live==bytes);
+ }
  assert(Eden::HostMemory::descriptor_live>0);
  auto moved=std::move(t);assert(!moved.Read(memory,31).second);
  }assert(Eden::HostMemory::descriptor_live==0);

@@ -189,12 +189,6 @@ void RasterizerVulkan::DispatchCompute() {"""),
     return false;
 """,
      """    DEBUG_ASSERT(addr != 0 || size != 0);
-    // A write to the page this core's last queued write covers joins it (performance.h DeferWrite).
-    if (::Eden::Performance::cpu_write_defer.load(std::memory_order_relaxed) &&
-        !::Eden::Performance::replaying_cpu_writes &&
-        ::Eden::Performance::ExtendDeferredWrite(addr, size, ::Eden::Performance::cpu_write_core)) {
-        return false;
-    }
     // Under the buffer cache lock: mark the buffer pages after this write CPU-modified as their own
     // first writes would (performance.h cpu_write_ahead), up to a page no buffer covers or one the
     // GPU modified.
@@ -204,7 +198,7 @@ void RasterizerVulkan::DispatchCompute() {"""),
         DAddr page = Common::AlignDown(written + written_size - 1, Core::DEVICE_PAGESIZE) + Core::DEVICE_PAGESIZE;
         for (; marked < pages; ++marked, page += Core::DEVICE_PAGESIZE)
             if (!buffer_cache.IsRegionRegistered(page, Core::DEVICE_PAGESIZE) ||
-                buffer_cache.OnCPUWrite(page, Core::DEVICE_PAGESIZE))
+                buffer_cache.OnCPUWriteAhead(page, Core::DEVICE_PAGESIZE))
                 break;
         return marked;
     };
@@ -354,10 +348,8 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, u32 direct
     }
 ''',
      '''    {
-        if (!::Eden::Performance::GuestCacheLockOrDefer(buffer_cache.mutex)) {
-            ::Eden::Performance::DeferWrite(addr, size, ::Eden::Performance::cpu_write_core);
-            return false;
-        }
+        // Cancel pending buffer copies before the CPU store can run.
+        ::Eden::Performance::GuestCacheLock(buffer_cache.mutex);
         std::lock_guard lock{buffer_cache.mutex, std::adopt_lock};
         if (buffer_cache.OnCPUWrite(addr, size)) {
             return true;
@@ -372,18 +364,6 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, u32 direct
         std::lock_guard lock{texture_cache.mutex, std::adopt_lock};
         texture_cache.WriteMemory(addr, size);
     }
-'''),
-    ('''            ::Eden::Performance::GuestCacheLock(buffer_cache.mutex);
-            std::lock_guard lock{buffer_cache.mutex, std::adopt_lock};
-            lap(&Detail::buffer_wait_ns);
-''',
-     '''            if (!::Eden::Performance::GuestCacheLockOrDefer(buffer_cache.mutex)) {
-                lap(&Detail::buffer_wait_ns);
-                ::Eden::Performance::DeferWrite(addr, size, ::Eden::Performance::cpu_write_core);
-                return false;
-            }
-            std::lock_guard lock{buffer_cache.mutex, std::adopt_lock};
-            lap(&Detail::buffer_wait_ns);
 '''),
     ('''            ::Eden::Performance::GuestCacheLock(texture_cache.mutex);
             std::lock_guard lock{texture_cache.mutex, std::adopt_lock};
@@ -1131,7 +1111,7 @@ gc_setup = '''    const auto ReclaimedBytes = [&](const Image& image) {
     };
 ''' + (port / 'vulkan_gc_downloads.inc').read_text()
 for old, new in [
-    ('    const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode]',
+    ('    const auto Cleanup = [&, this]',
      gc_setup + '\n    const auto Cleanup = [&, this]'),
     ('        if (must_download) {', '        if (must_download && !TakePrefetched(image_id, image)) {'),
     # Time the per-image drain Cleanup still takes for an image the prefetch could not batch.
@@ -1147,8 +1127,11 @@ for old, new in [
      '            }\n'
      '            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);'),
     ('(!high_priority_mode && must_download)) {', '(!DirtyEvictions() && must_download)) {'),
-    ('    Configure(false);', '    Configure(false);\n    PrefetchDownloads();'),
-    ('        Configure(true);', '        Configure(true);\n        PrefetchDownloads();'),
+    ('        evict_old_costly = true;',
+     '        evict_old_costly = true;\n        PrefetchDownloads();'),
+    ('\n    ForEachEviction(Cleanup, true);',
+     '\n    num_scanned = 0;\n    PrefetchDownloads();\n    ForEachEviction(Cleanup, true);'),
+    ('        eviction_order_ready = false;\n        ForEachEviction(Cleanup, true);', '        eviction_order_ready = false;\n        PrefetchDownloads();\n        ForEachEviction(Cleanup, true);'),
     # The eviction budget counts visits, not evictions: skipped images (decoding,
     # costly, or dirty images kept below the critical mark) burn it and stop the
     # scan, so kept images shield everything behind them. Count evictions; bound
@@ -1157,8 +1140,8 @@ for old, new in [
      '    size_t num_iterations = 0;\n    size_t num_scanned = 0;\n    constexpr size_t max_scanned = 8192;'),
     ('        if (num_iterations == 0) {\n            return true;\n        }\n        --num_iterations;',
      '        if (num_iterations == 0 || num_scanned >= max_scanned) {\n            return true;\n        }\n        ++num_scanned;\n        if (::Eden::Performance::gc_count_visits.load(std::memory_order_relaxed)) {\n            --num_iterations;\n        }'),
-    ('        if ((!aggressive_mode && True(image.flags & ImageFlagBits::CostlyLoad)) || (!DirtyEvictions() && must_download)) {\n            return false;\n        }',
-     '        if ((!aggressive_mode && True(image.flags & ImageFlagBits::CostlyLoad)) || (!DirtyEvictions() && must_download)) {\n            return false;\n        }\n        if (!::Eden::Performance::gc_count_visits.load(std::memory_order_relaxed)) {\n            --num_iterations;\n        }'),
+    ('        if (!CanEvictCostly(image) || (!DirtyEvictions() && must_download)) {\n            return false;\n        }',
+     '        if (!CanEvictCostly(image) || (!DirtyEvictions() && must_download)) {\n            return false;\n        }\n        if (!::Eden::Performance::gc_count_visits.load(std::memory_order_relaxed)) {\n            --num_iterations;\n        }'),
     # The aggressive pass gets its own scan allowance: Configure resets the
     # eviction budget per pass, and the scan counter must reset with it, or a
     # first pass spent on skips would stillborn the second one. Runs after the
