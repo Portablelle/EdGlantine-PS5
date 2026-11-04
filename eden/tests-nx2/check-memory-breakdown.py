@@ -35,6 +35,14 @@ assert 'original_image.GetMemoryBlock().size + scaled_image.GetMemoryBlock().siz
 runtime = (src / 'video_core/renderer_vulkan/vk_texture_cache.cpp').read_text()
 assert 'staging_buffer_pool.LogHeld();' in runtime, 'Vulkan statistics do not report the staging pool'
 pool = (src / 'video_core/renderer_vulkan/vk_staging_buffer_pool.cpp').read_text()
+# Layer 99zj and headless/main.cpp: the most refreshed images per report, and the descriptor
+# buffer A/B switch that any build reads (Pokopia's sprites swapping places for a frame).
+for needed in ('EDEN_REFRESHES images=', 'EDEN_REFRESH gpu=', 'refresh_counts.clear();', 'refresh.frames +='):
+    assert needed in cache, 'Texture cache report lacks: ' + needed
+main = (root / 'headless/main.cpp').read_text()
+switch = main.index('/descriptor-buffer-off.txt')
+assert main.rfind('#ifdef EDEN_DEV_PROFILE', 0, switch) < main.rfind('#endif', 0, switch), \
+    'The descriptor buffer switch is read in development builds only'
 assert 'void StagingBufferPool::LogHeld() const {' in pool
 
 with tempfile.TemporaryDirectory(prefix='eden-memory-breakdown-') as temp:
