@@ -259,6 +259,8 @@ with tempfile.TemporaryDirectory(prefix='eden-readback-refusal-') as temp:
             subprocess.run(['dpkg-deb', '-x', str(debs[-1]), str(temp / 'boost')], check=True)
             boost = [str(temp / 'boost/usr/include')]
     flags += ['-isystem' + b for b in boost]
+    # fmt (common/logging.h, through common/assert.h): Eden's package cache when there is one.
+    flags += ['-DFMT_HEADER_ONLY'] + ['-isystem' + f for f in sorted(glob.glob(str(source / '.cache/cpm/fmt/*/include')))]
     if sys.platform.startswith('linux'):
         flags.append('-fsanitize=address,undefined')
     subprocess.run([compiler, *flags, '-I' + str(src), '-I' + str(root / 'headless'), str(temp / 'check.cpp'), '-o', str(temp / 'check')], check=True)
