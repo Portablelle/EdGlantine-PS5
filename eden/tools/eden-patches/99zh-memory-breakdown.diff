@@ -1,0 +1,153 @@
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -1,3 +1,4 @@
++#include <chrono>
+ #include <atomic>
+ #include <cstdio>
+ // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+@@ -107,7 +108,12 @@ void BufferCache<P>::TickFrame() {
+         return;
+     }
+     runtime.TickFrame(slot_buffers);
+-    if (static u64 frames{}; ++frames % 600 == 0) {
++    // Every 600 frames, and every 5 s (a load at ~20 fps: issue #20).
++    static u64 frames{};
++    static auto last_report = std::chrono::steady_clock::now();
++    const auto report_now = std::chrono::steady_clock::now();
++    if (++frames % 600 == 0 || report_now - last_report >= std::chrono::seconds{5}) {
++        last_report = report_now;
+         u64 total{};
+         size_t count{};
+         std::vector<std::pair<u64, VAddr>> largest;
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -288,4 +288,26 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
+     }
+ }
+ 
++void StagingBufferPool::LogHeld() const {
++    const auto report = [this](const char* kind, const StagingBuffersCache& cache) {
++        u64 held{}, idle{};
++        size_t buffers{};
++        for (const StagingBuffers& level : cache) {
++            for (const StagingBuffer& entry : level.entries) {
++                const u64 bytes = entry.mapped_span.size() != 0 ? entry.mapped_span.size()
++                                                                : u64{1} << entry.log2_level;
++                held += bytes;
++                ++buffers;
++                if (!entry.deferred && scheduler.IsFree(entry.tick)) idle += bytes;
++            }
++        }
++        LOG_INFO(Render_Vulkan, "Staging pool {}: {} buffers {} MiB, {} MiB idle", kind, buffers, held >> 20,
++                 idle >> 20);
++    };
++    report("upload", upload_cache);
++    report("download", download_cache);
++    report("device", device_local_cache);
++    LOG_INFO(Render_Vulkan, "Staging pool stream buffer: {} MiB", stream_buffer_size >> 20);
++}
++
+ } // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+@@ -47,6 +47,9 @@ public:
+ 
+     void TickFrame();
+ 
++    /// Logs what the kept buffers of each kind hold, and how much of it the GPU is done with.
++    void LogHeld() const;
++
+     /// Run when graphics memory is refused even after the idle kept buffers went: frees what the
+     /// texture cache holds and can let go (RasterizerVulkan sets it). Returns how many images went.
+     std::function<size_t()> reclaim;
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -1993,6 +1993,7 @@ bool TextureCacheRuntime::CanReportMemoryUsage() const {
+ 
+ void TextureCacheRuntime::LogMemoryStatistics() const {
+     Vulkan::LogMemoryStatistics(device);
++    staging_buffer_pool.LogHeld();
+ }
+ 
+ bool TextureCacheRuntime::UseOpaqueAstcFormat() const {
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -357,6 +357,17 @@ public:
+     Image(Image&&) = default;
+     Image& operator=(Image&&) = default;
+ 
++    /// Graphics memory its images' allocations hold now (diagnostics, issue #20): the texture
++    /// cache counts an estimate from the guest size.
++    [[nodiscard]] u64 HostImageBytes() const noexcept {
++        return original_image.GetMemoryBlock().size + scaled_image.GetMemoryBlock().size;
++    }
++
++    /// The buffer its compute unswizzle keeps, 0 without one.
++    [[nodiscard]] u64 UnswizzleBufferBytes() const noexcept {
++        return has_compute_unswizzle_buffer ? compute_unswizzle_buffer_size : 0;
++    }
++
+     void UploadMemory(VkBuffer buffer, VkDeviceSize offset,
+                       std::span<const VideoCommon::BufferImageCopy> copies);
+ 
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -370,17 +370,28 @@ void TextureCache<P>::TickFrame() {
+     if (runtime.CanReportMemoryUsage()) {
+         total_used_memory = runtime.GetDeviceMemoryUsage();
+     }
+-    // Every 600 frames: device memory in use against the collector's thresholds, and what the
+-    // images themselves account for (VRAM pressure makes the collector thrash).
+-    if (static u64 frames{}; ++frames % 600 == 0) {
++    // Every 600 frames, and every 5 s: device memory in use against the collector's thresholds,
++    // and what the images themselves account for (VRAM pressure makes the collector thrash). A
++    // load runs at ~20 fps, so 600 frames alone never came before a crash at ~100 s (issue #20).
++    static u64 frames{};
++    static auto last_report = std::chrono::steady_clock::now();
++    const auto report_now = std::chrono::steady_clock::now();
++    if (++frames % 600 == 0 || report_now - last_report >= std::chrono::seconds{5}) {
++        last_report = report_now;
+         u64 image_bytes{};
+-        size_t images{};
++        u64 host_bytes{}, unswizzle_bytes{};
++        size_t images{}, unbacked{};
+         std::vector<std::pair<u64, const Image*>> largest;
+         std::map<u32, std::pair<u64, u32>> by_format;
+         for (const auto [image_id, image] : slot_images) {
+             const u64 bytes = GetScaledImageSizeBytes(*image);
+             image_bytes += bytes;
+             ++images;
++            if constexpr (requires { image->HostImageBytes(); image->UnswizzleBufferBytes(); }) {
++                host_bytes += image->HostImageBytes();
++                unswizzle_bytes += image->UnswizzleBufferBytes();
++            }
++            unbacked += True(image->flags & ImageFlagBits::Unbacked);
+             largest.emplace_back(bytes, image);
+             auto& format = by_format[static_cast<u32>(image->info.format)];
+             format.first += bytes;
+@@ -389,12 +400,17 @@ void TextureCache<P>::TickFrame() {
+         LOG_INFO(HW_GPU, "Texture cache: device memory {} MiB (expected {} MiB, critical {} MiB), {} images {} MiB",
+                  total_used_memory >> 20, expected_memory >> 20, critical_memory >> 20, images,
+                  image_bytes >> 20);
++        LOG_INFO(HW_GPU, "EDEN_MEMORY_IMAGES images={} estimated={}MiB allocated={}MiB unswizzle_buffers={}MiB "
++                 "unbacked={} frame={}", images, image_bytes >> 20, host_bytes >> 20, unswizzle_bytes >> 20,
++                 unbacked, frames);
+         std::partial_sort(largest.begin(), largest.begin() + std::min<size_t>(12, largest.size()),
+                           largest.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+         for (size_t i = 0; i < std::min<size_t>(12, largest.size()); ++i) {
+             const Image& image = *largest[i].second;
+-            LOG_INFO(HW_GPU, "  {} MiB: {:#x} {}x{}x{} layers {} levels {} format {} type {} flags {:#x}",
+-                     largest[i].first >> 20, image.gpu_addr, image.info.size.width, image.info.size.height,
++            u64 allocated{};
++            if constexpr (requires { image.HostImageBytes(); }) allocated = image.HostImageBytes();
++            LOG_INFO(HW_GPU, "  {} MiB ({} MiB allocated): {:#x} {}x{}x{} layers {} levels {} format {} type {} flags {:#x}",
++                     largest[i].first >> 20, allocated >> 20, image.gpu_addr, image.info.size.width, image.info.size.height,
+                      image.info.size.depth, image.info.resources.layers, image.info.resources.levels,
+                      static_cast<u32>(image.info.format), static_cast<u32>(image.info.type),
+                      static_cast<u32>(image.flags));
