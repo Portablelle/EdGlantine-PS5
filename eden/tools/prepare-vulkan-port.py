@@ -590,7 +590,9 @@ adapt('src/video_core/renderer_vulkan/vk_present_manager.cpp', 'vulkan_present_m
 # 480 MiB free. No Finish() when releasing: a buffer handed out earlier may not have its copy recorded.
 adapt('src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp', 'vulkan_staging_buffer_pool.cpp', [
     ('#include "video_core/vulkan_common/vulkan_wrapper.h"\n',
-     '#include "video_core/vulkan_common/vulkan_wrapper.h"\n#include <atomic>\n#include <cstdio>\n#include "staging_buffers.h"\n'),
+     '#include "video_core/vulkan_common/vulkan_wrapper.h"\n#include <atomic>\n#include <cstdio>\n#include "staging_buffers.h"\n'
+     '// The pool\'s free memory and largest free block, -1 when unknown (src/memory_pages.cpp).\n'
+     'extern "C" void eden_direct_memory_free(std::int64_t*, std::size_t*) noexcept __attribute__((weak));\n'),
     ('    const auto is_free = [this](const StagingBuffer& entry) {\n'
      '        return !entry.deferred && scheduler.IsFree(entry.tick);\n'
      '    };',
@@ -629,9 +631,13 @@ adapt('src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp', 'vulkan_stagi
      '                released += ::Eden::StagingBuffers::ReleaseFrom(level, idle);\n'
      '            }\n'
      '        }\n'
-     '        std::fprintf(stderr, "EDEN_STAGING_OOM asked=%zu made=%llu released=%zu buffers (%llu MiB)\\n", size,\n'
-     '                     static_cast<unsigned long long>(made), released.buffers,\n'
-     '                     static_cast<unsigned long long>(released.bytes >> 20));\n'
+     '        std::int64_t pool_free = -1;\n'
+     '        std::size_t largest = static_cast<std::size_t>(-1);\n'
+     '        if (eden_direct_memory_free) eden_direct_memory_free(&pool_free, &largest);\n'
+     '        std::fprintf(stderr, "EDEN_STAGING_OOM asked=%zu made=%llu released=%zu buffers (%llu MiB), then free=%lldMiB "\n'
+     '                     "largest_free=%lldMiB\\n", size, static_cast<unsigned long long>(made), released.buffers,\n'
+     '                     static_cast<unsigned long long>(released.bytes >> 20), pool_free < 0 ? -1ll : pool_free >> 20,\n'
+     '                     largest == static_cast<std::size_t>(-1) ? -1ll : static_cast<long long>(largest >> 20));\n'
      '        buffer = memory_allocator.CreateBuffer(buffer_ci, usage);\n'
      '    }\n'
      '    // A large buffer smaller than the power of two: the 1st, 2nd, 4th, 8th ... in the log.\n'
@@ -1009,10 +1015,14 @@ for call in ('vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &
         '                blocks += heap.statistics.blockBytes;\n'
         '                used += heap.statistics.allocationBytes;\n'
         '            }\n'
-        '            const auto free_block = ::Eden::Performance::graphics_memory_free.load(std::memory_order_relaxed);\n'
-        '            std::fprintf(stderr, "[ProsperoEden] graphics memory: refused outside the budget too (result %d): the pool\'s "\n'
-        '                         "largest free block is %llu MiB; the allocator holds %llu MiB in blocks, %llu MiB of it in use\\n",\n'
-        '                         int(created), free_block ? free_block() >> 20 : 0ull, blocks >> 20, used >> 20);\n'
+        '            std::int64_t pool_free = -1;\n'
+        '            std::size_t largest = static_cast<std::size_t>(-1);\n'
+        '            if (eden_direct_memory_free) eden_direct_memory_free(&pool_free, &largest);\n'
+        '            std::fprintf(stderr, "[ProsperoEden] graphics memory: refused outside the budget too (result %d): the pool has "\n'
+        '                         "%lld MiB free, its largest free block is %lld MiB; the allocator holds %llu MiB in blocks, "\n'
+        '                         "%llu MiB of it in use\\n", int(created), pool_free < 0 ? -1ll : pool_free >> 20,\n'
+        '                         largest == static_cast<std::size_t>(-1) ? -1ll : static_cast<long long>(largest >> 20),\n'
+        '                         blocks >> 20, used >> 20);\n'
         '        }\n'
         '    }\n'
         '    vk::Check(created);\n'
@@ -1053,7 +1063,9 @@ allocator = allocator.replace(held_ctor[1], (
 include = '#include "video_core/vulkan_common/vulkan_memory_allocator.h"\n'
 if allocator.count(include) != 1:
     raise RuntimeError('Pinned Vulkan allocator changed: its own include')
-allocator = allocator.replace(include, include + '#include <atomic>\n#include <cstdio>\n#include "performance.h"\n')
+allocator = allocator.replace(include, include + '#include <atomic>\n#include <cstdio>\n#include "performance.h"\n'
+                              '// The pool\'s free memory and largest free block, -1 when unknown (src/memory_pages.cpp).\n'
+                              'extern "C" void eden_direct_memory_free(std::int64_t*, std::size_t*) noexcept __attribute__((weak));\n')
 path = output / 'vulkan_memory_allocator.cpp'
 if not path.exists() or path.read_text() != allocator:
     path.write_text(allocator)

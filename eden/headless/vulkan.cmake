@@ -27,6 +27,10 @@ list(APPEND video_sources "${PORT_BUILD_DIR}/vulkan_device.cpp" "${PORT_BUILD_DI
 # An image or a buffer the allocator's budget refuses is asked for outside it (prepare-vulkan-port.py).
 list(REMOVE_ITEM video_sources vulkan_common/vulkan_memory_allocator.cpp)
 list(APPEND video_sources "${PORT_BUILD_DIR}/vulkan_memory_allocator.cpp")
+# Staging buffers sized for their transfer, and let go and asked for again when refused
+# (headless/staging_buffers.h, prepare-vulkan-port.py).
+list(REMOVE_ITEM video_sources renderer_vulkan/vk_staging_buffer_pool.cpp)
+list(APPEND video_sources "${PORT_BUILD_DIR}/vulkan_staging_buffer_pool.cpp")
 # Split the dispatch timer into its three phases (prepare-vulkan-port.py).
 list(REMOVE_ITEM video_sources control/scheduler.cpp)
 list(APPEND video_sources "${PORT_BUILD_DIR}/control_scheduler.cpp")

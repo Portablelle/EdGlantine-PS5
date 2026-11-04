@@ -3,6 +3,9 @@
 #include "cpu_policy.h"
 #include "crash_report.h"
 #include "stall_watchdog.h"
+#ifdef PS5_NATIVE
+#include "boot_trace.h"
+#endif
 #include "../src/fastmem.h"
 #include "common/cpu_features.h"
 #include "common/sparse_large_vector.h"
@@ -698,11 +701,15 @@ void ReportSessionMemory(const char* phase, unsigned session) {
         if (regions != 0) free_bytes = total - taken;
     }
 #endif
+    long t_ms = -1;  // milliseconds after the app started, as in boot-trace.txt
+#ifdef PS5_NATIVE
+    t_ms = ::Eden::BootTrace::detail::Milliseconds();
+#endif
     std::printf("EDEN_SESSION_MEMORY phase=%s session=%u total=%lld free=%lld largest_free=%zu regions=%u "
-                "heap_pieces=%zu heap_large=%zu large_blocks=%u tables=%zu gpu_bytes=%llu\n",
+                "heap_pieces=%zu heap_large=%zu large_blocks=%u tables=%zu gpu_bytes=%llu t_ms=%ld\n",
                 phase, session, total, free_bytes, largest, regions,
                 eden_heap_committed ? eden_heap_committed() : std::size_t{0}, large, large_blocks, table_held,
-                static_cast<unsigned long long>(eden_vulkan_memory_bytes ? eden_vulkan_memory_bytes() : 0));
+                static_cast<unsigned long long>(eden_vulkan_memory_bytes ? eden_vulkan_memory_bytes() : 0), t_ms);
     std::fflush(stdout);
 }
 
