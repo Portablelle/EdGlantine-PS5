@@ -18,12 +18,29 @@
             pending.clear();
             batch_bytes = 0;
         };
-        for (const ImageId image_id : images) {
+        for (size_t index = 0; index < images.size(); ++index) {
+            const ImageId image_id = images[index];
             Image& image = slot_images[image_id];
             const size_t bytes = image.unswizzled_size_bytes;
             if (pending.size() == 16 || bytes > batch_limit - batch_bytes)
                 finish_batch();
-            auto map = runtime.DownloadStagingBuffer(bytes);
+            auto refusable = runtime.TryDownloadStagingBuffer(bytes);
+            if (!refusable) {
+                // Refused even after the pool's retries (issue #20): what is already copied is
+                // published, this image and the ones after it stay GPU-modified for a later read.
+                finish_batch();
+                DroppedReadbacks dropped;
+                for (size_t rest = index; rest < images.size(); ++rest) {
+                    Image& skipped = slot_images[images[rest]];
+                    skipped.flags |= ImageFlagBits::GpuModified;
+                    skipped.info.forced_flushed = false; // the next CPU read asks again
+                    ++dropped.images;
+                    dropped.bytes += skipped.unswizzled_size_bytes;
+                }
+                ReportDroppedReadbacks("sync", dropped);
+                return;
+            }
+            auto map = std::move(*refusable);
             const auto copies = FixSmallVectorADL(FullDownloadCopies(image.info));
             image.DownloadMemory(map, copies);
             pending.emplace_back(image_id, std::move(map));

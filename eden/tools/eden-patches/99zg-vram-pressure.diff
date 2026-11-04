@@ -1,7 +1,7 @@
 diff --git a/src/video_core/delayed_destruction_ring.h b/src/video_core/delayed_destruction_ring.h
 --- a/src/video_core/delayed_destruction_ring.h
 +++ b/src/video_core/delayed_destruction_ring.h
-@@ -26,6 +26,16 @@
+@@ -26,6 +26,16 @@ public:
          elements[index].push_back(std::move(object));
      }
  
@@ -21,7 +21,7 @@ diff --git a/src/video_core/delayed_destruction_ring.h b/src/video_core/delayed_
 diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
 --- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
 +++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
-@@ -256,9 +256,17 @@
+@@ -256,9 +256,17 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
        wfi_event(device.GetLogical().CreateEvent()) {
      native_capture_session = std::make_unique<NativeDrawCaptureSession>();
      scheduler.SetQueryCache(query_cache);
@@ -50,7 +50,7 @@ diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h b/src/video
  #include <vector>
  
  #include "common/common_types.h"
-@@ -46,6 +47,10 @@
+@@ -46,6 +47,10 @@ public:
  
      void TickFrame();
  
@@ -61,6 +61,104 @@ diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h b/src/video
  private:
      struct StreamBufferCommit {
          size_t upper_bound;
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -1123,6 +1123,17 @@ StagingBufferRef TextureCacheRuntime::DownloadStagingBuffer(size_t size, bool de
+     return staging_buffer_pool.Request(size, MemoryUsage::Download, deferred);
+ }
+ 
++std::optional<StagingBufferRef> TextureCacheRuntime::TryDownloadStagingBuffer(size_t size, bool deferred) {
++    try {
++        return staging_buffer_pool.Request(size, MemoryUsage::Download, deferred);
++    } catch (const vk::Exception& refused) {
++        if (refused.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
++            throw;
++        }
++        return std::nullopt;
++    }
++}
++
+ void TextureCacheRuntime::FreeDeferredStagingBuffer(StagingBufferRef& ref) {
+     staging_buffer_pool.FreeDeferred(ref);
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <deque>
++#include <optional>
+ #include <span>
+ 
+ #include "video_core/texture_cache/texture_cache_base.h"
+@@ -57,6 +58,10 @@ public:
+ 
+     StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);
+ 
++    /// DownloadStagingBuffer, or nothing when graphics memory still refuses it after the pool's
++    /// own retries: a readback can be skipped, a session cannot be resumed (issue #20).
++    std::optional<StagingBufferRef> TryDownloadStagingBuffer(size_t size, bool deferred = false);
++
+     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
+ 
+     void TickFrame();
+diff --git a/src/video_core/texture_cache/pending_download.h b/src/video_core/texture_cache/pending_download.h
+--- a/src/video_core/texture_cache/pending_download.h
++++ b/src/video_core/texture_cache/pending_download.h
+@@ -3,6 +3,8 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <atomic>
++#include <cstdio>
+ #include <memory>
+ #include <unordered_set>
+ #include <cstddef>
+@@ -55,4 +57,42 @@ bool RetainPendingImageDownloads(Common::SlotId id, Image& image, Downloads& pen
+     return retained != nullptr;
+ }
+ 
++struct DroppedReadbacks {
++    size_t images = 0;
++    size_t bytes = 0;
++};
++
++// Takes the image readbacks out of a batch whose staging buffer graphics memory refused even
++// after the pool's retries (issue #20: a 144 MiB readback of a 6144x6144 render target ended a
++// session with 462 MiB free in blocks of 128 MiB at most). They are the preemptive copies of
++// render targets the CPU read before. The image stays GPU-modified and forced_flushed goes back
++// to false, so the CPU's next read of it flushes it for real instead of trusting guest memory.
++// Buffer readbacks stay. Returns what was not read back.
++template <class Image, class Downloads>
++DroppedReadbacks DropImageReadbacks(Downloads& downloads, Common::SlotVector<Image>& images) {
++    DroppedReadbacks dropped;
++    const auto end = std::remove_if(downloads.begin(), downloads.end(), [&](const auto& download) {
++        if (!download.is_swizzle) {
++            return false;
++        }
++        auto& image = download.GetImage(images);
++        image.info.forced_flushed = false;
++        ++dropped.images;
++        dropped.bytes += image.unswizzled_size_bytes;
++        return true;
++    });
++    downloads.erase(end, downloads.end());
++    return dropped;
++}
++
++// EDEN_READBACK_SKIPPED in stderr: the 1st, 2nd, 4th, 8th ... skip.
++inline void ReportDroppedReadbacks(const char* kind, const DroppedReadbacks& dropped) {
++    static std::atomic<unsigned long long> skips{0};
++    const auto times = skips.fetch_add(1, std::memory_order_relaxed) + 1;
++    if ((times & (times - 1)) == 0) {
++        std::fprintf(stderr, "EDEN_READBACK_SKIPPED kind=%s images=%zu bytes=%zu: graphics memory refused "
++                     "the staging buffer (%llu so far)\n", kind, dropped.images, dropped.bytes, times);
++    }
++}
++
+ } // namespace VideoCommon
 diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
 --- a/src/video_core/texture_cache/texture_cache.h
 +++ b/src/video_core/texture_cache/texture_cache.h
@@ -72,7 +170,7 @@ diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/textu
  #include "common/settings.h"
  #include "common/slot_vector.h"
  #include "video_core/control/channel_state.h"
-@@ -302,6 +303,25 @@
+@@ -302,6 +303,25 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
      }
  }
  
@@ -98,7 +196,7 @@ diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/textu
  template <class P>
  void TextureCache<P>::TickFrame() {
      for (auto* scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
-@@ -411,6 +431,11 @@
+@@ -411,6 +431,11 @@ void TextureCache<P>::TickFrame() {
          gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
          images_created = images_deleted = 0;
      }
@@ -110,7 +208,43 @@ diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/textu
      if (total_used_memory > minimum_memory) {
          RunGarbageCollector();
      }
-@@ -1578,7 +1603,7 @@
+@@ -1259,16 +1284,27 @@ void TextureCache<P>::CommitAsyncFlushes() {
+                                 image.info.layer_stride, image.guest_size_bytes, image.unswizzled_size_bytes);
+                 }
+             }
+-            auto download_map = runtime.DownloadStagingBuffer(total_size_bytes, true);
+-            for (const PendingDownload& download_info : download_ids) {
+-                if (download_info.is_swizzle) {
+-                    Image& image = download_info.GetImage(slot_images);
+-                    const auto copies = FixSmallVectorADL(FullDownloadCopies(image.info));
+-                    image.DownloadMemory(download_map, copies);
+-                    download_map.offset += Common::AlignUp(image.unswizzled_size_bytes, 64);
++            // Refused even after the pool's retries, these readbacks are skipped rather than the
++            // session ended (DropImageReadbacks, pending_download.h).
++            std::optional<decltype(runtime.DownloadStagingBuffer(total_size_bytes, true))> download_map;
++            if constexpr (requires(Runtime& r) { r.TryDownloadStagingBuffer(size_t{}, true); }) {
++                download_map = runtime.TryDownloadStagingBuffer(total_size_bytes, true);
++            } else {
++                download_map = runtime.DownloadStagingBuffer(total_size_bytes, true);
++            }
++            if (!download_map) {
++                ReportDroppedReadbacks("async", DropImageReadbacks(download_ids, slot_images));
++            } else {
++                for (const PendingDownload& download_info : download_ids) {
++                    if (download_info.is_swizzle) {
++                        Image& image = download_info.GetImage(slot_images);
++                        const auto copies = FixSmallVectorADL(FullDownloadCopies(image.info));
++                        image.DownloadMemory(*download_map, copies);
++                        download_map->offset += Common::AlignUp(image.unswizzled_size_bytes, 64);
++                    }
+                 }
++                uncommitted_async_buffers.emplace_back(*download_map);
+             }
+-            uncommitted_async_buffers.emplace_back(download_map);
+         }
+ 
+         async_buffers.emplace_back(std::move(uncommitted_async_buffers));
+@@ -1578,7 +1614,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
      uploaded_bytes += image.guest_size_bytes;
      largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
      const auto upload_start = std::chrono::steady_clock::now();
@@ -119,7 +253,7 @@ diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/textu
          auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
          UploadImageContents(image, staging);
          runtime.InsertUploadMemoryBarrier();
-@@ -3213,6 +3238,46 @@
+@@ -3213,6 +3249,46 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
      return true;
  }
  
@@ -169,7 +303,7 @@ diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/textu
 diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
 --- a/src/video_core/texture_cache/texture_cache_base.h
 +++ b/src/video_core/texture_cache/texture_cache_base.h
-@@ -190,6 +190,11 @@
+@@ -190,6 +190,11 @@ public:
      /// Notify the cache that a new frame has been queued
      void TickFrame();
  
@@ -181,7 +315,7 @@ diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/
      /// Return a constant reference to the given image view id
      [[nodiscard]] const ImageView& GetImageView(ImageViewId id) const noexcept;
  
-@@ -431,6 +436,10 @@
+@@ -431,6 +436,10 @@ private:
      /// Uploads a large plain 2D image in chunks; false if it does not qualify.
      bool UploadInChunks(Image& image);
  
@@ -192,7 +326,7 @@ diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/
      /// Records a GPU remap of a small part of a large 2D image for a partial re-upload instead of
      /// marking the whole image remapped (which replaces it). False if the image does not qualify.
      bool MarkPartialRemap(ImageBase& image, GPUVAddr gpu_addr, size_t size);
-@@ -520,6 +529,8 @@
+@@ -520,6 +529,8 @@ private:
  
      bool has_deleted_images = false;
      bool is_rescaling = false;
