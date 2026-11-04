@@ -1,0 +1,47 @@
+diff --git a/src/video_core/texture_cache/util.cpp b/src/video_core/texture_cache/util.cpp
+index fa224cc..d58b881 100644
+--- a/src/video_core/texture_cache/util.cpp
++++ b/src/video_core/texture_cache/util.cpp
+@@ -1190,23 +1190,28 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
+             const auto bpp_div = bc1 ? 2 : 1;
+ 
+             const u32 plane_dim = copy.image_extent.width * copy.image_extent.height;
+-            const u32 level_size = plane_dim * copy.image_extent.depth *
+-                                   copy.image_subresource.num_layers *
+-                                   BytesPerBlock(PixelFormat::A8B8G8R8_UNORM);
+-            decode_scratch.resize_destructive(level_size);
+-
+-            Tegra::Texture::ASTC::Decompress(
+-                input_offset, copy.image_extent.width, copy.image_extent.height,
+-                copy.image_subresource.num_layers * copy.image_extent.depth, tile_size.width,
+-                tile_size.height, decode_scratch);
+-
+-            compress(decode_scratch, copy.image_extent.width, copy.image_extent.height,
+-                     copy.image_subresource.num_layers * copy.image_extent.depth,
+-                     output.subspan(output_offset));
+-
+             const u32 aligned_plane_dim = Common::AlignUp(copy.image_extent.width, 4) *
+                                           Common::AlignUp(copy.image_extent.height, 4);
+ 
++            // One layer (or depth slice) at a time: both functions treat slices independently, so
++            // the output is the same, but the decoded RGBA8 scratch is one slice instead of the
++            // whole level. A 46-layer 1434x1434 array asked for 361 MiB in one piece; the console's
++            // shared pool had 403 MiB free in blocks of at most 125 MiB, and bad_alloc ended the game.
++            const u32 slices = copy.image_subresource.num_layers * copy.image_extent.depth;
++            const size_t input_slice = size_t{Common::DivideUp(copy.image_extent.width, tile_size.width)} *
++                                       Common::DivideUp(copy.image_extent.height, tile_size.height) * 16;
++            const size_t output_slice = aligned_plane_dim / bpp_div;
++            decode_scratch.resize_destructive(plane_dim * BytesPerBlock(PixelFormat::A8B8G8R8_UNORM));
++
++            for (u32 slice = 0; slice < slices; ++slice) {
++                Tegra::Texture::ASTC::Decompress(
++                    input_offset.subspan(slice * input_slice), copy.image_extent.width,
++                    copy.image_extent.height, 1, tile_size.width, tile_size.height, decode_scratch);
++
++                compress(decode_scratch, copy.image_extent.width, copy.image_extent.height, 1,
++                         output.subspan(output_offset + slice * output_slice));
++            }
++
+             copy.buffer_size =
+                 (aligned_plane_dim * copy.image_extent.depth * copy.image_subresource.num_layers) /
+                 bpp_div;

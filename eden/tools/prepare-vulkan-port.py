@@ -588,6 +588,8 @@ adapt('src/video_core/renderer_vulkan/vk_present_manager.cpp', 'vulkan_present_m
 # only when it holds the transfer, and a refused buffer is asked for once more after the kept ones
 # the GPU is done with are let go. A Switch 2 title was refused 512 MiB for a 341 MiB transfer with
 # 480 MiB free. No Finish() when releasing: a buffer handed out earlier may not have its copy recorded.
+# Each frame at most 256 MiB of idle kept buffers stay, none when the pool's largest free block is
+# under 512 MiB (asked every 16th frame): a loading burst left 610 MiB idle when the CPU was refused.
 adapt('src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp', 'vulkan_staging_buffer_pool.cpp', [
     ('#include "video_core/vulkan_common/vulkan_wrapper.h"\n',
      '#include "video_core/vulkan_common/vulkan_wrapper.h"\n#include <atomic>\n#include <cstdio>\n#include "staging_buffers.h"\n'
@@ -611,6 +613,30 @@ adapt('src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp', 'vulkan_stagi
      '                   ::Eden::StagingBuffers::Holds(entry.mapped_span.size(), entry.log2_level) < size;\n'
      '        });\n'
      '    }\n'),
+    ('    ReleaseCache(MemoryUsage::Download);\n}\n',
+     '    ReleaseCache(MemoryUsage::Download);\n'
+     '    // Idle kept buffers beyond 256 MiB go now, all of them when the pool runs low (staging_buffers.h).\n'
+     '    static std::size_t largest = static_cast<std::size_t>(-1);\n'
+     '    static unsigned frames = 0;\n'
+     '    if (eden_direct_memory_free && frames++ % 16 == 0) {\n'
+     '        std::int64_t pool_free = -1;\n'
+     '        eden_direct_memory_free(&pool_free, &largest);\n'
+     '    }\n'
+     '    const auto released = ::Eden::StagingBuffers::TrimIdle(\n'
+     '        std::array<StagingBuffersCache*, 3>{&device_local_cache, &upload_cache, &download_cache},\n'
+     '        [this](const StagingBuffer& entry) { return !entry.deferred && scheduler.IsFree(entry.tick); },\n'
+     '        ::Eden::StagingBuffers::IdleAllowance(largest));\n'
+     '    // A trim of 64 MiB or more: the 1st, 2nd, 4th, 8th ... in the log.\n'
+     '    static unsigned long long large_trims = 0;\n'
+     '    if (released.bytes >= (std::uint64_t{64} << 20)) {\n'
+     '        const auto times = ++large_trims;\n'
+     '        if ((times & (times - 1)) == 0) {\n'
+     '            std::fprintf(stderr, "EDEN_STAGING_TRIM released=%zu idle buffers (%llu MiB), largest_free=%lldMiB "\n'
+     '                         "(%llu so far)\\n", released.buffers, static_cast<unsigned long long>(released.bytes >> 20),\n'
+     '                         largest == static_cast<std::size_t>(-1) ? -1ll : static_cast<long long>(largest >> 20), times);\n'
+     '        }\n'
+     '    }\n'
+     '}\n'),
     ('        .size = 1ULL << log2_size,\n', '        .size = made,\n'),
     ('    vk::Buffer buffer = memory_allocator.CreateBuffer(buffer_ci, usage);\n',
      '    vk::Buffer buffer;\n'

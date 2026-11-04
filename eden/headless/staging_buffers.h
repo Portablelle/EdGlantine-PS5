@@ -14,14 +14,22 @@
 //
 // When the console refuses a buffer, every kept one the GPU is done with is let go and the buffer
 // is asked for once more.
+//
+// Eden lets go of kept buffers slowly (16 of one power of two per frame), so a loading burst left
+// 610 MiB of them idle in the shared pool while the CPU was refused 361 MiB (issue #20). Each frame
+// at most 256 MiB of buffers the GPU is done with stay kept, the largest go first, and none stay
+// when the pool's largest free block is under 512 MiB.
 #pragma once
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
 namespace Eden::StagingBuffers {
 inline constexpr std::uint64_t kExactAbove = std::uint64_t{16} << 20;
 inline constexpr std::uint64_t kStep = std::uint64_t{16} << 20;
+inline constexpr std::uint64_t kIdleKept = std::uint64_t{256} << 20;
+inline constexpr std::uint64_t kLowLargestFree = std::uint64_t{512} << 20;
 
 // Whether a transfer of `size` bytes gets a buffer of its own size. `mapped`: the CPU writes or
 // reads it (Eden's Upload and Download kinds); the buffers for the GPU alone keep their power of two.
@@ -65,6 +73,41 @@ Released ReleaseFrom(Level& level, Drop&& drop) {
     entries.erase(kept, entries.end());
     if (level.delete_index >= entries.size()) level.delete_index = 0;
     if (level.iterate_index > entries.size()) level.iterate_index = 0;
+    return released;
+}
+
+// How many bytes of idle kept buffers may stay: kIdleKept, or none when the pool's largest free
+// block (`largest_free`, -1 when unknown) is under kLowLargestFree.
+constexpr std::uint64_t IdleAllowance(std::size_t largest_free) noexcept {
+    return largest_free != static_cast<std::size_t>(-1) && largest_free < kLowLargestFree ? 0 : kIdleKept;
+}
+
+// Lets go of idle kept buffers (`idle` picks them), largest power of two first, until at most
+// `allowance` bytes of idle ones are kept. `caches`: the pool's caches, each an array of levels
+// indexed by log2.
+template <class Caches, class Idle>
+Released TrimIdle(const Caches& caches, Idle&& idle, std::uint64_t allowance) {
+    std::uint64_t idle_bytes = 0;
+    std::size_t levels = 0;
+    for (const auto* cache : caches) {
+        levels = std::max(levels, cache->size());
+        for (const auto& level : *cache) {
+            for (const auto& entry : level.entries) {
+                if (idle(entry)) idle_bytes += Holds(entry.mapped_span.size(), entry.log2_level);
+            }
+        }
+    }
+    Released released;
+    for (std::size_t log2 = levels; log2-- > 0 && idle_bytes > allowance;) {
+        for (auto* cache : caches) {
+            if (log2 >= cache->size()) continue;
+            released += ReleaseFrom((*cache)[log2], [&](const auto& entry) {
+                if (idle_bytes <= allowance || !idle(entry)) return false;
+                idle_bytes -= std::min(idle_bytes, Holds(entry.mapped_span.size(), entry.log2_level));
+                return true;
+            });
+        }
+    }
     return released;
 }
 } // namespace Eden::StagingBuffers
