@@ -21,6 +21,7 @@ free block would keep less than the texture cache's 1280 MiB reserve (AheadReadb
 at that run's numbers, with CommitAsyncFlushes. Fails on 3e0e601.
 """
 from pathlib import Path
+import glob
 import os
 import re
 import shutil
@@ -250,6 +251,14 @@ with tempfile.TemporaryDirectory(prefix='eden-readback-refusal-') as temp:
     body = batch.replace('    if constexpr (std::is_same_v<Runtime, Vulkan::TextureCacheRuntime>) {', '    {', 1)
     (temp / 'check.cpp').write_text(test.replace('COMMIT', 'template <class P>\n' + commit).replace('BATCH', body))
     flags = ['-std=c++20', '-O1', '-g']
+    # Boost: Eden's package cache after a configure, the system's, or the pinned .deb (.deps).
+    boost = sorted(glob.glob(str(source / '.cache/cpm/boost/*/libs/*/include')))
+    if not boost and not Path('/usr/include/boost/container/small_vector.hpp').exists():
+        debs = sorted((root / '.deps').glob('libboost*-dev_*.deb'))
+        if debs:
+            subprocess.run(['dpkg-deb', '-x', str(debs[-1]), str(temp / 'boost')], check=True)
+            boost = [str(temp / 'boost/usr/include')]
+    flags += ['-isystem' + b for b in boost]
     if sys.platform.startswith('linux'):
         flags.append('-fsanitize=address,undefined')
     subprocess.run([compiler, *flags, '-I' + str(src), '-I' + str(root / 'headless'), str(temp / 'check.cpp'), '-o', str(temp / 'check')], check=True)
