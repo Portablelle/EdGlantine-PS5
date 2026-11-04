@@ -183,11 +183,14 @@ code=common+declarations+decoder+'using Tegra::Texture::UnswizzleTexture;using T
 helpers=text[text.index('struct LevelInfo {'):text.index('[[nodiscard]] constexpr u32 CalculateLevelOffset(')]
 helpers=helpers.replace(function(helpers,'[[nodiscard]] Extent3D AdjustSamplesSize('),'')
 code+=helpers
+if 'bool SwizzleBlockLinearSlices(' in text:
+    code += function(text,'template <bool swizzle>\nbool SwizzleBlockLinearSlices(')
 for sig in ['[[nodiscard]] constexpr u32 CalculateLevelOffset(', '[[nodiscard]] constexpr u32 AlignLayerSize(',
-            'u32 CalculateLayerSize(', 'u32 CalculateLayerStride(',
+            'u32 CalculateLayerSize(', 'u32 CalculateLayerStride(', 'u32 CalculateGuestSizeInBytes(',
             'boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(',
             'boost::container::small_vector<BufferImageCopy, 16> UnswizzleImageRows(']:
-    code+=function(text,sig)
+    code+=function(text,sig).replace('Common::ScratchBuffer<u8>* tmp_buffer)',
+                                    'Common::ScratchBuffer<u8>* tmp_buffer = nullptr)')
 code+=r'''
 int main(){
  u32 random=0x792fac1;auto next=[&](){random^=random<<13;random^=random>>17;random^=random<<5;return random;};

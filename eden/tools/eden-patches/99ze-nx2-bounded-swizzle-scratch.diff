@@ -1,0 +1,209 @@
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index c6f633d..8452dd8 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -1725,15 +1725,13 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging)
+         return;
+     }
+ 
+-    Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> swizzle_data(
+-        *gpu_memory, gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
+     if (True(image.flags & ImageFlagBits::Converted)) {
+         unswizzle_data_buffer.resize_destructive(image.unswizzled_size_bytes);
+-        auto copies = FixSmallVectorADL(UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data, unswizzle_data_buffer));
++        auto copies = FixSmallVectorADL(UnswizzleImage(*gpu_memory, gpu_addr, image.info, {}, unswizzle_data_buffer, &swizzle_data_buffer));
+         ConvertImage(unswizzle_data_buffer, image.info, mapped_span, copies);
+         image.UploadMemory(staging, copies);
+     } else {
+-        const auto copies = FixSmallVectorADL(UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data, mapped_span));
++        const auto copies = FixSmallVectorADL(UnswizzleImage(*gpu_memory, gpu_addr, image.info, {}, mapped_span, &swizzle_data_buffer));
+         image.UploadMemory(staging, copies);
+     }
+ }
+@@ -1964,8 +1962,8 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
+     async_decodes.push_back(std::move(decode));
+ 
+     std::vector<u8> local_unswizzle_data_buffer(image.unswizzled_size_bytes, 0);
+-    Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> swizzle_data(*gpu_memory, image.gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
+-    auto copies = UnswizzleImage(*gpu_memory, image.gpu_addr, image.info, swizzle_data, local_unswizzle_data_buffer);
++    auto copies = UnswizzleImage(*gpu_memory, image.gpu_addr, image.info, {},
++                                local_unswizzle_data_buffer, &swizzle_data_buffer);
+     const size_t out_size = MapSizeBytes(image);
+     if (False(image.flags & ImageFlagBits::ZeroFilled)) {
+         // Until the decode lands (a second or more while title 1 streams ~40 textures a second)
+diff --git a/src/video_core/texture_cache/util.cpp b/src/video_core/texture_cache/util.cpp
+index d4500c1..fa224cc 100644
+--- a/src/video_core/texture_cache/util.cpp
++++ b/src/video_core/texture_cache/util.cpp
+@@ -528,6 +528,46 @@ void SwizzlePitchLinearImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr
+     }
+ }
+ 
++// With no depth interleaving, complete GOB block rows are contiguous guest ranges.
++// Restarting the decoder at a block-row boundary preserves both pitches and GOB offsets.
++// 3D block-depth interleaving, or a block row larger than the cap, keeps the whole path.
++template <bool swizzle>
++bool SwizzleBlockLinearSlices(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr,
++                              std::span<u8> output, std::span<const u8> input,
++                              u32 bytes_per_block, const Extent3D& tiles, const Extent3D& block,
++                              u32 stride_alignment, Common::ScratchBuffer<u8>& scratch) {
++    if (tiles.depth != 1 || block.depth != 0) return false;
++    const u32 rows_per_band = GOB_SIZE_Y << block.height;
++    const size_t row_bytes = size_t{Common::AlignUpLog2(tiles.width, stride_alignment)} * bytes_per_block;
++    const size_t band_bytes = Common::DivCeil(row_bytes, size_t{GOB_SIZE_X}) *
++                              (size_t{GOB_SIZE} << block.height);
++    if (band_bytes == 0 || band_bytes > MaxSwizzleScratchBytes) return false;
++    if (scratch.capacity() > MaxSwizzleScratchBytes) scratch.release();
++    const u32 bands_per_slice = static_cast<u32>(MaxSwizzleScratchBytes / band_bytes);
++    const u32 num_bands = Common::DivCeil(tiles.height, rows_per_band);
++    for (u32 band = 0; band < num_bands;) {
++        const u32 bands = (std::min)(bands_per_slice, num_bands - band);
++        const u32 y = band * rows_per_band;
++        const u32 height = (std::min)(bands * rows_per_band, tiles.height - y);
++        const size_t guest_offset = size_t{band} * band_bytes;
++        const size_t host_offset = size_t{y} * tiles.width * bytes_per_block;
++        const size_t bytes = size_t{bands} * band_bytes;
++        scratch.resize_destructive(bytes);
++        // Read before swizzling too: texels outside the image and row padding must survive.
++        gpu_memory.ReadBlockUnsafe(gpu_addr + guest_offset, scratch.data(), bytes);
++        if constexpr (swizzle) {
++            SwizzleTexture(scratch, input.subspan(host_offset), bytes_per_block, tiles.width,
++                           height, 1, block.height, 0, stride_alignment, gpu_memory.UsesNativeTiling());
++            gpu_memory.WriteBlockUnsafe(gpu_addr + guest_offset, scratch.data(), bytes);
++        } else {
++            UnswizzleTexture(output.subspan(host_offset), scratch, bytes_per_block, tiles.width,
++                             height, 1, block.height, 0, stride_alignment, gpu_memory.UsesNativeTiling());
++        }
++        band += bands;
++    }
++    return true;
++}
++
+ void SwizzleBlockLinearImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr,
+                              const ImageInfo& info, const BufferImageCopy& copy,
+                              std::span<const u8> input, Common::ScratchBuffer<u8>& tmp_buffer) {
+@@ -561,7 +601,10 @@ void SwizzleBlockLinearImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr
+ 
+     for (s32 layer = 0; layer < info.resources.layers; ++layer) {
+         const std::span<const u8> src = input.subspan(host_offset);
+-        {
++        if (!SwizzleBlockLinearSlices<true>(gpu_memory, gpu_addr + guest_offset, {}, src,
++                bytes_per_block, num_tiles, block,
++                StrideAlignment(num_tiles, info.block, BytesPerBlockLog2(info.format),
++                                info.tile_width_spacing), tmp_buffer)) {
+             Tegra::Memory::GpuGuestMemoryScoped<u8,
+                                                 Tegra::Memory::GuestMemoryFlags::UnsafeReadWrite>
+                 dst(gpu_memory, gpu_addr + guest_offset, subresource_size, &tmp_buffer);
+@@ -857,8 +900,9 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(Tegra::Memory
+                                                                    GPUVAddr gpu_addr,
+                                                                    const ImageInfo& info,
+                                                                    std::span<const u8> input,
+-                                                                   std::span<u8> output) {
+-    const size_t guest_size_bytes = input.size_bytes();
++                                                                   std::span<u8> output,
++                                                                   Common::ScratchBuffer<u8>* tmp_buffer) {
++    const size_t guest_size_bytes = input.empty() ? CalculateGuestSizeInBytes(info) : input.size_bytes();
+     const u32 bpp_log2 = BytesPerBlockLog2(info.format);
+     const Extent2D tile_size = DefaultBlockSize(info.format);
+     const Extent3D size = info.size;
+@@ -920,9 +964,23 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(Tegra::Memory
+ 
+         for (s32 layer = 0; layer < info.resources.layers; ++layer) {
+             const std::span<u8> dst = output.subspan(host_offset);
+-            const std::span<const u8> src = input.subspan(guest_offset + guest_layer_offset);
+-            UnswizzleTexture(dst, src, 1U << bpp_log2, num_tiles.width, num_tiles.height,
+-                             num_tiles.depth, block.height, block.depth, stride_alignment, gpu_memory.UsesNativeTiling());
++            const size_t offset = guest_offset + guest_layer_offset;
++            if (tmp_buffer) {
++                if (!SwizzleBlockLinearSlices<false>(gpu_memory, gpu_addr + offset, dst, {},
++                        1U << bpp_log2, num_tiles, block, stride_alignment, *tmp_buffer)) {
++                    Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead>
++                        src(gpu_memory, gpu_addr + offset, level_sizes[level], tmp_buffer);
++                    UnswizzleTexture(dst, src, 1U << bpp_log2, num_tiles.width, num_tiles.height,
++                                     num_tiles.depth, block.height, block.depth, stride_alignment,
++                                     gpu_memory.UsesNativeTiling());
++                }
++            } else {
++                // Callers holding a captured guest snapshot retain its exact contents.
++                const std::span<const u8> src = input.subspan(offset);
++                UnswizzleTexture(dst, src, 1U << bpp_log2, num_tiles.width, num_tiles.height,
++                                 num_tiles.depth, block.height, block.depth, stride_alignment,
++                                 gpu_memory.UsesNativeTiling());
++            }
+             guest_layer_offset += layer_stride;
+             host_offset += host_bytes_per_layer;
+         }
+diff --git a/src/video_core/texture_cache/util.h b/src/video_core/texture_cache/util.h
+index 2e741d9..5c49222 100644
+--- a/src/video_core/texture_cache/util.h
++++ b/src/video_core/texture_cache/util.h
+@@ -23,6 +23,9 @@ namespace VideoCommon {
+ 
+ using Tegra::Texture::TICEntry;
+ 
++// A guest block-row slice, shared by swizzle and unswizzle scratch.
++inline constexpr size_t MaxSwizzleScratchBytes = 16 * 1024 * 1024;
++
+ using LevelArray = std::array<u32, MAX_MIP_LEVELS>;
+ 
+ struct OverlapResult {
+@@ -71,7 +74,8 @@ struct OverlapResult {
+ 
+ [[nodiscard]] boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
+     Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
+-    std::span<const u8> input, std::span<u8> output);
++    std::span<const u8> input, std::span<u8> output,
++    Common::ScratchBuffer<u8>* tmp_buffer = nullptr);
+ 
+ /// Unswizzles only the blocks of a 2D block-linear image that overlap `dirty_ranges` (sorted,
+ /// non-overlapping [begin, end) byte offsets from the image start) into `output`. Returns no copies
+diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
+index a0832e6..e923c19 100644
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <bitset>
+ #include <chrono>
+ #include <filesystem>
+@@ -37,6 +38,25 @@
+ #include <android/api-level.h>
+ #endif
+ 
++#ifdef EDEN_NX2_PS5_PROTO
++namespace {
++// VMA reports real VkDeviceMemory block sizes, including unused space in those blocks.
++// Callbacks cannot allocate or query VMA again: it may hold its own allocator locks.
++static_assert(std::atomic<u64>::is_always_lock_free);
++std::atomic<u64> vma_device_bytes{0};
++void VKAPI_PTR TrackVmaAllocate(VmaAllocator, u32, VkDeviceMemory, VkDeviceSize bytes, void*) {
++    vma_device_bytes.fetch_add(bytes, std::memory_order_relaxed);
++}
++void VKAPI_PTR TrackVmaFree(VmaAllocator, u32, VkDeviceMemory, VkDeviceSize bytes, void*) {
++    vma_device_bytes.fetch_sub(bytes, std::memory_order_relaxed);
++}
++const VmaDeviceMemoryCallbacks memory_callbacks{TrackVmaAllocate, TrackVmaFree, nullptr};
++}
++extern "C" u64 eden_vulkan_memory_bytes() noexcept {
++    return vma_device_bytes.load(std::memory_order_relaxed);
++}
++#endif
++
+ namespace Vulkan {
+ using namespace Common::Literals;
+ namespace {
+@@ -758,7 +778,11 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR
+             // 1), which the texture cache counted as used and kept evicting textures for.
+             .preferredLargeHeapBlockSize = 64u * 1024u * 1024u,
+             .pAllocationCallbacks = nullptr,
++#ifdef EDEN_NX2_PS5_PROTO
++            .pDeviceMemoryCallbacks = &memory_callbacks,
++#else
+             .pDeviceMemoryCallbacks = nullptr,
++#endif
+             .pHeapSizeLimit = nullptr,
+             .pVulkanFunctions = &functions,
+             .instance = instance,

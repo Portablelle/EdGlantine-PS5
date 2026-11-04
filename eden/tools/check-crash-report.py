@@ -58,6 +58,19 @@ extern "C" int eden_exit_app(void) {
     (void)!write(1, "EXIT\n", 5);
     _exit(43);
 }
+// Memory-service providers are not linked by this check; preserve its non-OOM reports.
+extern "C" bool eden_guest_memory_oom(std::uint64_t*, std::uint64_t*, std::uint64_t*,
+                                      std::uint64_t*, std::uint64_t*) noexcept {
+    return false;
+}
+extern "C" void eden_direct_memory_free(std::int64_t* free_bytes, std::size_t* largest) noexcept {
+    *free_bytes = -1;
+    *largest = static_cast<std::size_t>(-1);
+}
+extern "C" void eden_direct_memory_failure_read(std::int64_t* free_bytes, std::size_t* largest) noexcept {
+    *free_bytes = std::int64_t{212} << 20;
+    *largest = std::size_t{130} << 20;
+}
 #ifdef PS5_NATIVE
 // The console calls the report makes.
 extern "C" int sceKernelDebugOutText(int, const char* text) { return static_cast<int>(write(2, text, std::strlen(text))); }
@@ -278,7 +291,8 @@ def check(binary, console):
     assert f'thread=CPUCore_1 report={reports[0]} restart=1' in err, err[-400:]
     assert ('memory: largest free block 1234 MiB of 12288 MiB, heap 256 MiB and 96 MiB in 3 large blocks\n' in report) \
         == console, report
-    assert ('heap refused: 1 request, the last of 134217728 bytes: the console had no memory for a new piece\n'
+    assert ('heap refused: 1 request, the last of 134217728 bytes: the console had no memory for a new piece '
+            '(free 212 MiB, largest 130 MiB at the time)\n'
             in report) == console, report
 
     # The functions, named from the report.

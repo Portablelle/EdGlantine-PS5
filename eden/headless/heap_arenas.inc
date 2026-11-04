@@ -75,6 +75,7 @@ static atomic_uint eden_heap_large_count;
 static atomic_size_t eden_heap_large_bytes;
 
 int sceKernelUsleep(unsigned int microseconds);
+int sceKernelDebugOutText(int channel, const char *text);
 
 /* Arena creation is rare (once per thread) but runs under a spin flag, and its holder also takes
  * an mspace lock. The emulated cores and the GPU thread run at real-time priority pinned to
@@ -105,6 +106,24 @@ unsigned long eden_heap_create_lock_state(unsigned *waiters) {
   if (waiters)
     *waiters = atomic_load_explicit(&eden_heap_create_waiters, memory_order_relaxed);
   return atomic_load_explicit(&eden_heap_create_holder, memory_order_relaxed);
+}
+
+/* Pool snapshots use kernel queries and lock-free atomics, including inside malloc. */
+void eden_direct_memory_failure_record(void);
+void eden_direct_memory_failure_read(int64_t *free_bytes, size_t *largest);
+
+static void eden_heap_grow_refused(const char *line);
+
+static void eden_heap_memory_refused(const char *reason) {
+  eden_direct_memory_failure_record();
+  int64_t free_bytes;
+  size_t largest;
+  eden_direct_memory_failure_read(&free_bytes, &largest);
+  char line[256];
+  snprintf(line, sizeof(line), "EDEN_HEAP_GROW refused: %s (free=%lldMiB largest_free=%lldMiB)\n",
+           reason, free_bytes < 0 ? -1LL : (long long)(free_bytes >> 20),
+           largest == (size_t)-1 ? -1LL : (long long)(largest >> 20));
+  eden_heap_grow_refused(line);
 }
 
 static void *eden_heap_owner(const void *address);
@@ -202,6 +221,7 @@ static void *eden_heap_large_allocate(size_t bytes) {
       continue;
     void *block = eden_heap_pages(bytes);
     if (block == NULL) {
+      eden_heap_memory_refused("the console has no memory for a large block");
       atomic_store_explicit(&eden_heap_large[i].address, 0, memory_order_release);
       return NULL;
     }
@@ -412,7 +432,7 @@ static int eden_heap_grow(size_t bytes, unsigned seen) {
       }
     } else {
       atomic_store_explicit(&eden_heap_grow_why, EDEN_HEAP_WHY_NO_MEMORY, memory_order_relaxed);
-      eden_heap_grow_refused("EDEN_HEAP_GROW refused: the console has no memory for a new piece\n");
+      eden_heap_memory_refused("the console has no memory for a new piece");
     }
   } else {
     atomic_store_explicit(&eden_heap_grow_why, EDEN_HEAP_WHY_AT_LIMIT, memory_order_relaxed);

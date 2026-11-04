@@ -19,6 +19,7 @@ python3 tests-nx2/check-sparse-owner.py
 python3 tests-nx2/check-memory-ranges.py
 python3 tests-nx2/check-eglantine.py
 python3 tests-nx2/check-isolation.py
+python3 tests-nx2/check-vulkan-port-anchors.py
 python3 tests-nx2/check-native.py
 python3 tests-nx2/run-mme.py
 python3 tools/check-exclusive-monitor.py

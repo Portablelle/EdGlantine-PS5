@@ -30,6 +30,9 @@ void UnlockSlot(SparseRange& r,size_t,unsigned state){assert(r.locked);r.state=s
 bool PromoteZero(SparseRange& r,size_t){if(fail_promote)return false;return mprotect((void*)r.begin.load(),SparseSlot,PROT_READ|PROT_WRITE)==0;}
 bool PromoteShared(SparseRange& r,size_t s){return PromoteZero(r,s);}
 bool PromoteFine(SparseRange& r,size_t s){return PromoteZero(r,s);}
+// The extracted handler's diagnostic formatter is outside this retry check's scope.
+struct OomNoticeLine { char data[1]{}; };
+void FormatOomNotice(OomNoticeLine&,std::uint64_t){}
 void Note(const char*){}
 '''
 main=r'''
