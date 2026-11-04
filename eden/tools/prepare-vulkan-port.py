@@ -639,15 +639,14 @@ adapt('src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp', 'vulkan_stagi
      '}\n'),
     ('        .size = 1ULL << log2_size,\n', '        .size = made,\n'),
     ('    vk::Buffer buffer = memory_allocator.CreateBuffer(buffer_ci, usage);\n',
-     '    vk::Buffer buffer;\n'
-     '    try {\n'
-     '        buffer = memory_allocator.CreateBuffer(buffer_ci, usage);\n'
-     '    } catch (const vk::Exception& refused) {\n'
-     '        if (refused.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY) {\n'
-     '            throw;\n'
-     '        }\n'
-     '        // Refused: the kept buffers the GPU is done with go, and the buffer is asked for once\n'
-     '        // more. Refused again, the error goes on as before.\n'
+     '    // Refused: the kept buffers the GPU is done with go, and the buffer is asked for once more;\n'
+     '    // refused again, the texture cache lets go of what it can and it is asked for a last time.\n'
+     '    std::int64_t pool_free = -1;\n'
+     '    std::size_t largest = static_cast<std::size_t>(-1);\n'
+     '    vk::Buffer buffer = ::Eden::StagingBuffers::MakeOrReclaim<vk::Exception>(\n'
+     '        [&] { return memory_allocator.CreateBuffer(buffer_ci, usage); },\n'
+     '        [](const vk::Exception& refused) { return refused.GetResult() == VK_ERROR_OUT_OF_DEVICE_MEMORY; },\n'
+     '        [&] {\n'
      '        const auto idle = [this](const StagingBuffer& entry) {\n'
      '            return !entry.deferred && scheduler.IsFree(entry.tick);\n'
      '        };\n'
@@ -657,15 +656,22 @@ adapt('src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp', 'vulkan_stagi
      '                released += ::Eden::StagingBuffers::ReleaseFrom(level, idle);\n'
      '            }\n'
      '        }\n'
-     '        std::int64_t pool_free = -1;\n'
-     '        std::size_t largest = static_cast<std::size_t>(-1);\n'
      '        if (eden_direct_memory_free) eden_direct_memory_free(&pool_free, &largest);\n'
      '        std::fprintf(stderr, "EDEN_STAGING_OOM asked=%zu made=%llu released=%zu buffers (%llu MiB), then free=%lldMiB "\n'
      '                     "largest_free=%lldMiB\\n", size, static_cast<unsigned long long>(made), released.buffers,\n'
      '                     static_cast<unsigned long long>(released.bytes >> 20), pool_free < 0 ? -1ll : pool_free >> 20,\n'
      '                     largest == static_cast<std::size_t>(-1) ? -1ll : static_cast<long long>(largest >> 20));\n'
-     '        buffer = memory_allocator.CreateBuffer(buffer_ci, usage);\n'
-     '    }\n'
+     '        },\n'
+     '        [&] {\n'
+     '        const std::int64_t before = pool_free;\n'
+     '        const std::size_t images = reclaim ? reclaim() : 0;\n'
+     '        if (eden_direct_memory_free) eden_direct_memory_free(&pool_free, &largest);\n'
+     '        std::fprintf(stderr, "EDEN_VRAM_RECLAIM asked=%zu made=%llu destroyed=%zu deleted images, freed=%lldMiB "\n'
+     '                     "then free=%lldMiB largest_free=%lldMiB\\n", size, static_cast<unsigned long long>(made), images,\n'
+     '                     before < 0 || pool_free < 0 ? -1ll : static_cast<long long>((pool_free - before) >> 20),\n'
+     '                     pool_free < 0 ? -1ll : pool_free >> 20,\n'
+     '                     largest == static_cast<std::size_t>(-1) ? -1ll : static_cast<long long>(largest >> 20));\n'
+     '        });\n'
      '    // A large buffer smaller than the power of two: the 1st, 2nd, 4th, 8th ... in the log.\n'
      '    if (exact && made >= (VkDeviceSize{64} << 20) && made < (VkDeviceSize{1} << log2_size)) {\n'
      '        static std::atomic<unsigned long long> large{0};\n'
@@ -680,7 +686,7 @@ adapt('src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp', 'vulkan_stagi
 ])
 # Development A/B switches for device features (headless/dev_vulkan.h, dev-settings).
 adapt('src/video_core/vulkan_common/vulkan_device.cpp', 'vulkan_device.cpp', [
-    ('#include <algorithm>', '#include <algorithm>\n#include <cstdio>\n#include "dev_vulkan.h"\n#include "performance.h"'),
+    ('#include <algorithm>', '#include <algorithm>\n#include <cstdio>\n#include "dev_vulkan.h"\n#include "graphics_usage.h"\n#include "performance.h"'),
     # The allocator counts what it holds itself instead of asking the driver. The driver's figures
     # are wrong on the console: it counts each allocation of graphics memory twice (as VRAM and as
     # visible VRAM), so the allocator saw the budget of the 8 GiB heap used up at 4 GiB. From there
@@ -691,7 +697,8 @@ adapt('src/video_core/vulkan_common/vulkan_device.cpp', 'vulkan_device.cpp', [
     ('    if (extensions.memory_budget) {\n        flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;\n    }\n',
      '    // The driver\'s budget is not asked for: its count is double (tools/prepare-vulkan-port.py).\n'),
     # "Memory in use" for the texture and buffer caches: on the console, the budget less what is
-    # left of the pool the CPU shares with the GPU (performance.h, graphics_memory_free).
+    # left of the pool the CPU shares with the GPU (performance.h, graphics_memory_free), less the
+    # last 1.25 GiB of it (graphics_usage.h).
     ('u64 Device::GetDeviceMemoryUsage() const {\n',
      'namespace {\n'
      '// The largest block of the shared pool that was free when the device was made: about the most\n'
@@ -701,14 +708,8 @@ adapt('src/video_core/vulkan_common/vulkan_device.cpp', 'vulkan_device.cpp', [
      'u64 Device::GetDeviceMemoryUsage() const {\n'
      '    if (const auto free_memory = ::Eden::Performance::graphics_memory_free.load(std::memory_order_relaxed);\n'
      '        free_memory && ::Eden::Performance::graphics_usage_from_pool.load(std::memory_order_relaxed)) {\n'
-     '        // The caches evict what is unused 1.6 GiB under the budget and evict hard 0.8 GiB under\n'
-     '        // it. Where the pool could never give graphics 6.4 GiB, those marks become a quarter\n'
-     '        // and an eighth of what it could give.\n'
-     '        const double scale = graphics_capacity != 0 && graphics_capacity < 6400_MiB\n'
-     '                                 ? static_cast<double>(6400_MiB) / static_cast<double>(graphics_capacity)\n'
-     '                                 : 1.0;\n'
-     '        const u64 free_bytes = static_cast<u64>(static_cast<double>(free_memory()) * scale);\n'
-     '        return device_access_memory > free_bytes ? device_access_memory - free_bytes : 0;\n'
+     '        // The last 1.25 GiB of the pool do not count as room for graphics (graphics_usage.h).\n'
+     '        return ::Eden::GraphicsUsage::Usage(device_access_memory, free_memory(), graphics_capacity);\n'
      '    }\n'),
     ('    extensions.descriptor_buffer = features.descriptor_buffer.descriptorBuffer;',
      '    extensions.descriptor_buffer = features.descriptor_buffer.descriptorBuffer &&\n'

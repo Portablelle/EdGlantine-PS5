@@ -13,7 +13,9 @@
 // the transfer, and one too small for a new transfer is let go before the new one is made.
 //
 // When the console refuses a buffer, every kept one the GPU is done with is let go and the buffer
-// is asked for once more.
+// is asked for once more. Refused again, the texture cache lets go of what it can at once (the
+// images it already deleted, once the GPU is idle; StagingBufferPool::reclaim) and the buffer is
+// asked for a last time: a 128 MiB buffer refused twice ended a session with 470 MiB free.
 //
 // Eden lets go of kept buffers slowly (16 of one power of two per frame), so a loading burst left
 // 610 MiB of them idle in the shared pool while the CPU was refused 361 MiB (issue #20). Each frame
@@ -74,6 +76,25 @@ Released ReleaseFrom(Level& level, Drop&& drop) {
     if (level.delete_index >= entries.size()) level.delete_index = 0;
     if (level.iterate_index > entries.size()) level.iterate_index = 0;
     return released;
+}
+
+// Makes a buffer with `make`. Refused (a `Refusal` that `refused` accepts), `release` runs and it
+// is asked for again; refused again, `reclaim` runs and it is asked for once more; refused a third
+// time, the error goes on. Any other error goes on at once.
+template <class Refusal, class Make, class Refused, class Release, class Reclaim>
+auto MakeOrReclaim(Make&& make, Refused&& refused, Release&& release, Reclaim&& reclaim) {
+    for (int refusals = 0;; ++refusals) {
+        try {
+            return make();
+        } catch (const Refusal& error) {
+            if (!refused(error) || refusals == 2) throw;
+        }
+        if (refusals == 0) {
+            release();
+        } else {
+            reclaim();
+        }
+    }
 }
 
 // How many bytes of idle kept buffers may stay: kIdleKept, or none when the pool's largest free

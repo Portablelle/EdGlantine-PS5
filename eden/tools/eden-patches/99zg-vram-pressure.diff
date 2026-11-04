@@ -1,0 +1,203 @@
+diff --git a/src/video_core/delayed_destruction_ring.h b/src/video_core/delayed_destruction_ring.h
+--- a/src/video_core/delayed_destruction_ring.h
++++ b/src/video_core/delayed_destruction_ring.h
+@@ -26,6 +26,16 @@
+         elements[index].push_back(std::move(object));
+     }
+ 
++    /// Destroys every object now (the caller made sure the GPU is done with them). Returns how many.
++    size_t Clear() {
++        size_t count = 0;
++        for (auto& objects : elements) {
++            count += objects.size();
++            objects.clear();
++        }
++        return count;
++    }
++
+ private:
+     size_t index = 0;
+     std::array<std::vector<T>, TICKS_TO_DESTROY> elements;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -256,9 +256,17 @@
+       wfi_event(device.GetLogical().CreateEvent()) {
+     native_capture_session = std::make_unique<NativeDrawCaptureSession>();
+     scheduler.SetQueryCache(query_cache);
++    // try_lock: the thread that was refused holds the texture cache lock when it was refused in
++    // texture cache work (the lock is recursive), and otherwise may hold another cache's lock
++    // that a thread holding this one waits for. Not taken, nothing is reclaimed.
++    staging_pool.reclaim = [this]() -> size_t {
++        std::unique_lock lock{texture_cache.mutex, std::try_to_lock};
++        return lock.owns_lock() ? texture_cache.ReclaimMemory() : 0;
++    };
+ }
+ 
+ RasterizerVulkan::~RasterizerVulkan() {
++    staging_pool.reclaim = nullptr;
+     scheduler.WaitWorker();
+     scheduler.Finish();
+ #ifdef EDEN_NX2_PS5_PROTO
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <climits>
++#include <functional>
+ #include <vector>
+ 
+ #include "common/common_types.h"
+@@ -46,6 +47,10 @@
+ 
+     void TickFrame();
+ 
++    /// Run when graphics memory is refused even after the idle kept buffers went: frees what the
++    /// texture cache holds and can let go (RasterizerVulkan sets it). Returns how many images went.
++    std::function<size_t()> reclaim;
++
+ private:
+     struct StreamBufferCommit {
+         size_t upper_bound;
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -21,6 +21,7 @@
+ #include <boost/container/small_vector.hpp>
+ 
+ #include "common/alignment.h"
++#include "common/scope_exit.h"
+ #include "common/settings.h"
+ #include "common/slot_vector.h"
+ #include "video_core/control/channel_state.h"
+@@ -302,6 +303,25 @@
+     }
+ }
+ 
++template <class P>
++size_t TextureCache<P>::ReclaimMemory() {
++    // Called when graphics memory is refused (vk_staging_buffer_pool.cpp), from inside texture
++    // cache work: JoinImages holds the ids of the images it merges and PrepareImage touches an
++    // image only after uploading it, so evicting images here could delete one still in use. The
++    // images already deleted wait TICKS_TO_DESTROY frames for the GPU in sentenced_images; once
++    // the GPU is idle they can go now. The next frame's collector evicts in aggressive mode.
++    if (reclaiming) {
++        return 0; // Finish() asked for memory again
++    }
++    reclaiming = true;
++    SCOPE_EXIT {
++        reclaiming = false;
++    };
++    reclaim_requested = true;
++    runtime.Finish();
++    return sentenced_images.Clear();
++}
++
+ template <class P>
+ void TextureCache<P>::TickFrame() {
+     for (auto* scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
+@@ -411,6 +431,11 @@
+         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
+         images_created = images_deleted = 0;
+     }
++    if (std::exchange(reclaim_requested, false)) {
++        // Graphics memory was refused since the last frame (ReclaimMemory): collect as if 1 GiB
++        // over the critical mark, so the aggressive pass frees up to 1 GiB of unused images.
++        total_used_memory = (std::max)(total_used_memory, critical_memory + 1_GiB);
++    }
+     if (total_used_memory > minimum_memory) {
+         RunGarbageCollector();
+     }
+@@ -1578,7 +1603,7 @@
+     uploaded_bytes += image.guest_size_bytes;
+     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
+     const auto upload_start = std::chrono::steady_clock::now();
+-    if (!UploadInChunks(image)) {
++    if (!UploadConvertedInChunks(image) && !UploadInChunks(image)) {
+         auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
+         UploadImageContents(image, staging);
+         runtime.InsertUploadMemoryBarrier();
+@@ -3213,6 +3238,46 @@
+     return true;
+ }
+ 
++template <class P>
++bool TextureCache<P>::UploadConvertedInChunks(Image& image) {
++    // A converted image (ASTC kept as BC1/BC3) was staged whole: a 1434x1434 array of 46 layers
++    // asked for 121 MiB in one block and the console refused it, with blocks of 80 MiB free
++    // (issue #20). ConvertImage treats layers independently, so groups of layers of at most
++    // 32 MiB are converted into their own staging buffer and uploaded in turn: same bytes.
++    constexpr u64 chunk_size = 32_MiB;
++    constexpr ImageFlagBits excluded = ImageFlagBits::Sparse | ImageFlagBits::AcceleratedUpload |
++                                       ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels;
++    const u32 layers = static_cast<u32>(image.info.resources.layers);
++    const u64 total = MapSizeBytes(image);
++    if (False(image.flags & ImageFlagBits::Converted) || True(image.flags & excluded) ||
++        image.info.type != ImageType::e2D || layers < 2 || total <= chunk_size || total % layers != 0) {
++        return false;
++    }
++    unswizzle_data_buffer.resize_destructive(image.unswizzled_size_bytes);
++    const auto copies = FixSmallVectorADL(UnswizzleImage(*gpu_memory, image.gpu_addr, image.info, {},
++                                                         unswizzle_data_buffer, &swizzle_data_buffer));
++    const u64 layer_size = total / layers;
++    const u32 group = static_cast<u32>((std::max<u64>)(1, chunk_size / layer_size));
++    for (u32 first = 0; first < layers; first += group) {
++        const u32 count = (std::min)(group, layers - first);
++        auto group_copies = copies;
++        for (auto& copy : group_copies) {
++            const size_t input_layer = copy.buffer_size / layers;
++            copy.buffer_offset += first * input_layer;
++            copy.buffer_size = count * input_layer;
++            copy.image_subresource.num_layers = static_cast<s32>(count);
++        }
++        auto staging = runtime.UploadStagingBuffer(layer_size * count);
++        ConvertImage(unswizzle_data_buffer, image.info, staging.mapped_span, group_copies);
++        for (auto& copy : group_copies) {
++            copy.image_subresource.base_layer = static_cast<s32>(first);
++        }
++        image.UploadMemory(staging, group_copies);
++    }
++    runtime.InsertUploadMemoryBarrier();
++    return true;
++}
++
+ template <class P>
+ bool TextureCache<P>::MarkPartialRemap(ImageBase& image, GPUVAddr gpu_addr, size_t size) {
+     if (CanUploadSparsePartial(image)) {
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -190,6 +190,11 @@
+     /// Notify the cache that a new frame has been queued
+     void TickFrame();
+ 
++    /// Graphics memory was refused: waits for the GPU, destroys the images already deleted and
++    /// makes the next frame's collector aggressive. Returns how many images it destroyed. Lock
++    /// `mutex` first.
++    size_t ReclaimMemory();
++
+     /// Return a constant reference to the given image view id
+     [[nodiscard]] const ImageView& GetImageView(ImageViewId id) const noexcept;
+ 
+@@ -431,6 +436,10 @@
+     /// Uploads a large plain 2D image in chunks; false if it does not qualify.
+     bool UploadInChunks(Image& image);
+ 
++    /// Converts and uploads a large converted 2D array a few layers at a time; false if it does
++    /// not qualify.
++    bool UploadConvertedInChunks(Image& image);
++
+     /// Records a GPU remap of a small part of a large 2D image for a partial re-upload instead of
+     /// marking the whole image remapped (which replaces it). False if the image does not qualify.
+     bool MarkPartialRemap(ImageBase& image, GPUVAddr gpu_addr, size_t size);
+@@ -520,6 +529,8 @@
+ 
+     bool has_deleted_images = false;
+     bool is_rescaling = false;
++    bool reclaim_requested = false;
++    bool reclaiming = false;
+     u64 total_used_memory = 0;
+     u64 minimum_memory;
+     u64 expected_memory;
