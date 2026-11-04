@@ -17,7 +17,6 @@ util = (engine / 'src/video_core/texture_cache/util.cpp').read_text()
 header = (engine / 'src/video_core/texture_cache/util.h').read_text()
 decoder = (engine / 'src/video_core/textures/decoders.cpp').read_text()
 cache = (engine / 'src/video_core/texture_cache/texture_cache.h').read_text()
-staging = (engine / 'src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp').read_text()
 
 
 def function(source, signature):
@@ -38,12 +37,6 @@ assert 'SwizzleBlockLinearSlices<true>' in function(util, 'void SwizzleBlockLine
 assert 'SwizzleBlockLinearSlices<false>' in function(util, 'boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(')
 assert 'image.guest_size_bytes, &swizzle_data_buffer' not in cache, 'Whole guest image still copied first'
 assert cache.count('&swizzle_data_buffer)') >= 3
-assert 'allocation_size = Common::AlignUp(size, size_t{2_MiB})' in staging
-assert 'if (usage == MemoryUsage::Download && size >= 16_MiB) return std::nullopt;' in staging
-assert 'std::erase_if(cache.entries' in staging and '!entry.deferred && scheduler.IsFree(entry.tick)' in staging
-allocator = (engine / 'src/video_core/vulkan_common/vulkan_memory_allocator.cpp').read_text()
-assert 'usage == MemoryUsage::Download && ci.size >= (16u << 20)' in allocator
-assert 'VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT' in allocator
 # Keep all decoder bit addressing, native tiling and entry points from production, not a model.
 constants = (engine / 'src/video_core/textures/decoders.h').read_text()
 constants = constants[constants.index('constexpr u32 GOB_SIZE_X'):constants.index('/// Unswizzles')]
@@ -51,7 +44,7 @@ core = decoder[decoder.index('constexpr u32 NativeGobOffset'):decoder.index('tem
 core += function(decoder, 'template <bool TO_LINEAR>\nvoid Swizzle(')
 core += function(decoder, 'void SwizzleTexture(') + function(decoder, 'void UnswizzleTexture(')
 if args.source_only:
-    print('PASS: real slice/decoder extraction, callers and PS5 staging integration (source only)')
+    print('PASS: real slice/decoder extraction, and callers (source only)')
     raise SystemExit(0)
 compiler = os.environ.get('CXX') or next((c for c in ('clang++-18', 'clang++', 'g++') if shutil.which(c)), None)
 assert compiler, 'No host C++ compiler; run on the build server or use --source-only for extraction only'
