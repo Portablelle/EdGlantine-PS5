@@ -64,10 +64,23 @@ diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h b/src/video
 diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
 --- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
 +++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
-@@ -1123,6 +1123,17 @@ StagingBufferRef TextureCacheRuntime::DownloadStagingBuffer(size_t size, bool de
+@@ -1123,6 +1123,30 @@ StagingBufferRef TextureCacheRuntime::DownloadStagingBuffer(size_t size, bool de
      return staging_buffer_pool.Request(size, MemoryUsage::Download, deferred);
  }
  
++// The console's direct memory pool (performance.cpp); absent elsewhere.
++extern "C" void eden_direct_memory_free(std::int64_t*, std::size_t*) noexcept __attribute__((weak));
++
++bool TextureCacheRuntime::AheadReadbackFits(size_t size, size_t& largest_free) const {
++    largest_free = SIZE_MAX;
++    // Small readbacks are not weighed: asking the pool for its largest free block walks it.
++    if (eden_direct_memory_free && size >= (size_t{16} << 20)) {
++        std::int64_t pool_free = -1;
++        eden_direct_memory_free(&pool_free, &largest_free);
++    }
++    return VideoCommon::AheadReadbackFits(largest_free, size);
++}
++
 +std::optional<StagingBufferRef> TextureCacheRuntime::TryDownloadStagingBuffer(size_t size, bool deferred) {
 +    try {
 +        return staging_buffer_pool.Request(size, MemoryUsage::Download, deferred);
@@ -93,7 +106,7 @@ diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/
  #include <span>
  
  #include "video_core/texture_cache/texture_cache_base.h"
-@@ -57,6 +58,10 @@ public:
+@@ -57,6 +58,14 @@ public:
  
      StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);
  
@@ -101,22 +114,27 @@ diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/
 +    /// own retries: a readback can be skipped, a session cannot be resumed (issue #20).
 +    std::optional<StagingBufferRef> TryDownloadStagingBuffer(size_t size, bool deferred = false);
 +
++    /// Whether a readback of `size` bytes queued ahead of a CPU read leaves the pool its reserve
++    /// (AheadReadbackFits, pending_download.h). `largest_free`: the block it was weighed against.
++    bool AheadReadbackFits(size_t size, size_t& largest_free) const;
++
      void FreeDeferredStagingBuffer(StagingBufferRef& ref);
  
      void TickFrame();
 diff --git a/src/video_core/texture_cache/pending_download.h b/src/video_core/texture_cache/pending_download.h
 --- a/src/video_core/texture_cache/pending_download.h
 +++ b/src/video_core/texture_cache/pending_download.h
-@@ -3,6 +3,8 @@
+@@ -3,6 +3,9 @@
  #pragma once
  
  #include <algorithm>
 +#include <atomic>
++#include <cstdint>
 +#include <cstdio>
  #include <memory>
  #include <unordered_set>
  #include <cstddef>
-@@ -55,4 +57,42 @@ bool RetainPendingImageDownloads(Common::SlotId id, Image& image, Downloads& pen
+@@ -55,4 +58,62 @@ bool RetainPendingImageDownloads(Common::SlotId id, Image& image, Downloads& pen
      return retained != nullptr;
  }
  
@@ -148,13 +166,33 @@ diff --git a/src/video_core/texture_cache/pending_download.h b/src/video_core/te
 +    return dropped;
 +}
 +
-+// EDEN_READBACK_SKIPPED in stderr: the 1st, 2nd, 4th, 8th ... skip.
-+inline void ReportDroppedReadbacks(const char* kind, const DroppedReadbacks& dropped) {
++// What the pool's largest free block must keep after a readback queued ahead of a CPU read
++// (CommitAsyncFlushes): the reserve the texture cache already leaves the CPU
++// (headless/graphics_usage.h, kReserve). Issue #20, run of #26 at 3e0e601: such a 144 MiB readback
++// was refused, the pool's idle buffers went and it was made with 430 MiB free; a moment later the
++// CPU heap could not get 16 MiB and the session ended in std::bad_alloc. A readback the CPU waits
++// for (DownloadMemory) does not keep it.
++inline constexpr std::uint64_t kAheadReadbackReserve = std::uint64_t{1280} << 20;
++
++// Whether a readback of `size` bytes queued ahead leaves kAheadReadbackReserve of the pool's
++// largest free block (`largest_free`, SIZE_MAX when unknown: always).
++constexpr bool AheadReadbackFits(std::size_t largest_free, std::size_t size) noexcept {
++    return largest_free == SIZE_MAX || (largest_free >= size && largest_free - size >= kAheadReadbackReserve);
++}
++
++// EDEN_READBACK_SKIPPED in stderr: the 1st, 2nd, 4th, 8th ... skip. `largest_free`: the pool's
++// largest free block when the pool was too low (kind=ahead), SIZE_MAX otherwise.
++inline void ReportDroppedReadbacks(const char* kind, const DroppedReadbacks& dropped,
++                                   std::size_t largest_free = SIZE_MAX) {
 +    static std::atomic<unsigned long long> skips{0};
 +    const auto times = skips.fetch_add(1, std::memory_order_relaxed) + 1;
 +    if ((times & (times - 1)) == 0) {
-+        std::fprintf(stderr, "EDEN_READBACK_SKIPPED kind=%s images=%zu bytes=%zu: graphics memory refused "
-+                     "the staging buffer (%llu so far)\n", kind, dropped.images, dropped.bytes, times);
++        std::fprintf(stderr, "EDEN_READBACK_SKIPPED kind=%s images=%zu bytes=%zu largest_free=%lldMiB: %s "
++                     "(%llu so far)\n", kind, dropped.images, dropped.bytes,
++                     largest_free == SIZE_MAX ? -1ll : static_cast<long long>(largest_free >> 20),
++                     largest_free == SIZE_MAX ? "graphics memory refused the staging buffer"
++                                              : "the pool would keep less than its 1280 MiB reserve",
++                     times);
 +    }
 +}
 +
@@ -208,7 +246,7 @@ diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/textu
      if (total_used_memory > minimum_memory) {
          RunGarbageCollector();
      }
-@@ -1259,16 +1284,27 @@ void TextureCache<P>::CommitAsyncFlushes() {
+@@ -1259,16 +1284,37 @@ void TextureCache<P>::CommitAsyncFlushes() {
                                  image.info.layer_stride, image.guest_size_bytes, image.unswizzled_size_bytes);
                  }
              }
@@ -219,16 +257,26 @@ diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/textu
 -                    const auto copies = FixSmallVectorADL(FullDownloadCopies(image.info));
 -                    image.DownloadMemory(download_map, copies);
 -                    download_map.offset += Common::AlignUp(image.unswizzled_size_bytes, 64);
-+            // Refused even after the pool's retries, these readbacks are skipped rather than the
-+            // session ended (DropImageReadbacks, pending_download.h).
++            // These readbacks are queued ahead of a CPU read. They are skipped rather than the
++            // session ended when graphics memory refuses them even after the pool's retries, and
++            // are not made at all where the pool would keep less than its reserve
++            // (DropImageReadbacks, AheadReadbackFits: pending_download.h).
 +            std::optional<decltype(runtime.DownloadStagingBuffer(total_size_bytes, true))> download_map;
-+            if constexpr (requires(Runtime& r) { r.TryDownloadStagingBuffer(size_t{}, true); }) {
-+                download_map = runtime.TryDownloadStagingBuffer(total_size_bytes, true);
-+            } else {
-+                download_map = runtime.DownloadStagingBuffer(total_size_bytes, true);
++            size_t largest_free = SIZE_MAX;
++            bool fits = true;
++            if constexpr (requires(const Runtime& r, size_t& l) { r.AheadReadbackFits(size_t{}, l); }) {
++                fits = runtime.AheadReadbackFits(total_size_bytes, largest_free);
++            }
++            if (fits) {
++                if constexpr (requires(Runtime& r) { r.TryDownloadStagingBuffer(size_t{}, true); }) {
++                    download_map = runtime.TryDownloadStagingBuffer(total_size_bytes, true);
++                } else {
++                    download_map = runtime.DownloadStagingBuffer(total_size_bytes, true);
++                }
 +            }
 +            if (!download_map) {
-+                ReportDroppedReadbacks("async", DropImageReadbacks(download_ids, slot_images));
++                ReportDroppedReadbacks(fits ? "async" : "ahead", DropImageReadbacks(download_ids, slot_images),
++                                       fits ? SIZE_MAX : largest_free);
 +            } else {
 +                for (const PendingDownload& download_info : download_ids) {
 +                    if (download_info.is_swizzle) {
@@ -244,7 +292,7 @@ diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/textu
          }
  
          async_buffers.emplace_back(std::move(uncommitted_async_buffers));
-@@ -1578,7 +1614,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+@@ -1578,7 +1624,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
      uploaded_bytes += image.guest_size_bytes;
      largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
      const auto upload_start = std::chrono::steady_clock::now();
@@ -253,7 +301,7 @@ diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/textu
          auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
          UploadImageContents(image, staging);
          runtime.InsertUploadMemoryBarrier();
-@@ -3213,6 +3249,46 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
+@@ -3213,6 +3259,46 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
      return true;
  }
  

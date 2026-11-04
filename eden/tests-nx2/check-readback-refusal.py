@@ -13,6 +13,12 @@ image readbacks when TryDownloadStagingBuffer gives nothing, and still downloads
 the production synchronous batch (headless/vulkan_download_batch.inc, as generated) publishes what
 it copied and leaves the refused image and the ones after it GPU-modified. Then checks the
 generated staging pool names the refused transfer's kind. Fails on 3d82baf.
+
+Run of 3e0e601 (00.065.027): that readback was refused once, the pool's idle buffers went and it
+was made with 430 MiB free; a moment later the CPU heap could not get 16 MiB and the session ended
+in std::bad_alloc. A readback queued ahead of a CPU read is now not made where the pool's largest
+free block would keep less than the texture cache's 1280 MiB reserve (AheadReadbackFits): checked
+at that run's numbers, with CommitAsyncFlushes. Fails on 3e0e601.
 """
 from pathlib import Path
 import os
@@ -57,6 +63,13 @@ for needed in ('staging_buffer_pool.Request(size, MemoryUsage::Download, deferre
 cache = (src / 'video_core/texture_cache/texture_cache.h').read_text()
 commit = function(cache, 'void TextureCache<P>::CommitAsyncFlushes() {')
 batch = (root / 'headless/vulkan_download_batch.inc').read_text()
+if 'AheadReadbackFits' not in pending:
+    print('FAIL: a readback queued ahead of a CPU read takes the pool\'s last memory (no AheadReadbackFits)')
+    sys.exit(1)
+fits = function(runtime_source, 'bool TextureCacheRuntime::AheadReadbackFits(')
+for needed in ('eden_direct_memory_free(&pool_free, &largest_free)', 'VideoCommon::AheadReadbackFits(largest_free, size)'):
+    assert needed in fits, 'TextureCacheRuntime::AheadReadbackFits lacks: ' + needed
+assert 'AheadReadbackFits' not in batch, 'A readback the CPU waits for must not be held to the reserve'
 assert 'TryDownloadStagingBuffer' in batch, 'The synchronous download batch still ends the session on a refusal'
 
 test = r'''
@@ -76,6 +89,9 @@ test = r'''
 #include "common/literals.h"
 #include "common/slot_vector.h"
 #include "video_core/texture_cache/pending_download.h"
+#include "graphics_usage.h"
+static_assert(VideoCommon::kAheadReadbackReserve == Eden::GraphicsUsage::kReserve,
+              "the readback reserve is the texture cache's");
 using namespace Common::Literals;
 
 namespace VideoCommon {
@@ -115,12 +131,18 @@ inline void SwizzleImage(Gpu&, u64, const Info&, std::span<const Copy>, std::spa
 namespace Vulkan {
 struct TextureCacheRuntime {
     std::size_t free_bytes = 0;  // largest staging buffer graphics memory still gives
-    int refusals = 0;
+    std::size_t largest = SIZE_MAX;  // the pool's largest free block, as the console reports it
+    int refusals = 0, requests = 0;
+    bool AheadReadbackFits(std::size_t size, std::size_t& largest_free) const {
+        largest_free = largest;
+        return VideoCommon::AheadReadbackFits(largest_free, size);
+    }
     VideoCommon::Map DownloadStagingBuffer(std::size_t size, bool = false) {
         assert(false && "the refusable request must be used");
         return {};
     }
     std::optional<VideoCommon::Map> TryDownloadStagingBuffer(std::size_t size, bool = false) {
+        ++requests;
         if (size > free_bytes) { ++refusals; return std::nullopt; }
         VideoCommon::Map map{0, size, std::vector<u8>(size)};
         map.mapped_span = map.bytes;
@@ -184,19 +206,40 @@ int main() {
     cache.CommitAsyncFlushes();
     assert(downloads == 2 && cache.committed_downloads.back().size() == 2 && cache.async_buffers.back().size() == 1);
 
-    // The synchronous batch: the 9 MiB image is copied and published, the 144 MiB one is refused.
+    // The run of 3e0e601: 144 MiB queued ahead with 182 MiB in the largest free block after the
+    // idle buffers went (made, then the heap was refused 16 MiB). Now not asked for at all.
+    static_assert(!AheadReadbackFits(182_MiB, 144_MiB) && !AheadReadbackFits(1198_MiB, 144_MiB));
+    static_assert(AheadReadbackFits(1424_MiB, 144_MiB) && AheadReadbackFits(4396_MiB, 144_MiB));
+    static_assert(AheadReadbackFits(SIZE_MAX, 144_MiB) && !AheadReadbackFits(100_MiB, 144_MiB));
+    downloads = 0;
+    const int asked = cache.runtime.requests;
+    cache.slot_images[target].info.forced_flushed = true;
+    cache.runtime.largest = 182_MiB;
+    cache.uncommitted_downloads = {{true, 0, target}, {false, 0, {}}};
+    cache.CommitAsyncFlushes();
+    assert(cache.runtime.requests == asked && downloads == 0);
+    assert(cache.committed_downloads.back().size() == 1 && !cache.committed_downloads.back()[0].is_swizzle);
+    assert(!cache.slot_images[target].info.forced_flushed);
+    cache.runtime.largest = 4396_MiB;
+    cache.uncommitted_downloads = {{true, 0, target}};
+    cache.CommitAsyncFlushes();
+    assert(cache.runtime.requests == asked + 1 && downloads == 1);
+
+    // The synchronous batch (not held to the reserve: the CPU waits for it): the 9 MiB image is copied and published, the 144 MiB one is refused.
     downloads = swizzles = 0;
     cache.slot_images[target].info.forced_flushed = true;
     cache.slot_images[target].flags = {};
     cache.slot_images[small].flags = {};
     cache.runtime.free_bytes = 128_MiB;
+    cache.runtime.largest = 182_MiB;
     cache.DownloadMemory({small, target});
     assert(downloads == 1 && swizzles == 1);
     assert(!True(cache.slot_images[small].flags & ImageFlagBits::GpuModified));
     assert(True(cache.slot_images[target].flags & ImageFlagBits::GpuModified));
     assert(!cache.slot_images[target].info.forced_flushed);
     std::printf("PASS: a refused 144 MiB readback is skipped (async: buffer readbacks kept, forced_flushed reset; "
-                "sync: copied images published, the rest left GPU-modified); with memory it is read back\n");
+                "sync: copied images published, the rest left GPU-modified); with memory it is read back; queued ahead, "
+                "it is not asked for where the pool would keep less than 1280 MiB (182 MiB left at 3e0e601)\n");
 }
 '''
 
@@ -209,7 +252,7 @@ with tempfile.TemporaryDirectory(prefix='eden-readback-refusal-') as temp:
     flags = ['-std=c++20', '-O1', '-g']
     if sys.platform.startswith('linux'):
         flags.append('-fsanitize=address,undefined')
-    subprocess.run([compiler, *flags, '-I' + str(src), str(temp / 'check.cpp'), '-o', str(temp / 'check')], check=True)
+    subprocess.run([compiler, *flags, '-I' + str(src), '-I' + str(root / 'headless'), str(temp / 'check.cpp'), '-o', str(temp / 'check')], check=True)
     subprocess.run([str(temp / 'check')], check=True)
 
     tools = temp / 'bin'
