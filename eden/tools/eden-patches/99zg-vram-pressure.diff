@@ -1,0 +1,385 @@
+diff --git a/src/video_core/delayed_destruction_ring.h b/src/video_core/delayed_destruction_ring.h
+--- a/src/video_core/delayed_destruction_ring.h
++++ b/src/video_core/delayed_destruction_ring.h
+@@ -26,6 +26,16 @@ public:
+         elements[index].push_back(std::move(object));
+     }
+ 
++    /// Destroys every object now (the caller made sure the GPU is done with them). Returns how many.
++    size_t Clear() {
++        size_t count = 0;
++        for (auto& objects : elements) {
++            count += objects.size();
++            objects.clear();
++        }
++        return count;
++    }
++
+ private:
+     size_t index = 0;
+     std::array<std::vector<T>, TICKS_TO_DESTROY> elements;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -256,9 +256,17 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
+       wfi_event(device.GetLogical().CreateEvent()) {
+     native_capture_session = std::make_unique<NativeDrawCaptureSession>();
+     scheduler.SetQueryCache(query_cache);
++    // try_lock: the thread that was refused holds the texture cache lock when it was refused in
++    // texture cache work (the lock is recursive), and otherwise may hold another cache's lock
++    // that a thread holding this one waits for. Not taken, nothing is reclaimed.
++    staging_pool.reclaim = [this]() -> size_t {
++        std::unique_lock lock{texture_cache.mutex, std::try_to_lock};
++        return lock.owns_lock() ? texture_cache.ReclaimMemory() : 0;
++    };
+ }
+ 
+ RasterizerVulkan::~RasterizerVulkan() {
++    staging_pool.reclaim = nullptr;
+     scheduler.WaitWorker();
+     scheduler.Finish();
+ #ifdef EDEN_NX2_PS5_PROTO
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <climits>
++#include <functional>
+ #include <vector>
+ 
+ #include "common/common_types.h"
+@@ -46,6 +47,10 @@ public:
+ 
+     void TickFrame();
+ 
++    /// Run when graphics memory is refused even after the idle kept buffers went: frees what the
++    /// texture cache holds and can let go (RasterizerVulkan sets it). Returns how many images went.
++    std::function<size_t()> reclaim;
++
+ private:
+     struct StreamBufferCommit {
+         size_t upper_bound;
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -1123,6 +1123,30 @@ StagingBufferRef TextureCacheRuntime::DownloadStagingBuffer(size_t size, bool de
+     return staging_buffer_pool.Request(size, MemoryUsage::Download, deferred);
+ }
+ 
++// The console's direct memory pool (performance.cpp); absent elsewhere.
++extern "C" void eden_direct_memory_free(std::int64_t*, std::size_t*) noexcept __attribute__((weak));
++
++bool TextureCacheRuntime::AheadReadbackFits(size_t size, size_t& largest_free) const {
++    largest_free = SIZE_MAX;
++    // Small readbacks are not weighed: asking the pool for its largest free block walks it.
++    if (eden_direct_memory_free && size >= (size_t{16} << 20)) {
++        std::int64_t pool_free = -1;
++        eden_direct_memory_free(&pool_free, &largest_free);
++    }
++    return VideoCommon::AheadReadbackFits(largest_free, size);
++}
++
++std::optional<StagingBufferRef> TextureCacheRuntime::TryDownloadStagingBuffer(size_t size, bool deferred) {
++    try {
++        return staging_buffer_pool.Request(size, MemoryUsage::Download, deferred);
++    } catch (const vk::Exception& refused) {
++        if (refused.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
++            throw;
++        }
++        return std::nullopt;
++    }
++}
++
+ void TextureCacheRuntime::FreeDeferredStagingBuffer(StagingBufferRef& ref) {
+     staging_buffer_pool.FreeDeferred(ref);
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <deque>
++#include <optional>
+ #include <span>
+ 
+ #include "video_core/texture_cache/texture_cache_base.h"
+@@ -57,6 +58,14 @@ public:
+ 
+     StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);
+ 
++    /// DownloadStagingBuffer, or nothing when graphics memory still refuses it after the pool's
++    /// own retries: a readback can be skipped, a session cannot be resumed (issue #20).
++    std::optional<StagingBufferRef> TryDownloadStagingBuffer(size_t size, bool deferred = false);
++
++    /// Whether a readback of `size` bytes queued ahead of a CPU read leaves the pool its reserve
++    /// (AheadReadbackFits, pending_download.h). `largest_free`: the block it was weighed against.
++    bool AheadReadbackFits(size_t size, size_t& largest_free) const;
++
+     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
+ 
+     void TickFrame();
+diff --git a/src/video_core/texture_cache/pending_download.h b/src/video_core/texture_cache/pending_download.h
+--- a/src/video_core/texture_cache/pending_download.h
++++ b/src/video_core/texture_cache/pending_download.h
+@@ -3,6 +3,9 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <atomic>
++#include <cstdint>
++#include <cstdio>
+ #include <memory>
+ #include <unordered_set>
+ #include <cstddef>
+@@ -55,4 +58,62 @@ bool RetainPendingImageDownloads(Common::SlotId id, Image& image, Downloads& pen
+     return retained != nullptr;
+ }
+ 
++struct DroppedReadbacks {
++    size_t images = 0;
++    size_t bytes = 0;
++};
++
++// Takes the image readbacks out of a batch whose staging buffer graphics memory refused even
++// after the pool's retries (issue #20: a 144 MiB readback of a 6144x6144 render target ended a
++// session with 462 MiB free in blocks of 128 MiB at most). They are the preemptive copies of
++// render targets the CPU read before. The image stays GPU-modified and forced_flushed goes back
++// to false, so the CPU's next read of it flushes it for real instead of trusting guest memory.
++// Buffer readbacks stay. Returns what was not read back.
++template <class Image, class Downloads>
++DroppedReadbacks DropImageReadbacks(Downloads& downloads, Common::SlotVector<Image>& images) {
++    DroppedReadbacks dropped;
++    const auto end = std::remove_if(downloads.begin(), downloads.end(), [&](const auto& download) {
++        if (!download.is_swizzle) {
++            return false;
++        }
++        auto& image = download.GetImage(images);
++        image.info.forced_flushed = false;
++        ++dropped.images;
++        dropped.bytes += image.unswizzled_size_bytes;
++        return true;
++    });
++    downloads.erase(end, downloads.end());
++    return dropped;
++}
++
++// What the pool's largest free block must keep after a readback queued ahead of a CPU read
++// (CommitAsyncFlushes): the reserve the texture cache already leaves the CPU
++// (headless/graphics_usage.h, kReserve). Issue #20, run of #26 at 3e0e601: such a 144 MiB readback
++// was refused, the pool's idle buffers went and it was made with 430 MiB free; a moment later the
++// CPU heap could not get 16 MiB and the session ended in std::bad_alloc. A readback the CPU waits
++// for (DownloadMemory) does not keep it.
++inline constexpr std::uint64_t kAheadReadbackReserve = std::uint64_t{1280} << 20;
++
++// Whether a readback of `size` bytes queued ahead leaves kAheadReadbackReserve of the pool's
++// largest free block (`largest_free`, SIZE_MAX when unknown: always).
++constexpr bool AheadReadbackFits(std::size_t largest_free, std::size_t size) noexcept {
++    return largest_free == SIZE_MAX || (largest_free >= size && largest_free - size >= kAheadReadbackReserve);
++}
++
++// EDEN_READBACK_SKIPPED in stderr: the 1st, 2nd, 4th, 8th ... skip. `largest_free`: the pool's
++// largest free block when the pool was too low (kind=ahead), SIZE_MAX otherwise.
++inline void ReportDroppedReadbacks(const char* kind, const DroppedReadbacks& dropped,
++                                   std::size_t largest_free = SIZE_MAX) {
++    static std::atomic<unsigned long long> skips{0};
++    const auto times = skips.fetch_add(1, std::memory_order_relaxed) + 1;
++    if ((times & (times - 1)) == 0) {
++        std::fprintf(stderr, "EDEN_READBACK_SKIPPED kind=%s images=%zu bytes=%zu largest_free=%lldMiB: %s "
++                     "(%llu so far)\n", kind, dropped.images, dropped.bytes,
++                     largest_free == SIZE_MAX ? -1ll : static_cast<long long>(largest_free >> 20),
++                     largest_free == SIZE_MAX ? "graphics memory refused the staging buffer"
++                                              : "the pool would keep less than its 1280 MiB reserve",
++                     times);
++    }
++}
++
+ } // namespace VideoCommon
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -21,6 +21,7 @@
+ #include <boost/container/small_vector.hpp>
+ 
+ #include "common/alignment.h"
++#include "common/scope_exit.h"
+ #include "common/settings.h"
+ #include "common/slot_vector.h"
+ #include "video_core/control/channel_state.h"
+@@ -302,6 +303,25 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
+     }
+ }
+ 
++template <class P>
++size_t TextureCache<P>::ReclaimMemory() {
++    // Called when graphics memory is refused (vk_staging_buffer_pool.cpp), from inside texture
++    // cache work: JoinImages holds the ids of the images it merges and PrepareImage touches an
++    // image only after uploading it, so evicting images here could delete one still in use. The
++    // images already deleted wait TICKS_TO_DESTROY frames for the GPU in sentenced_images; once
++    // the GPU is idle they can go now. The next frame's collector evicts in aggressive mode.
++    if (reclaiming) {
++        return 0; // Finish() asked for memory again
++    }
++    reclaiming = true;
++    SCOPE_EXIT {
++        reclaiming = false;
++    };
++    reclaim_requested = true;
++    runtime.Finish();
++    return sentenced_images.Clear();
++}
++
+ template <class P>
+ void TextureCache<P>::TickFrame() {
+     for (auto* scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
+@@ -411,6 +431,11 @@ void TextureCache<P>::TickFrame() {
+         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
+         images_created = images_deleted = 0;
+     }
++    if (std::exchange(reclaim_requested, false)) {
++        // Graphics memory was refused since the last frame (ReclaimMemory): collect as if 1 GiB
++        // over the critical mark, so the aggressive pass frees up to 1 GiB of unused images.
++        total_used_memory = (std::max)(total_used_memory, critical_memory + 1_GiB);
++    }
+     if (total_used_memory > minimum_memory) {
+         RunGarbageCollector();
+     }
+@@ -1259,16 +1284,37 @@ void TextureCache<P>::CommitAsyncFlushes() {
+                                 image.info.layer_stride, image.guest_size_bytes, image.unswizzled_size_bytes);
+                 }
+             }
+-            auto download_map = runtime.DownloadStagingBuffer(total_size_bytes, true);
+-            for (const PendingDownload& download_info : download_ids) {
+-                if (download_info.is_swizzle) {
+-                    Image& image = download_info.GetImage(slot_images);
+-                    const auto copies = FixSmallVectorADL(FullDownloadCopies(image.info));
+-                    image.DownloadMemory(download_map, copies);
+-                    download_map.offset += Common::AlignUp(image.unswizzled_size_bytes, 64);
++            // These readbacks are queued ahead of a CPU read. They are skipped rather than the
++            // session ended when graphics memory refuses them even after the pool's retries, and
++            // are not made at all where the pool would keep less than its reserve
++            // (DropImageReadbacks, AheadReadbackFits: pending_download.h).
++            std::optional<decltype(runtime.DownloadStagingBuffer(total_size_bytes, true))> download_map;
++            size_t largest_free = SIZE_MAX;
++            bool fits = true;
++            if constexpr (requires(const Runtime& r, size_t& l) { r.AheadReadbackFits(size_t{}, l); }) {
++                fits = runtime.AheadReadbackFits(total_size_bytes, largest_free);
++            }
++            if (fits) {
++                if constexpr (requires(Runtime& r) { r.TryDownloadStagingBuffer(size_t{}, true); }) {
++                    download_map = runtime.TryDownloadStagingBuffer(total_size_bytes, true);
++                } else {
++                    download_map = runtime.DownloadStagingBuffer(total_size_bytes, true);
++                }
++            }
++            if (!download_map) {
++                ReportDroppedReadbacks(fits ? "async" : "ahead", DropImageReadbacks(download_ids, slot_images),
++                                       fits ? SIZE_MAX : largest_free);
++            } else {
++                for (const PendingDownload& download_info : download_ids) {
++                    if (download_info.is_swizzle) {
++                        Image& image = download_info.GetImage(slot_images);
++                        const auto copies = FixSmallVectorADL(FullDownloadCopies(image.info));
++                        image.DownloadMemory(*download_map, copies);
++                        download_map->offset += Common::AlignUp(image.unswizzled_size_bytes, 64);
++                    }
+                 }
++                uncommitted_async_buffers.emplace_back(*download_map);
+             }
+-            uncommitted_async_buffers.emplace_back(download_map);
+         }
+ 
+         async_buffers.emplace_back(std::move(uncommitted_async_buffers));
+@@ -1578,7 +1624,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+     uploaded_bytes += image.guest_size_bytes;
+     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
+     const auto upload_start = std::chrono::steady_clock::now();
+-    if (!UploadInChunks(image)) {
++    if (!UploadConvertedInChunks(image) && !UploadInChunks(image)) {
+         auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
+         UploadImageContents(image, staging);
+         runtime.InsertUploadMemoryBarrier();
+@@ -3213,6 +3259,46 @@ bool TextureCache<P>::UploadInChunks(Image& image) {
+     return true;
+ }
+ 
++template <class P>
++bool TextureCache<P>::UploadConvertedInChunks(Image& image) {
++    // A converted image (ASTC kept as BC1/BC3) was staged whole: a 1434x1434 array of 46 layers
++    // asked for 121 MiB in one block and the console refused it, with blocks of 80 MiB free
++    // (issue #20). ConvertImage treats layers independently, so groups of layers of at most
++    // 32 MiB are converted into their own staging buffer and uploaded in turn: same bytes.
++    constexpr u64 chunk_size = 32_MiB;
++    constexpr ImageFlagBits excluded = ImageFlagBits::Sparse | ImageFlagBits::AcceleratedUpload |
++                                       ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels;
++    const u32 layers = static_cast<u32>(image.info.resources.layers);
++    const u64 total = MapSizeBytes(image);
++    if (False(image.flags & ImageFlagBits::Converted) || True(image.flags & excluded) ||
++        image.info.type != ImageType::e2D || layers < 2 || total <= chunk_size || total % layers != 0) {
++        return false;
++    }
++    unswizzle_data_buffer.resize_destructive(image.unswizzled_size_bytes);
++    const auto copies = FixSmallVectorADL(UnswizzleImage(*gpu_memory, image.gpu_addr, image.info, {},
++                                                         unswizzle_data_buffer, &swizzle_data_buffer));
++    const u64 layer_size = total / layers;
++    const u32 group = static_cast<u32>((std::max<u64>)(1, chunk_size / layer_size));
++    for (u32 first = 0; first < layers; first += group) {
++        const u32 count = (std::min)(group, layers - first);
++        auto group_copies = copies;
++        for (auto& copy : group_copies) {
++            const size_t input_layer = copy.buffer_size / layers;
++            copy.buffer_offset += first * input_layer;
++            copy.buffer_size = count * input_layer;
++            copy.image_subresource.num_layers = static_cast<s32>(count);
++        }
++        auto staging = runtime.UploadStagingBuffer(layer_size * count);
++        ConvertImage(unswizzle_data_buffer, image.info, staging.mapped_span, group_copies);
++        for (auto& copy : group_copies) {
++            copy.image_subresource.base_layer = static_cast<s32>(first);
++        }
++        image.UploadMemory(staging, group_copies);
++    }
++    runtime.InsertUploadMemoryBarrier();
++    return true;
++}
++
+ template <class P>
+ bool TextureCache<P>::MarkPartialRemap(ImageBase& image, GPUVAddr gpu_addr, size_t size) {
+     if (CanUploadSparsePartial(image)) {
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -190,6 +190,11 @@ public:
+     /// Notify the cache that a new frame has been queued
+     void TickFrame();
+ 
++    /// Graphics memory was refused: waits for the GPU, destroys the images already deleted and
++    /// makes the next frame's collector aggressive. Returns how many images it destroyed. Lock
++    /// `mutex` first.
++    size_t ReclaimMemory();
++
+     /// Return a constant reference to the given image view id
+     [[nodiscard]] const ImageView& GetImageView(ImageViewId id) const noexcept;
+ 
+@@ -431,6 +436,10 @@ private:
+     /// Uploads a large plain 2D image in chunks; false if it does not qualify.
+     bool UploadInChunks(Image& image);
+ 
++    /// Converts and uploads a large converted 2D array a few layers at a time; false if it does
++    /// not qualify.
++    bool UploadConvertedInChunks(Image& image);
++
+     /// Records a GPU remap of a small part of a large 2D image for a partial re-upload instead of
+     /// marking the whole image remapped (which replaces it). False if the image does not qualify.
+     bool MarkPartialRemap(ImageBase& image, GPUVAddr gpu_addr, size_t size);
+@@ -520,6 +529,8 @@ private:
+ 
+     bool has_deleted_images = false;
+     bool is_rescaling = false;
++    bool reclaim_requested = false;
++    bool reclaiming = false;
+     u64 total_used_memory = 0;
+     u64 minimum_memory;
+     u64 expected_memory;
