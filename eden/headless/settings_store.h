@@ -202,7 +202,7 @@ inline bool ValidRomPath(std::string_view name) {
     }
     std::string extension(name.substr(name.size() - 4));
     for (char& c : extension) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return extension == ".nsp" || extension == ".xci";
+    return extension == ".nsp" || extension == ".xci" || extension == ".nup";
 }
 
 // A wallpaper's file name: the name alone (the image lives in the wallpapers folder), readable

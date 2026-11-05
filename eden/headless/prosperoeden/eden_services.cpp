@@ -284,14 +284,14 @@ bool AddOnInGameFolder(const std::string& path) {
     return addon;
 }
 
-// The games in roms/, by their paths in it: its NSP and XCI files, and those in its game folders
+// The games in roms/, by their paths in it: its NSP, XCI and NUP files, and those in its game folders
 // (one level down, issue 168) that hold a game and not its update or DLC. Called with the
 // metadata reader held.
 std::vector<std::string> GameFiles() {
     const auto rom = [](const std::string& name) {
         std::string lower = name;
         for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        return lower.ends_with(".nsp") || lower.ends_with(".xci");
+        return lower.ends_with(".nsp") || lower.ends_with(".xci") || lower.ends_with(".nup");
     };
     const std::string roms = Eden::AssetsPath("roms");
     std::vector<std::string> files;
@@ -676,6 +676,8 @@ pe::ui::Home EdenServices::home() {
     if (home.setup_ready && home.last_exists) {
         eden_scan_addons(Eden::AssetsPath("updates").c_str(), Eden::AssetsPath("roms").c_str(),
                          Eden::AssetsPath("keys").c_str());
+        // A NUP carries its own update and DLC.
+        eden_note_nup_addons(last_path.c_str());
         const uint64_t title_id = eden_game_title_id(last_path.c_str());
         const GameLanguage language = LanguageFor(last_path, title_id, Eden::PreferencesFor(title_id).language);
         home.last_title_id = title_id;
@@ -776,6 +778,8 @@ std::vector<pe::ui::Game> EdenServices::games() {
             else
                 (void)std::remove(staged.c_str());
             game.title_id = eden_game_title_id(path.c_str());
+            // A NUP carries its own update and DLC.
+            eden_note_nup_addons(path.c_str());
             if (const std::string folder = GameFolderOf(file); game.title_id && !folder.empty()) {
                 const std::lock_guard folders(game_folders_lock_);
                 game_folders_[game.title_id] = folder;
@@ -1254,7 +1258,7 @@ pe::ui::FolderInfo EdenServices::folder_info(const std::string& directory) {
     pe::ui::FolderInfo info;
     info.keys = Eden::FileExists(JoinPath(directory, "keys/prod.keys"));
     info.firmware = CountFiles(JoinPath(directory, "firmware"), {".nca"});
-    info.games = CountFiles(JoinPath(directory, "roms"), {".nsp", ".xci"});
+    info.games = CountFiles(JoinPath(directory, "roms"), {".nsp", ".xci", ".nup"});
     return info;
 }
 
