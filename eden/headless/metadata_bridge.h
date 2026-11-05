@@ -50,6 +50,9 @@ int eden_rom_content(const char* rom_path, const char* keys_dir);
 // (its folders, one per game; roms_dir may be null), read with the provider that also applies them
 // to a running game. Replaces the previous scan; eden_game_addons queries it.
 void eden_scan_addons(const char* updates_dir, const char* roms_dir, const char* keys_dir);
+// Adds the update and DLC packed in a NUP game file to the last eden_scan_addons, for its game.
+// Does nothing for a file that is not a NUP.
+void eden_note_nup_addons(const char* rom_path);
 // The update and DLC files of a game in updates_dir and in game_dir, the game's own folder in
 // roms/ (null for a game directly in roms/), NSP or XCI at any depth, by the title IDs they hold:
 // each one's full path is handed to found. Returns how many there were.

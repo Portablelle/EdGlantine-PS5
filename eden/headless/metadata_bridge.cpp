@@ -41,6 +41,7 @@
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/nca_metadata.h"
+#include "core/file_sys/nup_container.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/submission_package.h"
@@ -73,6 +74,32 @@ constexpr std::array<const char*, 18> language_names{
     "Portuguese", "Russian", "Korean", "TraditionalChinese", "SimplifiedChinese",
     "BrazilianPortuguese", "Polish", "Thai",
 };
+
+// A NUP package (a base game with its updates and DLC in one file; Loader::AppLoader_NUP reads it):
+// the game's name, icon and title ID come from the package its program is in, the base's, or the
+// newest update's when there is no base. Its languages are the ones the loader declares.
+constexpr uint32_t kNupLanguages = 0x3FFFF;
+
+bool IsNupPath(std::string path) {
+    std::transform(path.begin(), path.end(), path.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return path.ends_with(".nup");
+}
+
+const FileSys::NupContainer::PackageInfo* NupProgramPackage(const FileSys::NupContainer& nup) {
+    if (nup.GetStatus() != Loader::ResultStatus::Success) return nullptr;
+    auto index = nup.FindBasePackage();
+    if (!index) index = nup.FindBestUpdatePackage();
+    return index ? &nup.GetPackages()[*index] : nullptr;
+}
+
+std::string NupTitle(const FileSys::NupContainer::PackageInfo& package) {
+    std::vector<std::string> names{package.title_name};
+    for (const auto& [language, name] : package.localized_titles) names.push_back(name);
+    for (const std::string& name : names)
+        if (!name.empty() && Eden::UsableName(name.c_str())) return Eden::PlainName(name.c_str());
+    return {};
+}
 
 FileSys::VirtualDir ExtractControl(const std::shared_ptr<FileSys::NCA>& control) {
     if (!control || control->GetStatus() != Loader::ResultStatus::Success) return {};
@@ -289,6 +316,11 @@ uint64_t eden_game_title_id(const char* rom_path) {
         FileSys::NSP package(file);
         return package.GetStatus() == Loader::ResultStatus::Success ? package.GetProgramTitleID() : 0;
     }
+    if (path.ends_with(".nup")) {
+        const FileSys::NupContainer nup(file);
+        const auto* package = NupProgramPackage(nup);
+        return package ? package->title_id : 0;
+    }
     return 0;
 }
 
@@ -329,6 +361,21 @@ int eden_extract_game_metadata(const char* rom_path, const char* keys_dir,
     std::string path = rom_path;
     std::transform(path.begin(), path.end(), path.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (path.ends_with(".nup")) {
+        const FileSys::NupContainer nup(file);
+        const auto* package = NupProgramPackage(nup);
+        if (!package) return 0;
+        GameLanguages()[rom_path] = kNupLanguages;
+        int result = 0;
+        if (const std::string name = NupTitle(*package); !name.empty()) {
+            std::snprintf(title, title_capacity, "%s", name.c_str());
+            result |= EDEN_METADATA_TITLE;
+        }
+        const std::vector<u8>* icon = package->icon.empty() ? nullptr : &package->icon;
+        if (!icon && !package->localized_icons.empty()) icon = &package->localized_icons.front().second;
+        if (icon && WriteTgaBytes(icon->data(), icon->size(), cover_tga_path, 4096)) result |= EDEN_METADATA_COVER;
+        return result;
+    }
     const bool xci = path.size() >= 4 && path.substr(path.size() - 4) == ".xci";
     FileSys::VirtualDir packed_update;
     const auto romfs = OpenControlRomFs(file, xci, &packed_update);
@@ -352,6 +399,7 @@ uint32_t eden_game_supported_languages(const char* rom_path, const char* keys_di
     try {
         if (Eden::DumpMetadata::IsEntry(rom_path))
             return GameLanguages()[rom_path] = ReadDumpLanguages(rom_path);
+        if (IsNupPath(rom_path)) return GameLanguages()[rom_path] = kNupLanguages;
         Common::FS::SetEdenPath(Common::FS::EdenPath::KeysDir, keys_dir);
         FileSys::RealVfsFilesystem vfs;
         const auto file = vfs.OpenFile(rom_path, FileSys::OpenMode::Read);
@@ -372,7 +420,7 @@ uint32_t eden_game_supported_languages(const char* rom_path, const char* keys_di
 namespace {
 struct AddOns {
     std::string update;
-    unsigned dlc = 0;
+    std::set<uint64_t> dlc;  // the DLC's title IDs
     uint32_t languages = 0;  // the update's own language flags (its control data replaces the game's)
 };
 // Base title ID -> its update and DLC files, from the last eden_scan_addons.
@@ -392,6 +440,11 @@ int eden_rom_content(const char* rom_path, const char* keys_dir) {
         std::string path = rom_path;
         std::transform(path.begin(), path.end(), path.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (path.ends_with(".nup")) {
+            // A NUP is a game (with its update and DLC), or a standalone update that boots alone.
+            const FileSys::NupContainer nup(file);
+            return NupProgramPackage(nup) ? EDEN_CONTENT_GAME : EDEN_CONTENT_UNKNOWN;
+        }
         std::shared_ptr<FileSys::NSP> package;
         if (path.ends_with(".nsp")) {
             package = std::make_shared<FileSys::NSP>(file);
@@ -454,12 +507,34 @@ void eden_scan_addons(const char* updates_dir, const char* roms_dir, const char*
                 if (const auto romfs = control->GetRomFS())
                     if (const auto files = FileSys::ExtractRomFS(romfs)) addons.languages = ReadLanguages(files);
         }
-        std::set<uint64_t> dlc;
         for (const auto& entry : provider.ListEntriesFilter(FileSys::TitleType::AOC, std::nullopt, std::nullopt))
-            if (dlc.insert(entry.title_id).second) ++scanned[FileSys::GetBaseTitleID(entry.title_id)].dlc;
+            scanned[FileSys::GetBaseTitleID(entry.title_id)].dlc.insert(entry.title_id);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[ProsperoEden] updates: %s\n", error.what());
         scanned.clear();
+    }
+}
+
+void eden_note_nup_addons(const char* rom_path) {
+    if (!rom_path || !IsNupPath(rom_path)) return;
+    try {
+        FileSys::RealVfsFilesystem vfs;
+        const auto file = vfs.OpenFile(rom_path, FileSys::OpenMode::Read);
+        if (!file || !FileSys::NupContainer::IsNupFile(file)) return;
+        const FileSys::NupContainer nup(file);
+        const auto* program = NupProgramPackage(nup);
+        if (!program) return;
+        auto& addons = ScannedAddOns()[FileSys::GetBaseTitleID(program->title_id)];
+        if (const auto update = nup.FindBestUpdatePackage()) {
+            const auto& package = nup.GetPackages()[*update];
+            if (addons.update.empty())
+                addons.update = !package.display_version.empty() ? package.display_version
+                                : "v" + std::to_string(package.version);
+        }
+        for (const auto& package : nup.GetPackages())
+            if (package.kind == FileSys::NupContainer::PackageKind::Addon) addons.dlc.insert(package.title_id);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[ProsperoEden] nup: %s\n", error.what());
     }
 }
 
@@ -553,8 +628,8 @@ int eden_game_addons(uint64_t title_id, char* update_version, size_t capacity, u
     const auto found = scanned.find(FileSys::GetBaseTitleID(title_id));
     if (!title_id || found == scanned.end()) return 0;
     if (update_version && capacity) std::snprintf(update_version, capacity, "%s", found->second.update.c_str());
-    if (dlc_count) *dlc_count = found->second.dlc;
-    return !found->second.update.empty() || found->second.dlc != 0;
+    if (dlc_count) *dlc_count = static_cast<unsigned>(found->second.dlc.size());
+    return !found->second.update.empty() || !found->second.dlc.empty();
 }
 
 namespace {
