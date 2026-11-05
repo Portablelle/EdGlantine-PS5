@@ -23,8 +23,9 @@ Counters from the 50 s of the session's `stderr.log` that follow loading
 
 The hardware video decoder did not load:
 `EDEN_HW_VIDEODEC module-load rc=0x80020002 path=/system/common/lib/libSceVideodec2.sprx`.
-The file is on the console, but the app's sandbox cannot see that path, so
-videos go to FFmpeg. Nothing shows that this costs gameplay FPS.
+The file is on the console (FTP lists it), so the app's sandbox probably does
+not see that path. Unverified: EVO loads it with `sceSysmoduleLoadModule(207)`
+instead. Videos go to FFmpeg. Nothing shows that this costs gameplay FPS.
 
 ---
 
