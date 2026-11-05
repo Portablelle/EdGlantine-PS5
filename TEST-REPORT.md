@@ -1169,8 +1169,7 @@ Instruction acceptance and compilation do not validate rendering: visual PS5 tri
 
 Incremental native compilation on `build-server` (18 objects), packaging and direct
 installation after confirmed closure. No new host test or general suite.
-Four concrete fixes from the initial review are detailed in
-[CUBIC-REVIEW.md](CUBIC-REVIEW.md): nonempty save import after filtering, no upload
+Four concrete fixes came from the initial review: nonempty save import after filtering, no upload
 redirects, unique memory-cache generation across instances, and preservation of
 the color matrix reported by FFmpeg.
 

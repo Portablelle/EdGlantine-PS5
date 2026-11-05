@@ -143,7 +143,7 @@ and the real QMD scheduler under ASan/UBSan: empty, unchanged, disjoint and long
 ranges; preservation of completion history and dependencies. They do not simulate
 the graphics driver.
 
-Per-layer sparse residency is tracked in [ROADMAP.md](ROADMAP.md). Selective
+Per-layer sparse residency is still planned. Selective
 residency remains to be ported (per-layer ASTC uploads are integrated in 00.008):
 these changes couple the Vulkan allocator, driver capabilities, GPU block tracking
 and ASTC uploads. Desktop figures published in commits are not PS5 measurements.

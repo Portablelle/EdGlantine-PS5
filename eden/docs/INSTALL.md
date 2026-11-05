@@ -36,6 +36,8 @@ Only these subfolders matter; the folder itself can have any name and location.
 
 Each game sits in a folder of its own in `roms/`, with everything that belongs to it: its update and DLC files, its mods, its cheats and its post-processing presets. ProsperoEden tells the game from its update and DLC by what each file holds, not by its name, so the files can have any names. Folders inside a game folder are not searched for games, and folders whose names start with a dot are skipped. **Delete from console** also deletes the update and DLC files in the game's folder, and the folder once it is empty.
 
+A game kept as a folder dump (`<Game>/exefs/main` with `<Game>/romfs/`, as made from a NUP) holds no cover of its own. Put a picture named `cover.jpg`, `cover.png`, `icon.jpg` or `icon.png` in its folder and the Library shows it; a game also found on a download source takes that source's cover.
+
 The folder browser shows how many keys, firmware files, and games each folder holds, so you can check a folder before selecting it. Moving your files later only needs a new selection in Settings; saved settings, covers, and recently played games carry over.
 
 ## App data

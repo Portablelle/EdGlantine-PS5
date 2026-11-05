@@ -254,7 +254,6 @@ bash package-remote.sh
 | `prototype.json` | Exact revisions, pinned hashes and integration records. |
 | `TEST-REPORT.md` | Every build's tests, console results and measurements, newest first. |
 | `HISTORY.md` | Earlier milestone notes (00.003 to 00.040). |
-| `ROADMAP.md` | Planned work, starting with sparse texture residency. |
 
 Packages, dumps, games, keys, SDKs and reference checkouts stay local and are
 never committed.

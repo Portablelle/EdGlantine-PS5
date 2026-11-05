@@ -348,6 +348,19 @@ int eden_extract_game_metadata(const char* rom_path, const char* keys_dir,
                 if(icon && WriteTga(icon,cover_tga_path)) result|=EDEN_METADATA_COVER;
             }
         }
+        // A dump made from a NUP keeps no control data, so no icon: a picture put in the game's
+        // folder (cover.jpg, icon.png...) is its cover then.
+        if(!(result&EDEN_METADATA_COVER)) {
+            for(const char* name : {"cover","Cover","icon","Icon"}) {
+                for(const char* extension : {".jpg",".jpeg",".png",".JPG",".PNG"}) {
+                    const auto picture=dump_vfs.OpenFile((root/(std::string{name}+extension)).string(),
+                                                         FileSys::OpenMode::Read);
+                    if(picture && picture->GetSize() && picture->GetSize()<=(64u<<20) &&
+                       WriteTga(picture,cover_tga_path)) {result|=EDEN_METADATA_COVER;break;}
+                }
+                if(result&EDEN_METADATA_COVER) break;
+            }
+        }
         if(!(result&EDEN_METADATA_TITLE)) {
             const auto name=root.filename().string();
             if(Eden::UsableName(name)) {std::snprintf(title,title_capacity,"%s",name.c_str());result|=EDEN_METADATA_TITLE;}
