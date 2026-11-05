@@ -6,9 +6,9 @@ EdGlantine-PS5 runs the Eden NX2 engine natively on the PS5. It is built on
 [ProsperoEden](https://github.com/blackbearreloaded/ProsperoEden), the PS5 port of
 Eden, and brings in work from the Eglantine and Eden-NS2 forks.
 
-Several NS2 games reach gameplay, but this is still a prototype. Expect low
-frame rates, rendering glitches and crashes. Nothing here is a stable
-compatibility claim.
+Pokopia is playable, and other NS2 games reach gameplay, but this is still a
+prototype. Expect low frame rates, rendering glitches and crashes. Nothing here
+is a stable compatibility claim.
 
 > **Contributors welcome.** Profiling, GPU memory, rendering correctness and
 > console testing are where help matters most. See [Contributing](#contributing).
@@ -41,12 +41,13 @@ release.
 
 | Game | State | Notes |
 |------|-------|-------|
-| **Pokopia** | Gameplay, 45–51 FPS | Temporary freezes and heavy flickering; black sky. See the [Pokopia investigation](eden/docs/POKOPIA_RENDERING_INVESTIGATION.md). |
-| **Donkey Kong Bananza** | Gameplay, about 16 FPS | Docked, 1x resolution, GPU-fast mode. Terrain and assets appear after a delay, then render correctly. See the [Bananza investigation](eden/docs/BANANZA_STARTUP_INVESTIGATION.md). |
-| **Welcome Tour** | Gameplay, about 8 FPS | It reached 21 FPS on .064; .065 regressed. Its intro video uses H.264. |
-| **Mario Kart World** | Crashes while loading | Runs out of graphics memory during the first load. History in [issue #20](https://github.com/Portablelle/EdGlantine-PS5/issues/20). |
+| **Pokopia** | **Playable**, 45–50 FPS | Starts correctly, and the sky is no longer black. From some camera angles, a few assets flicker and can swap places. The frame rate drops to about 30 depending on what is in view. See the [Pokopia investigation](eden/docs/POKOPIA_RENDERING_INVESTIGATION.md). |
+| **Donkey Kong Bananza** | Not playable, 5–20 FPS | No rendering problem seen any more, but the frame rate is too low to play. See the [Bananza investigation](eden/docs/BANANZA_STARTUP_INVESTIGATION.md). |
+| **Welcome Tour** | Not playable, about 10 FPS | Some assets seem to be missing and show black. |
+| **Mario Kart World** | Stops at the first load | Runs out of graphics memory during the first load. History in [issue #20](https://github.com/Portablelle/EdGlantine-PS5/issues/20). |
 
-These are the latest results reported by the player, not repeated benchmarks.
+These are the latest results reported by the player (November 5, 2026), not
+repeated benchmarks.
 Scenes and settings differ between runs. Exact numbers and conditions are in
 [TEST-REPORT.md](TEST-REPORT.md).
 
@@ -70,6 +71,19 @@ single-file package: a game with its updates and DLC. The Library reads its
 name, cover, update and DLC. When the game starts, the update is applied and the
 DLC is offered to it. The reader comes from Eglantine. The DLC support comes from
 [viejunerd's EglantinePS5 build](https://github.com/viejunerd/Eglantine-PS5-).
+
+### Pokopia shaders and memory breakdown ([#27](https://github.com/Portablelle/EdGlantine-PS5/pull/27))
+
+- **Two Pokopia shaders run again.** The native translator rejected them, so
+  their dispatches were skipped. Wide local spills (`LDL`/`STL` of 64 and 128
+  bits) and one-term predicate LUTs (`UPLOP3`) are now translated.
+- **Refresh journal.** Every 5 s, the logs list the images refreshed most often.
+  In Pokopia this points to a triple-buffered texture the game rewrites from the
+  CPU, a likely cause of the sprites that swap places.
+- **Descriptor buffers can be turned off.** Create
+  `/data/eden-nx2/descriptor-buffer-off.txt` to turn them off, for A/B tests.
+- **Memory breakdown.** Every 5 s, the logs show what fills the graphics pool:
+  allocated images, staging buffers and per-heap Vulkan statistics.
 
 ### Graphics memory on the PS5 ([issue #20](https://github.com/Portablelle/EdGlantine-PS5/issues/20))
 
@@ -167,10 +181,10 @@ roms/
 
 ## Known issues and limits
 
-- **Low frame rates.** CPU draw preparation dominates, and Welcome Tour regressed
-  on .065.
-- **Rendering.** Pokopia flickers and its sky is black. In Bananza, terrain shows
-  up late.
+- **Low frame rates.** Only Pokopia is playable. Bananza (5–20 FPS) and Welcome
+  Tour (about 10 FPS) are too slow, and CPU draw preparation is the main known cost.
+- **Rendering.** In Pokopia, some assets flicker and swap places from certain
+  camera angles. In Welcome Tour, some assets show black.
 - **Graphics memory.** Large games can run out of the PS5's shared graphics pool
   (issue #20).
 - **GPU thread splitting** is available but off at startup. Turning it on has
