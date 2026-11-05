@@ -7,9 +7,8 @@ EdGlantine-PS5 runs the Eden NX2 engine natively on the PS5. It is built on
 Eden, and brings in work from the Eglantine and Eden-NS2 forks.
 
 Pokopia is playable, and other NS2 games reach gameplay, but this is still a
-prototype. Expect low
-frame rates, rendering glitches and crashes. Nothing here is a stable
-compatibility claim.
+prototype. Expect low frame rates, rendering glitches and crashes. Nothing here
+is a stable compatibility claim.
 
 > **Contributors welcome.** Profiling, GPU memory, rendering correctness and
 > console testing are where help matters most. See [Contributing](#contributing).
