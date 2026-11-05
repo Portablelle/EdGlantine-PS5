@@ -32,9 +32,10 @@ is a stable compatibility claim.
 
 ## Current state
 
-**Installed test build: 00.065.031** (title `PPSA99862`, shown as **EdGlantine PS5**).
-It is `main` plus NUP support ([#28](https://github.com/Portablelle/EdGlantine-PS5/pull/28)).
-The `.0xx` part of `00.065.0xx` numbers test builds. Only the main version is a
+**Installed build: 00.066.000** (title `PPSA99862`, shown as **EdGlantine PS5**),
+the release of `main` with NUP support and the fixes up to
+[#34](https://github.com/Portablelle/EdGlantine-PS5/pull/34).
+The `.0xx` part of `00.066.0xx` numbers test builds. Only the main version is a
 release.
 
 ### Games
