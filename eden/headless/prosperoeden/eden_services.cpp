@@ -674,7 +674,7 @@ pe::ui::Home EdenServices::home() {
         std::string title = GameTitle(home.last_file);
         std::string cover = CoverPath(home.last_file);
         bool has_cover = Eden::FileExists(cover);
-        if (home.last_exists && home.setup_ready && !has_cover) {
+        if (home.last_exists && (home.setup_ready || home.last_standalone) && !has_cover) {
             cover = EnsureCover(home.last_file, &title);
             has_cover = !cover.empty();
         }
@@ -686,7 +686,7 @@ pe::ui::Home EdenServices::home() {
     }
     // The last game's update and DLC and the language it will use; when it does not offer the
     // chosen one, the caption says so.
-    if (home.setup_ready && home.last_exists) {
+    if ((home.setup_ready || home.last_standalone) && home.last_exists) {
         eden_scan_addons(Eden::AssetsPath("updates").c_str(), Eden::AssetsPath("roms").c_str(),
                          Eden::AssetsPath("keys").c_str());
         // A NUP carries its own update and DLC.
