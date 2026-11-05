@@ -1,0 +1,101 @@
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -279,7 +279,9 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
+         if (op == 0x20c || op == 0x80c || op == 0xa0c || op == 0xc0c ||
+             op == 0x20b || op == 0x80b || op == 0xa0b || op == 0x918 || op == 0x947 || op == 0x950) return false;
+         const u32 destination = instruction.Bits(16, 8);
+-        const u32 count = op == 0x83b ? 4U : op == 0x23c || op == 0x225 || op == 0x625 || op == 0x311 ? 2U : 1U;
++        const u32 width = instruction.Bits(73, 3);
++        const u32 count = op == 0x83b ? 4U : op == 0x23c || op == 0x225 || op == 0x625 || op == 0x311 ? 2U :
++            op == 0x983 && width == 6 ? 4U : op == 0x983 && width == 5 ? 2U : 1U;
+         return destination != 255 && link >= destination && link - destination < count;
+     };
+     // True when control can enter (first, last] from outside it: a branch, call or reconvergence
+@@ -1111,19 +1113,25 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
+             restore_predicate();
+             break;
+         }
+-        case 0x89c: { // Uniform predicate AND with an optionally inverted third source.
++        case 0x89c: { // Uniform predicate LUT that is true for one input combination: an AND.
++            // The LUT bit set, (a << 2) | (b << 1) | c, says which value each source must have;
++            // a source that must be false is inverted. 0x80 is a & b & c, 0x40 a & b & !c, and
++            // Pokopia's 0x04 is !a & b & !c (issue #20).
+             const u32 target = insn.Bits(81, 3);
+             const u32 lut = insn.Bits(64, 3) | (insn.Bits(72, 5) << 3);
+             if (target == 7 || insn.Bits(84, 3) != 7 ||
+-                insn.Bits(16, 8) || insn.words[1] || (lut != 0x80 && lut != 0x40))
++                insn.Bits(16, 8) || insn.words[1] || lut == 0 || (lut & (lut - 1)) != 0)
+                 return fail(index, "native uniform predicate LUT mode");
++            const u32 term = static_cast<u32>(std::countr_zero(lut));
++            const auto inverted = [term](u32 bit) { return (term >> bit) & 1 ? 0U : 8U; };
+             const auto mapped = [](u32 source) { return ((source & 7) == 7 ? 7 : 6 - (source & 7)) | (source & 8); };
+             emit(0x38e8000000070000ULL | 253 | (u64{255} << 8) | (u64{0x7f} << 20));
+             emit(0x38f0000000070000ULL | (u64{239} << 8) | (u64{0x7f} << 20));
+             // A UPn guard predicates the PSETP: when it is false the target keeps its loaded value.
+             emit(0x5090000000000000ULL | (u64{mapped(native_predicate)} << 16) | (u64{6 - target} << 3) | 7 |
+-                 (u64{mapped(insn.Bits(87, 4))} << 12) | (u64{mapped(insn.Bits(77, 4))} << 29) |
+-                 (u64{mapped(insn.Bits(68, 4)) ^ (lut == 0x40 ? 8U : 0U)} << 39));
++                 (u64{mapped(insn.Bits(87, 4)) ^ inverted(2)} << 12) |
++                 (u64{mapped(insn.Bits(77, 4)) ^ inverted(1)} << 29) |
++                 (u64{mapped(insn.Bits(68, 4)) ^ inverted(0)} << 39));
+             emit(0x38e8000000070000ULL | 239 | (u64{239} << 8) | (u64{1} << (26 - target)));
+             emit(0x38f0000000070000ULL | (u64{253} << 8) | (u64{0x7f} << 20));
+             break;
+@@ -2941,16 +2949,22 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
+             result.instructions.push_back(translated);
+             break;
+         }
+-        case 0x387: case 0x983: { // Scalar local spills with register-relative byte offsets.
++        case 0x387: case 0x983: { // Local spills of 32, 64 or 128 bits with register-relative byte offsets.
++            // The width (bits 73-75: 4 = 32, 5 = 64, 6 = 128 bits) is Maxwell's LDL/STL size field
++            // (bits 48-50). A wide access takes 2 or 4 registers from an aligned one, and an offset
++            // aligned to its size. Pokopia spills STL.128 [RZ+0x80], R12 (issue #20).
+             const bool store = opcode == 0x387;
+             const u32 data = store ? insn.Bits(32, 8) : static_cast<u32>(dest);
+-            if ((store && insn.Bits(16, 8)) || (!store && insn.Bits(32, 8)) ||
+-                (data >= reserved_register && data != 255) ||
+-                (insn.Bits(40, 24) & 3) ||
+-                (insn.words[2] != 0x00100800U && (store || insn.words[2] != 0x00300800U)))
++            const u32 width = insn.Bits(73, 3);
++            const u32 count = width == 6 ? 4U : width == 5 ? 2U : 1U;
++            const u32 mode = insn.words[2] & ~(7U << 9);
++            if ((store && insn.Bits(16, 8)) || (!store && insn.Bits(32, 8)) || width < 4 || width > 6 ||
++                (data == 255 ? count > 1 : (data % count != 0 || data + count > reserved_register)) ||
++                (insn.Bits(40, 24) & (count * 4 - 1)) ||
++                (mode != 0x00100000U && (store || mode != 0x00300000U)))
+                 return fail(index, "native local scalar spill mode");
+             emit((store ? 0xef50000000000000ULL : 0xef40000000000000ULL) | predicate |
+-                 data | (u64{insn.Bits(24, 8)} << 8) | (u64{insn.Bits(40, 24)} << 20) | (u64{4} << 48));
++                 data | (u64{insn.Bits(24, 8)} << 8) | (u64{insn.Bits(40, 24)} << 20) | (u64{width} << 48));
+             break;
+         }
+         case 0x883: { // UP2UR with UP0 selected and a zero merge source.
+diff --git a/src/shader_recompiler/frontend/ampere/native.h b/src/shader_recompiler/frontend/ampere/native.h
+--- a/src/shader_recompiler/frontend/ampere/native.h
++++ b/src/shader_recompiler/frontend/ampere/native.h
+@@ -43,7 +43,7 @@ enum class FrontendMode {
+ 
+ // Salt mixed into the pipeline cache identity of native-translated programs. Bump it whenever the
+ // native translation changes so cached results of an older translator are never reused.
+-inline constexpr u64 NATIVE_TRANSLATOR_SALT = 0x4f554e4345a00007ULL;
++inline constexpr u64 NATIVE_TRANSLATOR_SALT = 0x4f554e4345a00008ULL;
+ 
+ // Maxwell Location offset of native instruction `index` (same mapping the lowering uses).
+ [[nodiscard]] constexpr u32 LocationOf(u32 index) {
+diff --git a/src/shader_recompiler/frontend/ampere/register_pressure.h b/src/shader_recompiler/frontend/ampere/register_pressure.h
+--- a/src/shader_recompiler/frontend/ampere/register_pressure.h
++++ b/src/shader_recompiler/frontend/ampere/register_pressure.h
+@@ -53,8 +53,10 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
+         const u32 width = input.Bits(73, 3), count = width == 6 ? 4 : width == 5 ? 2 : 1;
+         operand(opcode == 0x388 ? 32 : 16, count); operand(24); break;
+     }
+-    case 0x387: case 0x983:
+-        operand(opcode == 0x387 ? 32 : 16); operand(24); break;
++    case 0x387: case 0x983: {
++        const u32 width = input.Bits(73, 3), count = width == 6 ? 4 : width == 5 ? 2 : 1;
++        operand(opcode == 0x387 ? 32 : 16, count); operand(24); break;
++    }
+     case 0x981: case 0x986: {
+         const u32 width = input.Bits(73, 3), count = width == 6 ? 4 : width == 5 ? 2 : 1;
+         operand(opcode == 0x981 ? 16 : 32, count);

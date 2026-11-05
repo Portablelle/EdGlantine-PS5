@@ -1,0 +1,72 @@
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -374,6 +374,7 @@ void TextureCache<P>::TickFrame() {
+     // and what the images themselves account for (VRAM pressure makes the collector thrash). A
+     // load runs at ~20 fps, so 600 frames alone never came before a crash at ~100 s (issue #20).
+     static u64 frames{};
++    static u64 refresh_report_frame{};
+     static auto last_report = std::chrono::steady_clock::now();
+     const auto report_now = std::chrono::steady_clock::now();
+     if (++frames % 600 == 0 || report_now - last_report >= std::chrono::seconds{5}) {
+@@ -431,6 +432,23 @@ void TextureCache<P>::TickFrame() {
+                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
+         LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
+                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
++        // The images refreshed most often since the last report: in how many of its frames, and
++        // their flags at the refresh (CPU- and GPU-modified together: both wrote it).
++        {
++            std::vector<std::pair<u64, u64>> refreshed;
++            for (const auto& [address, refresh] : refresh_counts) refreshed.emplace_back(refresh.refreshes, address);
++            const size_t shown = (std::min<size_t>)(12, refreshed.size());
++            std::partial_sort(refreshed.begin(), refreshed.begin() + shown, refreshed.end(), std::greater<>{});
++            LOG_INFO(HW_GPU, "EDEN_REFRESHES images={} frames_since_report={}", refresh_counts.size(),
++                     frames - std::exchange(refresh_report_frame, frames));
++            for (size_t i = 0; i < shown; ++i) {
++                const auto& r = refresh_counts[refreshed[i].second];
++                LOG_INFO(HW_GPU, "EDEN_REFRESH gpu={:#x} refreshes={} frames={} bytes={}MiB format={} {}x{} layers={} levels={} flags={:#x}",
++                         refreshed[i].second, r.refreshes, r.frames, r.bytes >> 20, r.format, r.width, r.height,
++                         r.layers, r.levels, r.flags);
++            }
++            refresh_counts.clear();
++        }
+         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
+         astc_opaque_images = astc_alpha_images = 0;
+         std::vector<std::pair<u32, u64>> shapes;
+@@ -1550,6 +1568,19 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+         return;
+     }
+     InvalidateAsyncDecode(image);
++    if (refresh_counts.size() < 4096 || refresh_counts.contains(image.gpu_addr)) {
++        auto& refresh = refresh_counts[image.gpu_addr];
++        ++refresh.refreshes;
++        refresh.frames += refresh.last_frame != frame_tick;
++        refresh.last_frame = frame_tick;
++        refresh.bytes += image.guest_size_bytes;
++        refresh.format = static_cast<u32>(image.info.format);
++        refresh.width = image.info.size.width;
++        refresh.height = image.info.size.height;
++        refresh.layers = image.info.resources.layers;
++        refresh.levels = image.info.resources.levels;
++        refresh.flags = static_cast<u32>(image.flags);
++    }
+     if (IsWatchedImage(image.gpu_addr)) {
+         LOG_INFO(HW_GPU, "watch: refresh, flags {:#x}, {} dirty pages, {} remapped ranges",
+                  static_cast<u32>(image.flags), image.partial_dirty_pages.size(), image.partial_remapped.size());
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -128,6 +128,13 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
+     u64 async_decodes_queued{};
+     u64 images_created{};
+     u64 images_uploaded{};   ///< Image contents uploaded from guest memory (last 600 frames)
++    /// Refreshes from guest memory per image since the last report (diagnostics: Pokopia's sprites
++    /// swap places for a frame while ~2 textures are uploaded every frame).
++    struct RefreshCount {
++        u64 refreshes = 0, frames = 0, last_frame = ~u64{0}, bytes = 0;
++        u32 format = 0, width = 0, height = 0, layers = 0, levels = 0, flags = 0;
++    };
++    std::unordered_map<u64, RefreshCount> refresh_counts;
+     u64 uploaded_bytes{};    ///< Guest bytes those uploads read
+     u64 largest_upload{};    ///< Largest of them
+     u64 layer_uploads{};     ///< Of them, uploads of only the written layers

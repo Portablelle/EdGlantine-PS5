@@ -27,6 +27,8 @@ python3 tests-nx2/check-converted-upload-chunks.py
 python3 tests-nx2/check-graphics-usage-reserve.py
 python3 tests-nx2/check-vram-reclaim.py
 python3 tests-nx2/check-readback-refusal.py
+python3 tests-nx2/check-memory-breakdown.py
+python3 tests-nx2/check-native-spill-lut.py
 python3 tests-nx2/check-native.py
 python3 tests-nx2/run-mme.py
 python3 tools/check-exclusive-monitor.py

@@ -869,6 +869,14 @@ int main(int argc, char** argv) {
         [[maybe_unused]] bool dev_block_list = false;  // read where a session applies its settings
         [[maybe_unused]] int dev_vertex_input = -1;  // likewise: dev-settings vertex_input_dynamic=off/on
         [[maybe_unused]] bool dev_cram_on = true, dev_cram_scan = true, dev_cram_dedup = false, dev_cram_fine = false;
+        // A/B switch in any build, read each session: /data/eden-nx2/descriptor-buffer-off.txt turns
+        // VK_EXT_descriptor_buffer off (Pokopia's sprites swap places for a frame: a descriptor
+        // written over before the GPU read it would do that). Development builds may still turn it
+        // off with dev-settings below.
+        Eden::DevVulkan::disable_descriptor_buffer =
+            std::ifstream(std::string{Eden::kDataDir} + "/descriptor-buffer-off.txt").good();
+        if (Eden::DevVulkan::disable_descriptor_buffer)
+            std::fprintf(stderr, "EDEN_DESCRIPTOR_BUFFER off (descriptor-buffer-off.txt)\n");
 #ifdef EDEN_DEV_PROFILE
         // One-run A/B switches written by the development runner; absent = defaults.
         {
