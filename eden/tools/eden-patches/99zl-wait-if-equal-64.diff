@@ -1,0 +1,192 @@
+--- a/src/core/hle/kernel/k_address_arbiter.cpp
++++ b/src/core/hle/kernel/k_address_arbiter.cpp
+@@ -31,6 +31,11 @@
+     return true;
+ }
+ 
++bool ReadFromUser(KernelCore& kernel, s64* out, KProcessAddress address) {
++    *out = static_cast<s64>(GetCurrentMemory(kernel).Read64(GetInteger(address)));
++    return true;
++}
++
+ bool DecrementIfLessThan(KernelCore& kernel, s32* out, KProcessAddress address, s32 value) {
+     auto& monitor = GetCurrentProcess(kernel).GetExclusiveMonitor();
+     const auto current_core = kernel.CurrentPhysicalCoreIndex();
+@@ -323,6 +328,54 @@
+         if (!ReadFromUser(system.Kernel(), std::addressof(user_value), addr)) {
+             slp.CancelSleep();
+             R_THROW(ResultInvalidCurrentMemory);
++        }
++
++        // Check that the value is equal.
++        if (value != user_value) {
++            slp.CancelSleep();
++            R_THROW(ResultInvalidState);
++        }
++
++        // Check that the timeout is non-zero.
++        if (timeout == 0) {
++            slp.CancelSleep();
++            R_THROW(ResultTimedOut);
++        }
++
++        // Set the arbiter.
++        cur_thread->SetAddressArbiter(std::addressof(m_tree), addr);
++        m_tree.insert(*cur_thread);
++
++        // Wait for the thread to finish.
++        wait_queue.SetHardwareTimer(timer);
++        cur_thread->BeginWait(system.Kernel(), std::addressof(wait_queue));
++        cur_thread->SetWaitReasonForDebugging(ThreadWaitReasonForDebugging::Arbitration);
++    }
++
++    // Get the result.
++    return cur_thread->GetWaitResult();
++}
++
++Result KAddressArbiter::WaitIfEqual64(uint64_t addr, s64 value, s64 timeout) {
++    // Prepare to wait.
++    KThread* cur_thread = GetCurrentThreadPointer(system.Kernel());
++    KHardwareTimer* timer{};
++    ThreadQueueImplForKAddressArbiter wait_queue(system.Kernel(), std::addressof(m_tree));
++
++    {
++        KScopedSchedulerLockAndSleep slp{system.Kernel(), std::addressof(timer), cur_thread, timeout};
++
++        // Check that the thread isn't terminating.
++        if (cur_thread->IsTerminationRequested()) {
++            slp.CancelSleep();
++            R_THROW(ResultTerminationRequested);
++        }
++
++        // Read the value from userspace.
++        s64 user_value{};
++        if (!ReadFromUser(system.Kernel(), std::addressof(user_value), addr)) {
++            slp.CancelSleep();
++            R_THROW(ResultInvalidCurrentMemory);
+         }
+ 
+         // Check that the value is equal.
+--- a/src/core/hle/kernel/k_address_arbiter.h
++++ b/src/core/hle/kernel/k_address_arbiter.h
+@@ -41,14 +41,16 @@
+         }
+     }
+ 
+-    Result WaitForAddress(uint64_t addr, Svc::ArbitrationType type, s32 value, s64 timeout) {
++    Result WaitForAddress(uint64_t addr, Svc::ArbitrationType type, s64 value, s64 timeout) {
+         switch (type) {
+         case Svc::ArbitrationType::WaitIfLessThan:
+-            R_RETURN(WaitIfLessThan(addr, value, false, timeout));
++            R_RETURN(WaitIfLessThan(addr, static_cast<s32>(value), false, timeout));
+         case Svc::ArbitrationType::DecrementAndWaitIfLessThan:
+-            R_RETURN(WaitIfLessThan(addr, value, true, timeout));
++            R_RETURN(WaitIfLessThan(addr, static_cast<s32>(value), true, timeout));
+         case Svc::ArbitrationType::WaitIfEqual:
+-            R_RETURN(WaitIfEqual(addr, value, timeout));
++            R_RETURN(WaitIfEqual(addr, static_cast<s32>(value), timeout));
++        case Svc::ArbitrationType::WaitIfEqual64:
++            R_RETURN(WaitIfEqual64(addr, value, timeout));
+         default:
+             UNREACHABLE();
+         }
+@@ -60,6 +62,7 @@
+     Result SignalAndModifyByWaitingCountIfEqual(uint64_t addr, s32 value, s32 count);
+     Result WaitIfLessThan(uint64_t addr, s32 value, bool decrement, s64 timeout);
+     Result WaitIfEqual(uint64_t addr, s32 value, s64 timeout);
++    Result WaitIfEqual64(uint64_t addr, s64 value, s64 timeout);
+ 
+ private:
+     ThreadTree m_tree;
+--- a/src/core/hle/kernel/k_process.h
++++ b/src/core/hle/kernel/k_process.h
+@@ -494,7 +494,7 @@
+         R_RETURN(m_address_arbiter.SignalToAddress(address, signal_type, value, count));
+     }
+ 
+-    Result WaitAddressArbiter(uintptr_t address, Svc::ArbitrationType arb_type, s32 value, s64 timeout) {
++    Result WaitAddressArbiter(uintptr_t address, Svc::ArbitrationType arb_type, s64 value, s64 timeout) {
+         R_RETURN(m_address_arbiter.WaitForAddress(address, arb_type, value, timeout));
+     }
+ 
+--- a/src/core/hle/kernel/svc/svc_address_arbiter.cpp
++++ b/src/core/hle/kernel/svc/svc_address_arbiter.cpp
+@@ -32,6 +32,7 @@
+     case Svc::ArbitrationType::WaitIfLessThan:
+     case Svc::ArbitrationType::DecrementAndWaitIfLessThan:
+     case Svc::ArbitrationType::WaitIfEqual:
++    case Svc::ArbitrationType::WaitIfEqual64:
+         return true;
+     default:
+         return false;
+@@ -41,14 +42,18 @@
+ } // namespace
+ 
+ // Wait for an address (via Address Arbiter)
+-Result WaitForAddress(Core::System& system, u64 address, ArbitrationType arb_type, s32 value,
++Result WaitForAddress(Core::System& system, u64 address, ArbitrationType arb_type, s64 value,
+                       s64 timeout_ns) {
+     LOG_TRACE(Kernel_SVC, "called, address={:#x}, arb_type={:#x}, value={:#x}, timeout_ns={}",
+               address, arb_type, value, timeout_ns);
+ 
+     // Validate input.
+     R_UNLESS(!IsKernelAddress(address), ResultInvalidCurrentMemory);
+-    R_UNLESS(Common::IsAligned(address, sizeof(s32)), ResultInvalidAddress);
++    if (arb_type == ArbitrationType::WaitIfEqual64) {
++        R_UNLESS(Common::IsAligned(address, sizeof(s64)), ResultInvalidAddress);
++    } else {
++        R_UNLESS(Common::IsAligned(address, sizeof(s32)), ResultInvalidAddress);
++    }
+     R_UNLESS(IsValidArbitrationType(arb_type), ResultInvalidEnumValue);
+ 
+     // Convert timeout from nanoseconds to ticks.
+@@ -86,7 +91,7 @@
+                  .SignalAddressArbiter(address, signal_type, value, count));
+ }
+ 
+-Result WaitForAddress64(Core::System& system, u64 address, ArbitrationType arb_type, s32 value,
++Result WaitForAddress64(Core::System& system, u64 address, ArbitrationType arb_type, s64 value,
+                         s64 timeout_ns) {
+     R_RETURN(WaitForAddress(system, address, arb_type, value, timeout_ns));
+ }
+--- a/src/core/hle/kernel/svc.cpp
++++ b/src/core/hle/kernel/svc.cpp
+@@ -1642,7 +1642,7 @@
+ static void SvcWrap_WaitForAddress64(Core::System& system, std::span<uint64_t, 8> args) {
+     uint64_t address = Convert<uint64_t>(GetArg64(args, 0));
+     ArbitrationType arb_type = Convert<ArbitrationType>(GetArg64(args, 1));
+-    int32_t value = Convert<int32_t>(GetArg64(args, 2));
++    int64_t value = Convert<int64_t>(GetArg64(args, 2));
+     int64_t timeout_ns = Convert<int64_t>(GetArg64(args, 3));
+     Result ret = WaitForAddress64(system, address, arb_type, value, timeout_ns);
+     SetArg64(args, 0, Convert<uint64_t>(ret));
+--- a/src/core/hle/kernel/svc.h
++++ b/src/core/hle/kernel/svc.h
+@@ -71,7 +71,7 @@
+ Result GetResourceLimitCurrentValue(Core::System& system, int64_t* out_current_value, Handle resource_limit_handle, LimitableResource which);
+ Result SetThreadActivity(Core::System& system, Handle thread_handle, ThreadActivity thread_activity);
+ Result GetThreadContext3(Core::System& system, uint64_t out_context, Handle thread_handle);
+-Result WaitForAddress(Core::System& system, uint64_t address, ArbitrationType arb_type, int32_t value, int64_t timeout_ns);
++Result WaitForAddress(Core::System& system, uint64_t address, ArbitrationType arb_type, int64_t value, int64_t timeout_ns);
+ Result SignalToAddress(Core::System& system, uint64_t address, SignalType signal_type, int32_t value, int32_t count);
+ void SynchronizePreemptionState(Core::System& system);
+ Result GetResourceLimitPeakValue(Core::System& system, int64_t* out_peak_value, Handle resource_limit_handle, LimitableResource which);
+@@ -313,7 +313,7 @@
+ Result GetResourceLimitCurrentValue64(Core::System& system, int64_t* out_current_value, Handle resource_limit_handle, LimitableResource which);
+ Result SetThreadActivity64(Core::System& system, Handle thread_handle, ThreadActivity thread_activity);
+ Result GetThreadContext364(Core::System& system, uint64_t out_context, Handle thread_handle);
+-Result WaitForAddress64(Core::System& system, uint64_t address, ArbitrationType arb_type, int32_t value, int64_t timeout_ns);
++Result WaitForAddress64(Core::System& system, uint64_t address, ArbitrationType arb_type, int64_t value, int64_t timeout_ns);
+ Result SignalToAddress64(Core::System& system, uint64_t address, SignalType signal_type, int32_t value, int32_t count);
+ void SynchronizePreemptionState64(Core::System& system);
+ Result GetResourceLimitPeakValue64(Core::System& system, int64_t* out_peak_value, Handle resource_limit_handle, LimitableResource which);
+--- a/src/core/hle/kernel/svc_types.h
++++ b/src/core/hle/kernel/svc_types.h
+@@ -75,6 +75,7 @@
+     WaitIfLessThan = 0,
+     DecrementAndWaitIfLessThan = 1,
+     WaitIfEqual = 2,
++    WaitIfEqual64 = 3,
+ };
+ 
+ enum class YieldType : s64 {

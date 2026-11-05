@@ -1,0 +1,71 @@
+--- a/src/core/hle/service/audio/nx2_audio_device_manager.h
++++ b/src/core/hle/service/audio/nx2_audio_device_manager.h
+@@ -51,6 +51,7 @@
+     s32 data_threshold{}; ///< free frames that signal the data event
+     Kernel::KEvent* state_event{};
+     Kernel::KEvent* data_event{};
++    u32 layout_dumps{}; ///< EDEN_SYSMIX_LAYOUT reports written for this stream (at most 3)
+ };
+ 
+ struct Nx2SysmixStreams {
+@@ -421,6 +422,44 @@
+     // is empty are dropped, as an underrun plays silence), and signals the data event of every open
+     // stream with at least its threshold of free frames, engaged or not: the game fills the ring
+     // before it engages the stream.
++    static void DumpLayout(Core::Memory::Memory& memory, Nx2SysmixStream& stream, u32 read, u32 write) {
++        const std::size_t bytes = static_cast<std::size_t>((std::min<u64>)(stream.size, 0x40000));
++        std::vector<u8> data(bytes);
++        memory.ReadBlock(stream.buffer, data.data(), bytes);
++        std::size_t nonzero_rows = 0, first = bytes, last = 0;
++        for (std::size_t row = 0; row + 16 <= bytes; row += 16) {
++            if (std::any_of(data.begin() + row, data.begin() + row + 16, [](u8 b) { return b != 0; })) {
++                ++nonzero_rows;
++                first = (std::min)(first, row);
++                last = row;
++            }
++        }
++        LOG_INFO(Service_Audio,
++                 "EDEN_SYSMIX_LAYOUT stream={} dump={} buffer={:#x} size={:#x} type={} channels={} rate={} "
++                 "frames={} read={} write={} nonzero_rows={} first={:#x} last={:#x}",
++                 stream.id, stream.layout_dumps, stream.buffer, stream.size, stream.sample_type,
++                 stream.channels, stream.sample_rate, stream.frames, read, write, nonzero_rows, first, last);
++        std::size_t shown = 0;
++        for (std::size_t row = 0; row + 16 <= bytes && shown < 80; row += 16) {
++            const bool header = row < 0x60 || (row >= 0xff0 && row < 0x1060);
++            const bool nonzero =
++                std::any_of(data.begin() + row, data.begin() + row + 16, [](u8 b) { return b != 0; });
++            if (!header && !nonzero) {
++                continue;
++            }
++            // Past the header, every 16th non-zero row, so the samples' extent shows.
++            if (!header && (row / 16) % 16 != 0) {
++                continue;
++            }
++            u32 w[4];
++            std::memcpy(w, data.data() + row, sizeof(w));
++            LOG_INFO(Service_Audio, "EDEN_SYSMIX_ROW stream={} off={:#06x} {:08x} {:08x} {:08x} {:08x}",
++                     stream.id, row, w[0], w[1], w[2], w[3]);
++            ++shown;
++        }
++        ++stream.layout_dumps;
++    }
++
+     static void Drain(Core::System& system, Nx2SysmixStreams& state, u32 owner) {
+         std::scoped_lock lk{state.mutex};
+         auto& memory = system.ApplicationMemory();
+@@ -435,6 +474,15 @@
+                 continue;
+             }
+             u32 filled = (write + capacity - read) % capacity;
++            // Three reports per stream: when it first holds frames, and twice more once it has
++            // played on (a ring that moves shows where its samples are written).
++            if (filled != 0 && stream->layout_dumps < 3 &&
++                (stream->layout_dumps == 0 || write != 0)) {
++                static thread_local u32 skip = 0;
++                if (stream->layout_dumps == 0 || ++skip % 400 == 0) {
++                    DumpLayout(memory, *stream, read, write);
++                }
++            }
+             if (stream->engaged) {
+                 stream->owed_frames += stream->sample_rate *
+                                        std::chrono::duration<double>(DrainInterval).count();

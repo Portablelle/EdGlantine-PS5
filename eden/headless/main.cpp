@@ -65,6 +65,7 @@
 #include "cache_budget.h"
 #include "performance.h"
 #include "stall_watchdog.h"
+#include "thread_dump.h"
 #include "dev_vulkan.h"
 #include "../src/fastmem.h"
 #include "crash_report.h"
@@ -1849,6 +1850,10 @@ int main(int argc, char** argv) {
                 std::jthread runtime_control([&](std::stop_token stop) {
                     Eden::Performance::ProfilingSession profiling;
                     auto next_memory_report = session_start + std::chrono::seconds(10);
+                    // With detailed logging, what every guest thread waits on, every 10 s: a game
+                    // that stops without an error shows which threads are blocked and where.
+                    const bool thread_dumps = game && Eden::LoadPreferences().detailed_logging;
+                    auto next_thread_dump = session_start + std::chrono::seconds(10);
 #ifdef EDEN_NX2_PS5_PROTO
                     Eden::RuntimeControl commands(Eden::AppFile("split-enable.request"),
                                                   Eden::AppFile("profile-refresh.request"));
@@ -1864,6 +1869,10 @@ int main(int argc, char** argv) {
                         if (game && now >= next_memory_report) {
                             Eden::Performance::ReportSessionMemory("play", 0);
                             next_memory_report = now + std::chrono::seconds(10);
+                        }
+                        if (thread_dumps && now >= next_thread_dump) {
+                            Eden::ThreadDump::Dump(system, std::chrono::duration<double>(now - session_start).count());
+                            next_thread_dump = now + std::chrono::seconds(10);
                         }
                         std::this_thread::sleep_for(std::chrono::milliseconds(50));
                     }

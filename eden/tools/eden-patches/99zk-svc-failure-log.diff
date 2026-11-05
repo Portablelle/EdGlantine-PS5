@@ -1,0 +1,50 @@
+--- a/src/core/hle/kernel/svc.cpp
++++ b/src/core/hle/kernel/svc.cpp
+@@ -2580,6 +2580,32 @@
+     return text;
+ }
+ 
++// A kernel result other than success in the first return register, logged with the call's inputs:
++// a game that stops on a kernel error shows which call returned it. Calls that return no result
++// can leave a value there; a value equal to the first input, and the expected timeouts and
++// cancellations of waits, are skipped. At most 512 lines, InvalidEnumValue (2001-0120) always.
++void LogSvcFailure(Core::System& system, u32 imm, const std::array<uint64_t, 8>& in,
++                   const std::array<uint64_t, 8>& out) {
++    const u32 raw = static_cast<u32>(out[0]);
++    if (raw == 0 || (raw & 0x1FF) != 1 || static_cast<u32>(in[0]) == raw) {
++        return;
++    }
++    const u32 description = (raw >> 9) & 0x1FFF;
++    if (description == 117 || description == 118) { // TimedOut, Cancelled
++        return;
++    }
++    static std::atomic<u32> logged{0};
++    const bool always = description == 120;
++    if (!always && logged.fetch_add(1, std::memory_order_relaxed) >= 512) {
++        return;
++    }
++    LOG_WARNING(Kernel_SVC,
++                "EDEN_SVC_FAIL svc={:#x} result={:#x} (2001-{:04}) thread={} "
++                "in=[{:#x} {:#x} {:#x} {:#x} {:#x} {:#x}] out1={:#x}",
++                imm, raw, description, GetCurrentThread(system.Kernel()).GetThreadId(), in[0],
++                in[1], in[2], in[3], in[4], in[5], out[1]);
++}
++
+ void Call(Core::System& system, u32 imm) {
+     auto& kernel = system.Kernel();
+     auto& process = GetCurrentProcess(kernel);
+@@ -2611,12 +2637,14 @@
+     LOG_TRACE(Kernel_SVC, "{} [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x} [6]={:#x}",
+         imm, GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2),
+         GetArg64(args, 3), GetArg64(args, 4), GetArg64(args, 5), GetArg64(args, 6));
++    const std::array<uint64_t, 8> svc_inputs = args;
+     if (process.Is64Bit()) {
+         Call64(system, imm, args);
+     } else {
+         Call32(system, imm, args);
+     }
+     //kernel.ExitSVCProfile();
++    LogSvcFailure(system, imm, svc_inputs, args);
+     if (diag_slot != nullptr) {
+         diag_slot->svc = ~0u;
+         if (imm == 0x2c) {
