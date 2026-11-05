@@ -1,0 +1,80 @@
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -379,9 +379,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
+         const DAddr diff = base_address - *cpu_src_address;
+         const DAddr new_base_address = *cpu_dest_address + diff;
+         tmp_intervals.push_back({new_base_address, size});
+-        if (DownloadsAtFence(new_base_address, size)) {
+-            uncommitted_gpu_modified_ranges.Add(new_base_address, size);
+-        }
++        QueueFenceDownload(new_base_address, size);
+     };
+     gpu_modified_ranges.ForEachInRange(*cpu_src_address, amount, mirror);
+     // This subtraction in this order is important for overlapping copies.
+@@ -1920,9 +1918,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
+     }
+     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
+     Nx2AddRangeOnce(gpu_modified_ranges, device_addr, size);
+-    if (DownloadsAtFence(device_addr, size)) {
+-        uncommitted_gpu_modified_ranges.Add(device_addr, size);
+-    }
++    QueueFenceDownload(device_addr, size);
+ }
+ 
+ template <class P>
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -625,6 +625,33 @@ private:
+         return all || memory_tracker.IsRegionPreflushable(device_addr, size);
+     }
+ 
++    /// Queues a GPU write for download at the next fence when DownloadsAtFence holds. With only
++    /// Preflushable marks, just the marked pages are queued: a write that covers one marked page
++    /// of a large buffer would otherwise copy the whole buffer back at every fence. The other
++    /// pages stay GPU modified and are flushed on demand, like any write that is not
++    /// Preflushable. EDEN_NX2_EXACT_PREFLUSH=0 queues the whole write again (Lichii #104).
++    void QueueFenceDownload(DAddr device_addr, u64 size) {
++        static const bool exact = [] {
++            const char* value = std::getenv("EDEN_NX2_EXACT_PREFLUSH");
++            return value == nullptr || value[0] != '0';
++        }();
++        if (!DownloadsAtFence(device_addr, size)) {
++            return;
++        }
++        if (!exact || AsyncBufferDownloads()) {
++            uncommitted_gpu_modified_ranges.Add(device_addr, size);
++            return;
++        }
++        const DAddr end = device_addr + size;
++        memory_tracker.ForEachPreflushableRange(device_addr, size, [&](DAddr begin, u64 length) {
++            const DAddr lower = (std::max)(begin, device_addr);
++            const DAddr upper = (std::min)(begin + length, end);
++            if (lower < upper) {
++                uncommitted_gpu_modified_ranges.Add(lower, upper - lower);
++            }
++        });
++    }
++
+     bool AsyncBufferDownloads() const {
+         static const int forced = [] {
+             const char* value = std::getenv("EDEN_NX2_BUFFER_DOWNLOADS");
+diff --git a/src/video_core/buffer_cache/memory_tracker_base.h b/src/video_core/buffer_cache/memory_tracker_base.h
+--- a/src/video_core/buffer_cache/memory_tracker_base.h
++++ b/src/video_core/buffer_cache/memory_tracker_base.h
+@@ -166,6 +166,14 @@ public:
+         });
+     }
+ 
++    /// Call 'func' for each range marked as Preflushable
++    template <typename Func>
++    void ForEachPreflushableRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
++        IteratePages<false>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
++            manager->ForEachModifiedRange(Type::Preflushable, false, manager->cpu_addr + offset, size, func);
++        });
++    }
++
+     /// Call 'func' for each GPU modified range and unmark those pages as GPU modified
+     template <typename Func>
+     void ForEachDownloadRange(VAddr query_cpu_range, u64 query_size, bool clear, Func&& func) {

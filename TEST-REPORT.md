@@ -1,3 +1,34 @@
+# 00.066.002 — Lichii ports, Welcome Tour, November 5, 2026
+
+Test build of `main` after #36 plus #37: Lichii's Ampere GPU timestamps in
+nanoseconds, the continuous-range cache, no upload of a target the clear
+overwrites, the occlusion counter pausing instead of resetting, the alpha-ref
+pipeline key and exact Preflushable downloads. It was installed over FTP:
+70 files, and `param.json` reads 00.066.002. 00.066.001 was installed before
+it without #37.
+
+**Welcome Tour, as reported by the player: 8–20 FPS, about 15 on average.**
+The previous report was about 10 FPS, so this is better, but the scenes and
+runs are not the same, and this is not an A/B on one binary.
+
+Counters from the 50 s of the session's `stderr.log` that follow loading
+(19 windows of about 5 s, logs in `artifacts/lichii-perf-002/logs/`):
+
+- **GPU thread:** 27,421 draws/s and 511 ms/s in `draw`. The finer phases are
+  not measured in this build.
+- **Host GPU:** busy 243 ms/s, fence drains 117 ms/s and queue wait
+  17 ms/s. The host GPU is not what limits the frame rate.
+- **Draw memo:** hits on 4.70 of 4.79 M requests/s, and the resource memo on
+  4.76 M of them.
+
+The hardware video decoder did not load:
+`EDEN_HW_VIDEODEC module-load rc=0x80020002 path=/system/common/lib/libSceVideodec2.sprx`.
+The file is on the console (FTP lists it), so the app's sandbox probably does
+not see that path. Unverified: EVO loads it with `sceSysmoduleLoadModule(207)`
+instead. Videos go to FFmpeg. Nothing shows that this costs gameplay FPS.
+
+---
+
 # Bananza startup hotfix — JIT constant writable alias, November 2, 2026
 
 Initial nxnative/nightly package crashes after 22 seconds, CPUCore_0, before any
