@@ -818,6 +818,10 @@ std::vector<pe::ui::Game> EdenServices::games() {
                 game.sources = sources_of(titles[i]);
                 game.key = titles[i].key;
                 local[i] = true;
+                // A game whose files hold no cover (a folder dump) takes its sources' one.
+                for (const Eden::Remote::Game& entry : titles[i].games)
+                    if (game.cover.empty() && !entry.cover.empty() && Eden::FileExists(entry.cover))
+                        game.cover = entry.cover;
                 break;
             }
     }
