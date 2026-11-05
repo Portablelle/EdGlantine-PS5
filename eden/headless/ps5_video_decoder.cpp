@@ -232,6 +232,19 @@ public:
             au.insert(au.end(), packet.begin(), packet.end());
             if (!ReadH264(au)) return false;
             if (!have_sps) return Fail("h264-sps-missing");
+            if (reordering) {
+                std::optional<std::uint64_t> key;
+                for (auto nal : AnnexBNals(au)) {
+                    const auto type = nal[0] & 31;
+                    if (type != 1 && type != 5) continue;
+                    const auto order = ParseH264SliceOrder(nal, picture);
+                    if (!order || !(key = display_order.Key(*order, picture))) return Fail("h264-slice-order");
+                    break;
+                }
+                if (!key) return Fail("h264-slice-order");
+                if (pending.size() >= MaxPending) return Fail("reorder-depth");
+                pending.push_back({*key, pts});
+            }
             return DecodeOne(au, pts, true, frame);
         }
         const auto split = SplitVp9(packet);
@@ -255,6 +268,32 @@ public:
     }
 
     void ReportFallback(const char* reason) override { Fail(reason); }
+
+    void AllowDelayedOutput() override { delayed_allowed = true; }
+
+    // Outputs the pictures still in the decoder at the end of the stream, in display order.
+    bool DrainFrames(std::vector<std::shared_ptr<FFmpeg::Frame>>& drained) override {
+        if (!decoder || failed) return false;
+        while (!pending.empty()) {
+            const auto slot = next_slot++ % Slots;
+            auto* frame_buffer = static_cast<u8*>(frames.address) + slot * frame_bytes;
+            SceVideodec2FrameBuffer fb{};
+            fb.size = sizeof(fb); fb.buffer = frame_buffer; fb.buffer_size = frame_bytes;
+            SceVideodec2OutputInfo out{};
+            out.size = sizeof(out);
+            const int rc = api->Flush(decoder, &fb, &out);
+            if (rc) return Fail("drain-flush", rc);
+            if (!out.valid) break;
+            std::shared_ptr<FFmpeg::Frame> frame;
+            // As in EVO's drain, a flushed picture is not tied to an accepted slot.
+            if (!EmitPicture(out, fb, frame_buffer, TakeDisplayPts(), frame, false)) return false;
+            drained.push_back(std::move(frame));
+        }
+        if (!pending.empty())
+            std::fprintf(stderr, "EDEN_HW_VIDEODEC drain left=%zu\n", pending.size());
+        pending.clear();
+        return true;
+    }
 
     void Close() override {
         if (decoder) {
@@ -304,13 +343,21 @@ private:
                     (decoder && (parsed->coded_width > max_width || parsed->coded_height > max_height)) ||
                     parsed->level > (display.width > 1920 || display.height > 1088 ? 52U : 51U))
                     return Fail("h264-sps-format");
-                if (!parsed->no_reordering) return Fail("h264-reordering");
+                if (!parsed->no_reordering && !reordering) {
+                    // Pictures leave in display order: they are paired with their packets
+                    // by picture order count, which needs type 0 or 2.
+                    if (!delayed_allowed) return Fail("h264-reordering");
+                    if (parsed->poc_type == 1) return Fail("h264-poc-type");
+                    reordering = true;
+                    std::fprintf(stderr, "EDEN_HW_VIDEODEC reordering poc-type=%u\n", parsed->poc_type);
+                }
+                if (reordering && parsed->poc_type == 1) return Fail("h264-poc-type");
                 picture = *parsed;
                 have_sps = true;
             } else if (type == 1 || type == 5) {
                 const auto b_slice = IsBSlice(nal);
-                // Also reject slices contradicting the admitted zero-reordering SPS.
-                if (!b_slice || *b_slice) return Fail("h264-reordering");
+                // Without reordering, also reject slices contradicting the admitted SPS.
+                if (!b_slice || (*b_slice && !reordering)) return Fail("h264-reordering");
             } else if (type >= 2 && type <= 4) return Fail("h264-data-partition");
             else if (type == 0 || type > 12) return Fail("h264-nal-type");
         }
@@ -339,6 +386,8 @@ private:
         if (rc) return Fail("decode", rc);
         if (in.size != sizeof(in) || fb.size != sizeof(fb) || out.size != sizeof(out) || out.error)
             return Fail("decode-output");
+        // Reordered pictures stay in the decoder until their display turn (or DrainFrames).
+        if (reordering && !out.valid) return true;
         if (shown && !out.valid) {
             out = {}; out.size = sizeof(out);
             rc = api->Flush(decoder, &fb, &out);
@@ -346,8 +395,28 @@ private:
         }
         // Hidden VP9 references must be submitted, but never paired to an output timestamp.
         if (!shown) return true;
+        return EmitPicture(out, fb, frame_buffer, reordering ? TakeDisplayPts() : pts, frame, true);
+    }
+    // The decoder emits pictures in display order: the earliest pending one is leaving.
+    s64 TakeDisplayPts() {
+        if (pending.empty()) return -1;
+        const auto earliest = std::ranges::min_element(pending, {}, &PendingPicture::key);
+        const auto pts = earliest->pts;
+        pending.erase(earliest);
+        if (logged_outputs < 8) {
+            std::fprintf(stderr, "EDEN_HW_VIDEODEC reorder-out pts=%lld pending=%zu\n",
+                         static_cast<long long>(pts), pending.size());
+            ++logged_outputs;
+        }
+        return pts;
+    }
+    bool EmitPicture(const SceVideodec2OutputInfo& out, const SceVideodec2FrameBuffer& fb,
+                     u8* frame_buffer, s64 pts, std::shared_ptr<FFmpeg::Frame>& frame,
+                     bool require_accepted) {
+        if (pts < 0) return Fail("reorder-pairing");
         if (!out.valid || out.error || out.picture_count != 1 || out.codec != codec_type ||
-            out.size != sizeof(out) || fb.size != sizeof(fb) || !fb.accepted) return Fail("no-picture");
+            out.size != sizeof(out) || fb.size != sizeof(fb) || (require_accepted && !fb.accepted))
+            return Fail("no-picture");
         const auto pitch = out.pitch_bytes ? out.pitch_bytes : out.pitch;
         if (!pitch || pitch != out.pitch || pitch < out.width || out.width > max_width ||
             out.height > max_height || out.width < picture.coded_width || out.height < picture.coded_height ||
@@ -391,6 +460,16 @@ private:
     std::size_t cpu_bytes{}, frame_bytes{}, next_slot{};
     u32 codec_type{}, max_width{}, max_height{};
     bool owns_queue{}, reset_done{}, have_sps{}, decoded_once{}, failed{};
+    // Delayed output (AllowDelayedOutput): reordered H.264, paired by display order.
+    struct PendingPicture {
+        std::uint64_t key;
+        s64 pts;
+    };
+    static constexpr std::size_t MaxPending = 16;
+    std::vector<PendingPicture> pending;
+    H264DisplayOrder display_order;
+    unsigned logged_outputs{};
+    bool delayed_allowed{}, reordering{};
 };
 
 } // namespace

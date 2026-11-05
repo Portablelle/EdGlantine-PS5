@@ -18,11 +18,12 @@ assert 'h264_backend.Decode(' in native, 'native video hardware selection hook m
 assert (host1x / 'hardware_video_decoder.cpp').is_file(), 'standalone hardware session missing'
 # Integration points requiring the full emulator/FFmpeg build remain presence checks only.
 for hook in ('h264_backend.Reset(', 'h264_backend.Finish(', 'h264_backend.TakeRestartPacket(',
-             'h264_backend.SoftwareResult(', 'h264_backend.ConfigureH264('):
+             'h264_backend.SoftwareResult(', 'h264_backend.ConfigureH264(',
+             'h264_backend.AllowDelayedOutput(', 'h264_backend.Drain('):
     assert hook in native, hook
 ffmpeg_source = (host1x / 'ffmpeg.cpp').read_text()
 for hook in ('m_backend.Decode(', 'm_backend.Reset(', 'm_backend.TakeRestartPacket(',
-             'm_backend.SoftwareResult(', 'bool IsBackendFrameValid('):
+             'm_backend.SoftwareResult(', 'bool IsBackendFrameValid(', 's64 BackendFramePts('):
     assert hook in ffmpeg_source, hook
 cmake = (source / 'video_core/CMakeLists.txt').read_text()
 for unit in ('hardware_video_decoder.cpp', 'hardware_video_decoder.h', 'video_decode.h'):
@@ -125,6 +126,7 @@ bool IsBackendFrameValid(const Frame& frame, const FrameDimensions& dimensions, 
     return Eden::VideoDecode::ValidFrame(frame, dimensions.width, dimensions.height, pts,
                                          AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P);
 }
+s64 BackendFramePts(const Frame& frame) { return frame.GetFrame()->pts; }
 }
 
 using namespace FFmpeg;
@@ -292,6 +294,11 @@ struct State {
     unsigned direct_count{}, fail_direct_index{};
     u32 codec{};
     bool no_picture{}, buffered{}, pending{}, bad_pitch{}, bad_bounds{}, bad_size{}, output_error{};
+    // Reordering decoder: emit[n] says whether decode call n outputs a picture; Flush outputs
+    // flush_left more. The pictures leave in display order, as the backend assumes.
+    bool reorder{};
+    std::vector<bool> emit;
+    unsigned flush_left{};
     int Call(const char* name) { calls.push_back(name); return failure == name ? Error : 0; }
 } state;
 void Clean() {
@@ -423,6 +430,11 @@ int32_t MockVideodec2Decode(void* decoder, SceVideodec2InputData* input,
     const auto rc = Sony::state.Call("decode");
     if (rc) return rc;
     Sony::Fill(fb, output);
+    if (Sony::state.reorder) {
+        const auto call = Sony::state.decodes - 1;
+        output->valid = call < Sony::state.emit.size() && Sony::state.emit[call];
+        return 0;
+    }
     if (Sony::state.no_picture || Sony::state.buffered) output->valid = 0;
     Sony::state.pending = Sony::state.buffered && !Sony::state.no_picture;
     if (Sony::state.codec == 2382845) {
@@ -435,6 +447,10 @@ int32_t MockVideodec2Flush(void* decoder, SceVideodec2FrameBuffer* fb, SceVideod
     assert(decoder && fb->size == sizeof(*fb) && output->size == sizeof(*output));
     const auto rc = Sony::state.Call("flush");
     if (rc) return rc;
+    if (Sony::state.reorder) {
+        if (Sony::state.flush_left) { Sony::Fill(fb, output); --Sony::state.flush_left; }
+        return 0;
+    }
     if (Sony::state.pending) { Sony::Fill(fb, output); Sony::state.pending = false; }
     return 0;
 }
@@ -877,6 +893,75 @@ size_t CountLog(const std::string& text, const std::string& needle) {
     while ((pos = text.find(needle, pos)) != std::string::npos) { ++count; pos += needle.size(); }
     return count;
 }
+// One slice NAL of a frame picture for the test SPS (4-bit frame_num, POC type 0 with a 4-bit
+// pic_order_cnt_lsb). slice_type 0 = P, 1 = B, 2 = I.
+std::vector<u8> Slice(bool idr, bool reference, unsigned slice_type, unsigned frame_num, unsigned poc_lsb) {
+    BitWriter w;
+    w.UE(0); w.UE(slice_type); w.UE(0); w.U(frame_num, 4);
+    if (idr) w.UE(0);
+    w.U(poc_lsb, 4);
+    w.U(0xa5, 8); w.U(1, 1); // Some slice data, then the stop bit.
+    std::vector<u8> nal{0, 0, 0, 1, u8((reference ? 0x60 : 0) | (idr ? 5 : 1))};
+    nal.insert(nal.end(), w.bytes.begin(), w.bytes.end());
+    return nal;
+}
+void CheckDelayedOutput() {
+    // An SPS that allows reordering, then I P B B P B B in decode order:
+    // display order I(0) B(2) B(4) P(6) B(8) B(10) P(12).
+    struct Unit { bool idr, reference; unsigned type, frame_num, poc; };
+    const Unit gop[]{{true, true, 2, 0, 0}, {false, true, 0, 1, 6}, {false, false, 1, 2, 2},
+                     {false, false, 1, 2, 4}, {false, true, 0, 2, 12}, {false, false, 1, 3, 8},
+                     {false, false, 1, 3, 10}};
+    const auto sps = Sps(false, 2);
+    assert(!Eden::VideoDecode::H264Sps(sps)->no_reordering);
+    const auto make = [&](const Unit& unit) {
+        std::vector<u8> au;
+        if (unit.idr) {
+            au = {0, 0, 0, 1}; au.insert(au.end(), sps.begin(), sps.end());
+            au.insert(au.end(), {0, 0, 1, 0x68, 0xce, 0x3c, 0x80});
+        }
+        const auto slice = Slice(unit.idr, unit.reference, unit.type, unit.frame_num, unit.poc);
+        au.insert(au.end(), slice.begin(), slice.end());
+        return au;
+    };
+    // Without delayed output, the reordering SPS stays on FFmpeg.
+    {
+        Sony::Setup(); CaptureLog log; Eden::RegisterPs5VideoDecoder();
+        HardwareVideoDecoderSession session; std::shared_ptr<Frame> frame;
+        assert(session.Decode(VideoCodec::H264, make(gop[0]), {}, high, 1, {}, frame) == Route::Software);
+        assert(log.Read().find("fallback reason=h264-reordering") != std::string::npos);
+        session.Finish(); Sony::Clean();
+    }
+    Sony::Setup();
+    Sony::state.reorder = true;
+    Sony::state.emit = {false, false, true, true, true, true, true};
+    Sony::state.flush_left = 2;
+    std::vector<s64> shown;
+    {
+        CaptureLog log; Eden::RegisterPs5VideoDecoder();
+        HardwareVideoDecoderSession session;
+        session.AllowDelayedOutput();
+        for (s64 pts = 1; pts <= 7; ++pts) {
+            std::shared_ptr<Frame> frame;
+            const auto route = session.Decode(VideoCodec::H264, make(gop[pts - 1]), {}, high, pts, {}, frame);
+            assert(route == Route::Hardware && session.IsActive());
+            assert(!frame == !Sony::state.emit[pts - 1]);
+            if (frame) shown.push_back(frame->GetFrame()->pts);
+        }
+        for (const auto& frame : session.Drain()) shown.push_back(frame->GetFrame()->pts);
+        assert(session.IsActive());
+        session.Finish();
+        const auto text = log.Read();
+        assert(text.find("EDEN_HW_VIDEODEC reordering poc-type=0") != std::string::npos);
+        assert(text.find("fallback reason=") == std::string::npos);
+        assert(CountLog(text, "EDEN_HW_VIDEODEC reorder-out ") == 7);
+    }
+    // Each picture carries the pts of its own packet, in display order.
+    assert((shown == std::vector<s64>{1, 3, 4, 2, 6, 7, 5}));
+    assert(Sony::state.decodes == 7 && Sony::state.flush_left == 0);
+    Sony::Clean();
+}
+
 void CheckLoader(const std::string& mode) {
     Setup(); Sony::Setup();
     const bool module_failure = mode == "--loader-module-fail";
@@ -935,6 +1020,7 @@ int main(int argc, char** argv) {
     if (argc > 1) { CheckLoader(argv[1]); return 0; }
     CheckSession();
     CheckVideodecApi();
+    CheckDelayedOutput();
 }
 '''
 

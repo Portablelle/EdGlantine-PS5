@@ -1,0 +1,174 @@
+diff --git a/src/core/hle/service/am/service/native_video_decoder.cpp b/src/core/hle/service/am/service/native_video_decoder.cpp
+--- a/src/core/hle/service/am/service/native_video_decoder.cpp
++++ b/src/core/hle/service/am/service/native_video_decoder.cpp
+@@ -335,6 +335,7 @@ private:
+     }
+ 
+     void DrainH264() {
++        for (const auto& frame : h264_backend.Drain()) QueueH264Frame(frame);
+         h264_backend.Finish();
+         avcodec_send_packet(h264_context->GetCodecContext(), nullptr);
+         CollectH264Frames();
+@@ -356,6 +357,9 @@ private:
+         auto phase = PerfClock::now();
+         auto bytes = ffmpeg_vp9 ? input.bytes : ToAnnexB(input.bytes);
+         if (!ffmpeg_vp9) {
++            // Frames are paired with submissions by pts (QueueH264Frame), so the hardware
++            // decoder may return them later and in display order, as FFmpeg does.
++            h264_backend.AllowDelayedOutput();
+             std::shared_ptr<FFmpeg::Frame> hardware_frame;
+             const auto route = h264_backend.Decode(Tegra::Host1x::NvdecCommon::VideoCodec::H264,
+                 bytes, {}, FFmpeg::FrameDimensions{static_cast<s32>(configuration->width),
+@@ -365,7 +369,7 @@ private:
+                 PerfMark(Decode, phase);
+                 if (route == FFmpeg::HardwareVideoDecoderSession::Route::Hardware) {
+                     h264_timestamps[input.submission_id] = input.timestamp;
+-                    QueueH264Frame(hardware_frame);
++                    if (hardware_frame) QueueH264Frame(hardware_frame);
+                 }
+                 // Also consume skipped inter pictures: PumpOutput must keep progressing to IDR.
+                 pending_input_bytes -= input.bytes.size();
+diff --git a/src/video_core/host1x/ffmpeg.cpp b/src/video_core/host1x/ffmpeg.cpp
+--- a/src/video_core/host1x/ffmpeg.cpp
++++ b/src/video_core/host1x/ffmpeg.cpp
+@@ -364,6 +364,10 @@ bool IsBackendFrameValid(const Frame& frame, const FrameDimensions& dimensions,
+                                          AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P);
+ }
+ 
++s64 BackendFramePts(const Frame& frame) {
++    return frame.GetFrame()->pts;
++}
++
+ DecodeApi::~DecodeApi() {
+     this->Reset();
+ }
+diff --git a/src/video_core/host1x/hardware_video_decoder.cpp b/src/video_core/host1x/hardware_video_decoder.cpp
+--- a/src/video_core/host1x/hardware_video_decoder.cpp
++++ b/src/video_core/host1x/hardware_video_decoder.cpp
+@@ -39,6 +39,18 @@ void HardwareVideoDecoderSession::Reset() {
+     m_h264 = {};
+     m_restart_packet.clear();
+ }
++std::vector<std::shared_ptr<Frame>> HardwareVideoDecoderSession::Drain() {
++    std::vector<std::shared_ptr<Frame>> frames;
++    if (m_state != State::Hardware || !m_delayed) return frames;
++    if (!m_backend->DrainFrames(frames)) {
++        m_backend->ReportFallback("drain-failed");
++        Transition(State::Recovery);
++    }
++    std::erase_if(frames, [this](const std::shared_ptr<Frame>& frame) {
++        return !frame || !IsBackendFrameValid(*frame, m_dimensions, BackendFramePts(*frame));
++    });
++    return frames;
++}
+ void HardwareVideoDecoderSession::Finish() {
+     if (m_state == State::Hardware) Transition(State::Recovery);
+ }
+@@ -71,6 +83,7 @@ HardwareVideoDecoderSession::Route HardwareVideoDecoderSession::Decode(
+             dimensions->width > 0 && dimensions->height > 0 && dimensions->profile >= 0 &&
+             (codec == VideoCodec::H264 || codec == VideoCodec::VP9)) {
+             auto backend = factory();
++            if (backend && m_delayed) backend->AllowDelayedOutput();
+             if (backend && backend->Supports(codec, *dimensions)) {
+                 // Include in-band SPS before Open so admission can verify its VUI restrictions.
+                 const auto parameters = codec == VideoCodec::H264 ? m_h264.Restore({}) : std::vector<u8>{};
+@@ -90,9 +103,12 @@ HardwareVideoDecoderSession::Route HardwareVideoDecoderSession::Decode(
+         if (m_state == State::Selection) Transition(State::Software);
+     }
+     if (m_state == State::Hardware) {
++        // A delayed backend can return no frame, or the frame of an earlier packet.
+         if (dimensions == m_dimensions && !offsets.interlaced &&
+             m_backend->Decode(packet, pts, frame) &&
+-            (offsets.hidden || (frame && IsBackendFrameValid(*frame, *dimensions, pts)))) {
++            (offsets.hidden ||
++             (m_delayed ? !frame || IsBackendFrameValid(*frame, *dimensions, BackendFramePts(*frame))
++                        : frame && IsBackendFrameValid(*frame, *dimensions, pts)))) {
+             return Route::Hardware;
+         }
+         frame.reset();
+diff --git a/src/video_core/host1x/hardware_video_decoder.h b/src/video_core/host1x/hardware_video_decoder.h
+--- a/src/video_core/host1x/hardware_video_decoder.h
++++ b/src/video_core/host1x/hardware_video_decoder.h
+@@ -13,6 +13,7 @@ namespace FFmpeg {
+ class Frame;
+ struct FrameDimensions;
+ bool IsBackendFrameValid(const Frame& frame, const FrameDimensions& dimensions, s64 pts);
++s64 BackendFramePts(const Frame& frame);
+ 
+ struct FrameOffsets {
+     bool interlaced{};
+@@ -47,6 +48,14 @@ public:
+                       const FrameDimensions& dimensions, std::span<const u8> extradata = {}) = 0;
+     virtual bool Decode(std::span<const u8> packet, s64 pts, std::shared_ptr<Frame>& frame) = 0;
+     virtual void Close() = 0;
++    // Delayed output, for a caller that pairs frames with packets by pts (the native video
++    // service). Called before Open, it lets the backend admit reordered H.264: Decode may then
++    // return no frame, frames come out in display order carrying the pts of their own packet,
++    // and DrainFrames returns those still queued at the end of the stream.
++    virtual void AllowDelayedOutput() {}
++    virtual bool DrainFrames([[maybe_unused]] std::vector<std::shared_ptr<Frame>>& frames) {
++        return true;
++    }
+     // The default logs once at the selection seam; native backends can retain a specific reason.
+     virtual void ReportFallback(const char* reason);
+ };
+@@ -70,6 +79,11 @@ public:
+                  const FrameOffsets& offsets, std::optional<FrameDimensions> dimensions, s64 pts,
+                  std::span<const u8> extradata, std::shared_ptr<Frame>& frame);
+     void Reset();
++    // Lets a later Open admit backends with delayed output (see AllowDelayedOutput). The caller
++    // then accepts Hardware routes without a frame, frames for earlier packets, and Drain.
++    void AllowDelayedOutput() { m_delayed = true; }
++    // Frames still queued in a delayed backend, before Finish at the end of the stream.
++    std::vector<std::shared_ptr<Frame>> Drain();
+     // Synchronous backends have no queued output. Drain closes them and subsequent packets
+     // use FFmpeg from the next IDR/keyframe; it does not retry hardware after EOS/Flush/Stop.
+     void Finish();
+@@ -90,6 +104,7 @@ private:
+     std::vector<u8> m_restart_packet;
+     void Transition(State next);
+     State m_state{State::Selection};
++    bool m_delayed{};
+ };
+ 
+ } // namespace FFmpeg
+diff --git a/src/video_core/host1x/video_decode.h b/src/video_core/host1x/video_decode.h
+--- a/src/video_core/host1x/video_decode.h
++++ b/src/video_core/host1x/video_decode.h
+@@ -124,6 +124,9 @@ inline bool H264Hrd(Bits& b) {
+ struct Picture {
+     std::uint32_t coded_width{}, coded_height{}, width{}, height{}, left{}, top{}, level{};
+     std::uint32_t matrix{2}; // AVCOL_SPC_UNSPECIFIED, native service keeps its BT.709 default.
++    // Slice header fields that order pictures (8.2.1): the bits of frame_num and of
++    // pic_order_cnt_lsb, and pic_order_cnt_type.
++    std::uint32_t frame_num_bits{}, poc_type{}, poc_lsb_bits{};
+     bool full_range{}, no_reordering{};
+ };
+ inline std::optional<Picture> H264Sps(Bytes nal) {
+@@ -147,9 +150,14 @@ inline std::optional<Picture> H264Sps(Bytes nal) {
+             }
+         }
+     } else if (profile != 66 && profile != 77) return {};
+-    if (b.UE() > 12) return {};
++    const auto frame_num_bits = b.UE() + 4;
++    if (frame_num_bits > 16) return {};
+     const auto poc = b.UE();
+-    if (poc == 0) { if (b.UE() > 12) return {}; }
++    std::uint32_t poc_lsb_bits = 0;
++    if (poc == 0) {
++        poc_lsb_bits = b.UE() + 4;
++        if (poc_lsb_bits > 16) return {};
++    }
+     else if (poc == 1) {
+         b.Read(1); b.SE(); b.SE();
+         const auto cycle = b.UE();
+@@ -164,6 +172,9 @@ inline std::optional<Picture> H264Sps(Bytes nal) {
+     b.Read(1);
+     Picture p;
+     p.level = level;
++    p.frame_num_bits = frame_num_bits;
++    p.poc_type = poc;
++    p.poc_lsb_bits = poc_lsb_bits;
+     p.coded_width = (mw + 1) * 16; p.coded_height = (mh + 1) * 16;
+     std::uint32_t right = 0, bottom = 0;
+     if (b.Read(1)) { p.left = b.UE(); right = b.UE(); p.top = b.UE(); bottom = b.UE(); }
