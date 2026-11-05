@@ -1,0 +1,36 @@
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -1590,6 +1590,8 @@
+                 (u64{1} << 39) | (u64{1} << 40));
+             break;
+         case 0x219: case 0xa19: case 0xc19: { // U32 shifts with a zero word outside the selected result.
++            // .L takes the low result of {RZ:low}; .R.HI the high result of {high:RZ}; .R without
++            // .HI the low result of {RZ:low}, the low word shifted right.
+             const u32 low = insn.Bits(24, 8), high = insn.Bits(64, 8);
+             const u32 shift = opcode == 0xa19 ? materialize(2, 0, 251, false, false) :
+                               opcode == 0xc19 ? uniform_register(insn.Bits(32, 8)) : insn.Bits(32, 8);
+@@ -1597,10 +1599,11 @@
+             if ((opcode != 0xa19 && insn.words[1] > 255) || shift == ~0U ||
+                 (opcode == 0xa19 && insn.Bits(62, 2)) || insn.Bits(73, 2) != 3 ||
+                 (insn.words[2] & ~(0x000118ffU | (opcode == 0xc19 ? 0x08000000U : 0U))) != 0x00000600U ||
+-                (right ? (!high_result || low != 255) : (high_result || high != 255)))
++                (right ? (high_result ? low != 255 : high != 255) : (high_result || high != 255)))
+                 return fail(index, "native register shift mode");
++            const bool right_low = right && !high_result;
+             emit(base(right ? 0x5cf8000000000000ULL : 0x5bf8000000000000ULL) |
+-                (u64{right ? high : 255U} << 8) | (u64{shift} << 20) |
++                (u64{right_low ? low : right ? high : 255U} << 8) | (u64{shift} << 20) |
+                 (u64{right ? 255U : low} << 39) | (u64{insn.Bits(75, 1)} << 50));
+             break;
+         }
+--- a/src/shader_recompiler/frontend/ampere/native.h
++++ b/src/shader_recompiler/frontend/ampere/native.h
+@@ -43,7 +43,7 @@
+ 
+ // Salt mixed into the pipeline cache identity of native-translated programs. Bump it whenever the
+ // native translation changes so cached results of an older translator are never reused.
+-inline constexpr u64 NATIVE_TRANSLATOR_SALT = 0x4f554e4345a00008ULL;
++inline constexpr u64 NATIVE_TRANSLATOR_SALT = 0x4f554e4345a00009ULL;
+ 
+ // Maxwell Location offset of native instruction `index` (same mapping the lowering uses).
+ [[nodiscard]] constexpr u32 LocationOf(u32 index) {
