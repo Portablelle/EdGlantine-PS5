@@ -27,12 +27,19 @@ for hook in ('m_backend.Decode(', 'm_backend.Reset(', 'm_backend.TakeRestartPack
 cmake = (source / 'video_core/CMakeLists.txt').read_text()
 for unit in ('hardware_video_decoder.cpp', 'hardware_video_decoder.h', 'video_decode.h'):
     assert 'host1x/' + unit in cmake, unit
-for name in ('headless/CMakeLists.txt', 'tools/prepare-build.sh', 'tools/package-headless-native.sh'):
-    wiring = (root / name).read_text()
-    assert 'libSceVideodec2.so' not in wiring and 'build-videodec2-stub' not in wiring, name
+# The sceVideodec2 functions are imports of the firmware module (as in EVO): loading it by path
+# and resolving with sceKernelDlsym found no symbol on the console (0x80020003).
+assert 'libSceVideodec2.so' in (root / 'headless/CMakeLists.txt').read_text()
+assert 'build-videodec2-stub.sh' in (root / 'tools/prepare-build.sh').read_text()
+assert 'libSceVideodec2.so' in (root / 'tools/package-headless-native.sh').read_text()
 assert 'libSceVideodec2.sprx' not in (root / 'headless/check_package.py').read_text()
-assert not (root / 'tools/build-videodec2-stub.sh').exists()
-assert not (root / 'tools/stubs/libSceVideodec2.c').exists()
+stub = (root / 'tools/stubs/libSceVideodec2.c').read_text()
+for function in ('QueryComputeMemoryInfo', 'AllocateComputeQueue', 'ReleaseComputeQueue',
+                 'QueryDecoderMemoryInfo', 'CreateDecoder', 'DeleteDecoder', 'MapDirectMemory',
+                 'Reset', 'Decode', 'Flush'):
+    assert f'int sceVideodec2{function}(void)' in stub, function
+decoder = (root / 'headless/ps5_video_decoder.cpp').read_text()
+assert 'sceKernelDlsym(' not in decoder and 'sceKernelLoadStartModule(' not in decoder
 
 ffmpeg = r'''#pragma once
 #include <array>
@@ -294,12 +301,8 @@ void Clean() {
 void Setup() { Clean(); state = {}; }
 // Independent of per-stream decoder state: the production loader lives for this process.
 struct LoaderState {
-    unsigned loads{}, resolves{}, sysmodule_loads{};
+    unsigned sysmodule_loads{};
     int rc{};
-    bool sandbox_fails{};
-    std::string missing;
-    bool null_symbol{};
-    std::set<std::string> names;
 } loader;
 void Fill(SceVideodec2FrameBuffer* fb, SceVideodec2OutputInfo* out) {
     fb->accepted = 1;
@@ -317,22 +320,11 @@ void Fill(SceVideodec2FrameBuffer* fb, SceVideodec2OutputInfo* out) {
 }
 }
 extern "C" {
-const char* sceKernelGetFsSandboxRandomWord() { return "sbxword01"; }
+// The module comes from the system module service; its functions are linked imports.
 int sceSysmoduleLoadModule(uint16_t id) {
     assert(id == 207);
     ++Sony::loader.sysmodule_loads;
-    return 0;
-}
-int sceKernelLoadStartModule(const char* path, size_t args, const void* argp,
-                             uint32_t flags, const void* options, int* result) {
-    // The sandbox's view of /system/common/lib first, then the absolute path.
-    const std::string name{path};
-    const bool sandbox = name == "/sbxword01/common/lib/libSceVideodec2.sprx";
-    assert(sandbox || name == "/system/common/lib/libSceVideodec2.sprx");
-    assert(args == 0 && !argp && flags == 0 && !options && !result);
-    ++Sony::loader.loads;
-    if (sandbox && Sony::loader.sandbox_fails) return static_cast<int>(0x80020002U);
-    return Sony::loader.rc ? Sony::loader.rc : 42; // Successful return is a module handle.
+    return Sony::loader.rc;
 }
 int64_t sceKernelGetDirectMemorySize() { return 512 * 1024 * 1024; }
 int sceKernelAllocateDirectMemory(int64_t from, int64_t to, size_t size, size_t align, int type, int64_t* start) {
@@ -447,24 +439,34 @@ int32_t MockVideodec2Flush(void* decoder, SceVideodec2FrameBuffer* fb, SceVideod
     return 0;
 }
 int32_t MockVideodec2MapDirectMemory(void*, const SceVideodec2DirectMemory*) { return Sony::Error; }
-int sceKernelDlsym(int module, const char* name, void** address) {
-    assert(module == 42 && Sony::loader.loads == (Sony::loader.sandbox_fails ? 2U : 1U));
-    ++Sony::loader.resolves;
-    assert(Sony::loader.names.insert(name).second); // No symbol can be resolved twice.
-    *address = nullptr;
-    if (Sony::loader.missing == name) return Sony::loader.null_symbol ? 0 : Sony::Error;
-    if (std::string(name) == "sceVideodec2QueryComputeMemoryInfo") *address = reinterpret_cast<void*>(&MockVideodec2QueryComputeMemoryInfo);
-    if (std::string(name) == "sceVideodec2AllocateComputeQueue") *address = reinterpret_cast<void*>(&MockVideodec2AllocateComputeQueue);
-    if (std::string(name) == "sceVideodec2ReleaseComputeQueue") *address = reinterpret_cast<void*>(&MockVideodec2ReleaseComputeQueue);
-    if (std::string(name) == "sceVideodec2QueryDecoderMemoryInfo") *address = reinterpret_cast<void*>(&MockVideodec2QueryDecoderMemoryInfo);
-    if (std::string(name) == "sceVideodec2CreateDecoder") *address = reinterpret_cast<void*>(&MockVideodec2CreateDecoder);
-    if (std::string(name) == "sceVideodec2DeleteDecoder") *address = reinterpret_cast<void*>(&MockVideodec2DeleteDecoder);
-    if (std::string(name) == "sceVideodec2MapDirectMemory") *address = reinterpret_cast<void*>(&MockVideodec2MapDirectMemory);
-    if (std::string(name) == "sceVideodec2Reset") *address = reinterpret_cast<void*>(&MockVideodec2Reset);
-    if (std::string(name) == "sceVideodec2Decode") *address = reinterpret_cast<void*>(&MockVideodec2Decode);
-    if (std::string(name) == "sceVideodec2Flush") *address = reinterpret_cast<void*>(&MockVideodec2Flush);
-    assert(*address);
-    return 0;
+// The firmware module's functions, as the packaged imports reach them.
+int32_t sceVideodec2QueryComputeMemoryInfo(SceVideodec2ComputeMemoryInfo* memory) {
+    return MockVideodec2QueryComputeMemoryInfo(memory);
+}
+int32_t sceVideodec2AllocateComputeQueue(const SceVideodec2ComputeConfigInfo* config,
+                                         const SceVideodec2ComputeMemoryInfo* memory, void** queue) {
+    return MockVideodec2AllocateComputeQueue(config, memory, queue);
+}
+int32_t sceVideodec2ReleaseComputeQueue(void* queue) { return MockVideodec2ReleaseComputeQueue(queue); }
+int32_t sceVideodec2QueryDecoderMemoryInfo(const SceVideodec2DecoderConfigInfo* config,
+                                           SceVideodec2DecoderMemoryInfo* memory) {
+    return MockVideodec2QueryDecoderMemoryInfo(config, memory);
+}
+int32_t sceVideodec2CreateDecoder(const SceVideodec2DecoderConfigInfo* config,
+                                  const SceVideodec2DecoderMemoryInfo* memory, void** decoder) {
+    return MockVideodec2CreateDecoder(config, memory, decoder);
+}
+int32_t sceVideodec2DeleteDecoder(void* decoder) { return MockVideodec2DeleteDecoder(decoder); }
+int32_t sceVideodec2MapDirectMemory(void* decoder, const SceVideodec2DirectMemory* memory) {
+    return MockVideodec2MapDirectMemory(decoder, memory);
+}
+int32_t sceVideodec2Reset(void* decoder) { return MockVideodec2Reset(decoder); }
+int32_t sceVideodec2Decode(void* decoder, SceVideodec2InputData* input, SceVideodec2FrameBuffer* fb,
+                           SceVideodec2OutputInfo* output) {
+    return MockVideodec2Decode(decoder, input, fb, output);
+}
+int32_t sceVideodec2Flush(void* decoder, SceVideodec2FrameBuffer* fb, SceVideodec2OutputInfo* output) {
+    return MockVideodec2Flush(decoder, fb, output);
 }
 }
 
@@ -866,7 +868,7 @@ void CheckVideodecApi() {
         else assert(!backend->Decode(std::array<u8, 5>{0, 0, 1, 0x41, 0xa0}, 1, frame));
         assert(Sony::state.decodes == 0); Sony::Clean();
     }
-    assert(Sony::loader.loads == 1 && Sony::loader.resolves == 10);
+    assert(Sony::loader.sysmodule_loads == 1);
     RegisterHardwareVideoDecoder(nullptr);
 }
 
@@ -878,21 +880,13 @@ size_t CountLog(const std::string& text, const std::string& needle) {
 void CheckLoader(const std::string& mode) {
     Setup(); Sony::Setup();
     const bool module_failure = mode == "--loader-module-fail";
-    const bool null_symbol = mode == "--loader-null-symbol";
-    const bool missing_symbol = mode == "--loader-symbol-missing" || null_symbol;
-    const bool system_path = mode == "--loader-system-path";
-    assert(module_failure || missing_symbol || system_path || mode == "--loader-success" ||
-           mode == "--loader-concurrent");
+    assert(module_failure || mode == "--loader-success" || mode == "--loader-concurrent");
     Sony::loader.rc = module_failure ? Sony::Error : 0;
-    Sony::loader.sandbox_fails = system_path;
-    // Require even the unused export: a partially resolved API must never be published ready.
-    Sony::loader.missing = missing_symbol ? "sceVideodec2MapDirectMemory" : "";
-    Sony::loader.null_symbol = null_symbol;
     CaptureLog log;
     Eden::RegisterPs5VideoDecoder();
     auto candidate = Eden::CreatePs5VideoDecoder();
     assert(candidate->Supports(VideoCodec::H264, high));
-    assert(Sony::loader.loads == 0 && Sony::loader.resolves == 0); // Registration/Supports are lazy.
+    assert(Sony::loader.sysmodule_loads == 0); // Registration/Supports are lazy.
     if (mode == "--loader-concurrent") {
         std::array<std::thread, 8> threads;
         for (auto& thread : threads) thread = std::thread([] {
@@ -908,11 +902,11 @@ void CheckLoader(const std::string& mode) {
         HardwareVideoDecoderSession session;
         std::shared_ptr<Frame> frame;
         const auto route = session.Decode(VideoCodec::H264, AccessUnit(), {}, high, attempt + 1, {}, frame);
-        if (module_failure || missing_symbol) {
+        if (module_failure) {
             assert(route == HardwareVideoDecoderSession::Route::Software && !frame);
             assert(session.HasFallenBack() && Sony::state.calls.empty());
             // A fixed environment must not trigger a retry: failure belongs to the process cache.
-            Sony::loader.rc = 0; Sony::loader.missing.clear(); Sony::loader.sandbox_fails = false;
+            Sony::loader.rc = 0;
         } else {
             assert(route == HardwareVideoDecoderSession::Route::Hardware && frame);
             assert(frame->GetWidth() == 64 && frame->GetHeight() == 32);
@@ -920,33 +914,14 @@ void CheckLoader(const std::string& mode) {
         }
     }
     Sony::Clean();
-    // Both paths are tried only when the sandbox path fails.
-    const unsigned path_loads = module_failure || system_path ? 2U : 1U;
-    assert(Sony::loader.loads == path_loads && Sony::loader.sysmodule_loads == 1);
-    assert(Sony::loader.resolves == (module_failure ? 0U : missing_symbol ? 7U : 10U));
+    assert(Sony::loader.sysmodule_loads == 1);
     const auto text = log.Read();
-    assert(CountLog(text, "EDEN_HW_VIDEODEC sysmodule-load id=207 rc=0x00000000") == 1);
-    assert(CountLog(text, "EDEN_HW_VIDEODEC module-load ") == path_loads);
-    assert(text.find("path=/sbxword01/common/lib/libSceVideodec2.sprx") != std::string::npos);
-    assert((text.find("path=/system/common/lib/libSceVideodec2.sprx") != std::string::npos) ==
-           (path_loads == 2));
-    if (system_path) {
-        assert(text.find("EDEN_HW_VIDEODEC module-load rc=0x80020002 path=/sbxword01/") !=
-               std::string::npos);
-    }
+    assert(CountLog(text, "EDEN_HW_VIDEODEC sysmodule-load ") == 1);
     if (module_failure) {
-        assert(text.find("EDEN_HW_VIDEODEC module-load rc=0x811d0200") != std::string::npos);
-        assert(CountLog(text, "EDEN_HW_VIDEODEC symbol-missing ") == 0);
-        assert(CountLog(text, "EDEN_HW_VIDEODEC fallback reason=module-load ") == 2);
-    } else if (missing_symbol) {
-        const std::string expected = std::string("EDEN_HW_VIDEODEC symbol-missing name=sceVideodec2MapDirectMemory rc=") +
-                                     (null_symbol ? "0x00000000" : "0x811d0200");
-        assert(text.find(expected) != std::string::npos);
-        assert(CountLog(text, "EDEN_HW_VIDEODEC symbol-missing ") == 1);
-        assert(CountLog(text, "EDEN_HW_VIDEODEC fallback reason=symbol-missing ") == 2);
+        assert(text.find("EDEN_HW_VIDEODEC sysmodule-load id=207 rc=0x811d0200") != std::string::npos);
+        assert(CountLog(text, "EDEN_HW_VIDEODEC fallback reason=sysmodule-load ") == 2);
     } else {
-        assert(text.find("EDEN_HW_VIDEODEC module-load rc=0x0000002a") != std::string::npos);
-        assert(CountLog(text, "EDEN_HW_VIDEODEC symbol-missing ") == 0);
+        assert(text.find("EDEN_HW_VIDEODEC sysmodule-load id=207 rc=0x00000000") != std::string::npos);
         if (mode == "--loader-concurrent") {
             // Queue ownership may reject contenders; the shared loader must still succeed once.
             assert(CountLog(text, "EDEN_HW_VIDEODEC fallback ") ==
@@ -976,9 +951,7 @@ with tempfile.TemporaryDirectory(prefix='hw-video-fallback-') as directory:
                     str(host1x / 'hardware_video_decoder.cpp'),
                     str(root / 'headless/ps5_video_decoder.cpp'),
                     str(temp / 'check.cpp'), '-o', str(temp / 'check')], check=True)
-    for mode in (None, '--loader-module-fail', '--loader-symbol-missing',
-                 '--loader-null-symbol', '--loader-success', '--loader-system-path',
-                 '--loader-concurrent'):
+    for mode in (None, '--loader-module-fail', '--loader-success', '--loader-concurrent'):
         subprocess.run([str(temp / 'check')] + ([mode] if mode else []), check=True,
                        env={key: value for key, value in os.environ.items()
                             if key != 'EDEN_PS5_HW_VIDEODEC'})
