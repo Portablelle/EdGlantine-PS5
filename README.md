@@ -1,12 +1,12 @@
 # EdGlantine-PS5
 
-**An experimental Nintendo Switch 2 (NX2) emulator for jailbroken PS5 consoles.**
+**An experimental NS2 emulator for jailbroken PS5 consoles.**
 
 EdGlantine-PS5 runs the Eden NX2 engine natively on the PS5. It is built on
 [ProsperoEden](https://github.com/blackbearreloaded/ProsperoEden), the PS5 port of
 Eden, and brings in work from the Eglantine and Eden-NS2 forks.
 
-Several Switch 2 games reach gameplay, but this is still a prototype. Expect low
+Several NS2 games reach gameplay, but this is still a prototype. Expect low
 frame rates, rendering glitches and crashes. Nothing here is a stable
 compatibility claim.
 
@@ -97,7 +97,7 @@ explained.
 
 - **PS5 hardware decoder.** H.264 and VP9 videos can be decoded by the PS5's own
   decoder (`libSceVideodec2`). Any stream it cannot take goes to FFmpeg as before.
-- **Disable switch.** Set `EDEN_PS5_HW_VIDEODEC=0` to turn the hardware decoder off.
+- **Turning it off.** Set `EDEN_PS5_HW_VIDEODEC=0` to turn the hardware decoder off.
 - **Faster conversion.** Turning video frames from YUV into RGBA now runs on
   several threads.
 - **Not yet confirmed on a console.** Whether real game videos use the hardware
@@ -108,7 +108,7 @@ explained.
 About twenty small fixes ported one by one, each with its own pull request, for
 example:
 
-- Switch 2 detection inside NSP files.
+- NS2 detection inside NSP files.
 - Six-axis sensor ranges and Mii arguments.
 - Audio-out and video-decoder lifetimes at shutdown.
 - Shader-removal and descriptor-bitmap performance.
@@ -120,7 +120,7 @@ example:
 
 Everything from ProsperoEden, plus:
 
-- **Switch 2 (NX2) games** on the Eden NX2 engine, with native shaders, GPU
+- **NS2 games** on the Eden NX2 engine, with native shaders, GPU
   descriptors, texture streaming and NX2 services from Eden-NS2.
 - **Six guest CPU cores** pinned to their own physical cores, with the GPU thread
   on a separate one, when the console's topology allows it.
