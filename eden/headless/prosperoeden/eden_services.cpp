@@ -284,6 +284,14 @@ bool AddOnInGameFolder(const std::string& path) {
     return addon;
 }
 
+// Whether a game file is a NUP. Its contents are not encrypted, so like a folder dump it runs
+// without keys or firmware.
+bool IsNupFile(const std::string& name) {
+    std::string lower = name;
+    for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return lower.ends_with(".nup");
+}
+
 // The games in roms/, by their paths in it: its NSP, XCI and NUP files, and those in its game folders
 // (one level down, issue 168) that hold a game and not its update or DLC. Called with the
 // metadata reader held.
@@ -656,7 +664,8 @@ pe::ui::Home EdenServices::home() {
     const std::string last_path = Eden::AssetsPath("roms/" + home.last_file);
     home.last_exists = !home.last_file.empty() && IsFile(last_path);
     home.last_standalone = home.last_exists && Eden::FilesystemAccess() &&
-        Eden::DumpPaths::ValidEntry(home.last_file) && Eden::DumpMetadata::Ready(last_path);
+        ((Eden::DumpPaths::ValidEntry(home.last_file) && Eden::DumpMetadata::Ready(last_path)) ||
+         IsNupFile(home.last_file));
     if (!home.last_file.empty()) {
         std::string title = GameTitle(home.last_file);
         std::string cover = CoverPath(home.last_file);
@@ -760,7 +769,7 @@ std::vector<pe::ui::Game> EdenServices::games() {
         game.format = Eden::DumpPaths::ValidEntry(file) ? "ExeFS" : format;
         game.size = Eden::DumpPaths::ValidEntry(file) ? std::string{"-"} : SizeLabel(static_cast<double>(info.st_size));
         game.file = file;
-        game.standalone = Eden::DumpPaths::ValidEntry(file);
+        game.standalone = Eden::DumpPaths::ValidEntry(file) || IsNupFile(file);
         // A game whose data cannot be read is still listed, by its file name.
         try {
             char title[513]{};
