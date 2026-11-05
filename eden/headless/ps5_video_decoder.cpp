@@ -14,6 +14,8 @@
 extern "C" {
 int sceKernelLoadStartModule(const char*, std::size_t, const void*, std::uint32_t, const void*, int*);
 int sceKernelDlsym(int, const char*, void**);
+const char* sceKernelGetFsSandboxRandomWord();
+int sceSysmoduleLoadModule(std::uint16_t);
 std::int64_t sceKernelGetDirectMemorySize();
 int sceKernelAllocateDirectMemory(std::int64_t, std::int64_t, std::size_t, std::size_t, int, std::int64_t*);
 int sceKernelMapDirectMemory(void**, std::size_t, int, int, std::int64_t, std::size_t);
@@ -37,8 +39,13 @@ void Note(const char* stage, int rc) {
     std::fprintf(stderr, "EDEN_HW_VIDEODEC %s rc=0x%08x\n", stage, static_cast<unsigned>(rc));
 }
 
-// The absolute system path and kernel loading mechanism are also used by the local
-// moonlight-VideoDecoder.cpp reference. No POSIX dlopen/dlsym or PS4 dependency preload.
+// libSceVideodec2's system module id, as EVO's evo_vdec_native.c loads it.
+constexpr std::uint16_t Videodec2SysmoduleId = 207;
+
+// Kernel loading as in the local moonlight-VideoDecoder.cpp reference. No POSIX dlopen/dlsym or
+// PS4 dependency preload. Inside the app's sandbox, /system/common/lib is reached through the
+// sandbox's random word (/<word>/common/lib); the absolute path returned 0x80020002 (not found)
+// on the console with the file present.
 struct Videodec2Api {
     decltype(&sceVideodec2QueryComputeMemoryInfo) QueryComputeMemoryInfo{};
     decltype(&sceVideodec2AllocateComputeQueue) AllocateComputeQueue{};
@@ -74,10 +81,27 @@ const Videodec2Api& GetVideodec2Api() {
     // module until process exit: Close releases decoder resources, never these shared pointers.
     static const Videodec2Api api = [] {
         Videodec2Api result;
-        constexpr const char* path = "/system/common/lib/libSceVideodec2.sprx";
-        const int module = result.module = sceKernelLoadStartModule(path, 0, nullptr, 0, nullptr, nullptr);
-        std::fprintf(stderr, "EDEN_HW_VIDEODEC module-load rc=0x%08x path=%s\n",
-                     static_cast<unsigned>(module), path);
+        // The system module service loads it with its dependencies, from outside the sandbox;
+        // the path load below then returns the loaded module's handle for sceKernelDlsym.
+        const int sysmodule = sceSysmoduleLoadModule(Videodec2SysmoduleId);
+        std::fprintf(stderr, "EDEN_HW_VIDEODEC sysmodule-load id=%u rc=0x%08x\n",
+                     static_cast<unsigned>(Videodec2SysmoduleId), static_cast<unsigned>(sysmodule));
+        constexpr const char* library = "common/lib/libSceVideodec2.sprx";
+        char sandbox_path[96]{};
+        const char* const word = sceKernelGetFsSandboxRandomWord();
+        const int written = word && *word
+            ? std::snprintf(sandbox_path, sizeof(sandbox_path), "/%s/%s", word, library) : -1;
+        if (written < 0 || written >= static_cast<int>(sizeof(sandbox_path))) sandbox_path[0] = '\0';
+        const char* const paths[] = {sandbox_path, "/system/common/lib/libSceVideodec2.sprx"};
+        int module = -1;
+        for (const char* path : paths) {
+            if (!*path) continue;
+            module = sceKernelLoadStartModule(path, 0, nullptr, 0, nullptr, nullptr);
+            std::fprintf(stderr, "EDEN_HW_VIDEODEC module-load rc=0x%08x path=%s\n",
+                         static_cast<unsigned>(module), path);
+            if (module >= 0) break;
+        }
+        result.module = module;
         if (module < 0) { result.rc = module; return result; }
         result.failure = "symbol-missing";
         if (!ResolveVideodec2(module, "sceVideodec2QueryComputeMemoryInfo", result.QueryComputeMemoryInfo, result.rc)) return result;
