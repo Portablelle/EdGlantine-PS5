@@ -72,6 +72,19 @@ name, cover, update and DLC. When the game starts, the update is applied and the
 DLC is offered to it. The reader comes from Eglantine. The DLC support comes from
 [viejunerd's EglantinePS5 build](https://github.com/viejunerd/Eglantine-PS5-).
 
+### Pokopia shaders and memory breakdown ([#27](https://github.com/Portablelle/EdGlantine-PS5/pull/27))
+
+- **Two Pokopia shaders run again.** The native translator rejected them, so
+  their dispatches were skipped. Wide local spills (`LDL`/`STL` of 64 and 128
+  bits) and one-term predicate LUTs (`UPLOP3`) are now translated.
+- **Refresh journal.** Every 5 s, the logs list the images refreshed most often.
+  In Pokopia this points to a triple-buffered texture the game rewrites from the
+  CPU, a likely cause of the sprites that swap places.
+- **Descriptor buffers can be turned off.** Create
+  `/data/eden-nx2/descriptor-buffer-off.txt` to turn them off, for A/B tests.
+- **Memory breakdown.** Every 5 s, the logs show what fills the graphics pool:
+  allocated images, staging buffers and per-heap Vulkan statistics.
+
 ### Graphics memory on the PS5 ([issue #20](https://github.com/Portablelle/EdGlantine-PS5/issues/20))
 
 Mario Kart World runs out of the PS5's shared graphics memory while it loads.
