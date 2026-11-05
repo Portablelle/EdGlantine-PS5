@@ -12,8 +12,7 @@
 #include "video_core/host1x/ffmpeg.h"
 
 extern "C" {
-int sceKernelLoadStartModule(const char*, std::size_t, const void*, std::uint32_t, const void*, int*);
-int sceKernelDlsym(int, const char*, void**);
+int sceSysmoduleLoadModule(std::uint16_t);
 std::int64_t sceKernelGetDirectMemorySize();
 int sceKernelAllocateDirectMemory(std::int64_t, std::int64_t, std::size_t, std::size_t, int, std::int64_t*);
 int sceKernelMapDirectMemory(void**, std::size_t, int, int, std::int64_t, std::size_t);
@@ -37,8 +36,15 @@ void Note(const char* stage, int rc) {
     std::fprintf(stderr, "EDEN_HW_VIDEODEC %s rc=0x%08x\n", stage, static_cast<unsigned>(rc));
 }
 
-// The absolute system path and kernel loading mechanism are also used by the local
-// moonlight-VideoDecoder.cpp reference. No POSIX dlopen/dlsym or PS4 dependency preload.
+// libSceVideodec2's system module id, as EVO's evo_vdec_native.c loads it.
+constexpr std::uint16_t Videodec2SysmoduleId = 207;
+
+// The sceVideodec2 functions are imports of the system module, as in EVO: the app links
+// tools/stubs/libSceVideodec2.c and the packaging tool turns those symbols into imports.
+// Loading the module by path does not work from the app: the absolute path returned
+// 0x80020002 (not found) with the file present, and through the sandbox's path the module
+// loaded but sceKernelDlsym found none of its functions (0x80020003). This loads the module
+// through the system module service before the first decoder is made.
 struct Videodec2Api {
     decltype(&sceVideodec2QueryComputeMemoryInfo) QueryComputeMemoryInfo{};
     decltype(&sceVideodec2AllocateComputeQueue) AllocateComputeQueue{};
@@ -50,46 +56,30 @@ struct Videodec2Api {
     decltype(&sceVideodec2Reset) Reset{};
     decltype(&sceVideodec2Decode) Decode{};
     decltype(&sceVideodec2Flush) Flush{};
-    int module{-1};
     bool ready{};
-    const char* failure{"module-load"};
+    const char* failure{"sysmodule-load"};
     int rc{};
 };
 
-template <typename Function>
-bool ResolveVideodec2(int module, const char* name, Function& function, int& rc) {
-    void* address{};
-    rc = sceKernelDlsym(module, name, &address);
-    if (rc != 0 || !address) {
-        std::fprintf(stderr, "EDEN_HW_VIDEODEC symbol-missing name=%s rc=0x%08x\n",
-                     name, static_cast<unsigned>(rc));
-        return false;
-    }
-    function = reinterpret_cast<Function>(address);
-    return true;
-}
-
 const Videodec2Api& GetVideodec2Api() {
-    // Function-local static initialization is thread-safe and caches failure too. Retain the
-    // module until process exit: Close releases decoder resources, never these shared pointers.
+    // Function-local static initialization is thread-safe and caches failure too. The module
+    // stays loaded until process exit: Close releases decoder resources, never the module.
     static const Videodec2Api api = [] {
         Videodec2Api result;
-        constexpr const char* path = "/system/common/lib/libSceVideodec2.sprx";
-        const int module = result.module = sceKernelLoadStartModule(path, 0, nullptr, 0, nullptr, nullptr);
-        std::fprintf(stderr, "EDEN_HW_VIDEODEC module-load rc=0x%08x path=%s\n",
-                     static_cast<unsigned>(module), path);
-        if (module < 0) { result.rc = module; return result; }
-        result.failure = "symbol-missing";
-        if (!ResolveVideodec2(module, "sceVideodec2QueryComputeMemoryInfo", result.QueryComputeMemoryInfo, result.rc)) return result;
-        if (!ResolveVideodec2(module, "sceVideodec2AllocateComputeQueue", result.AllocateComputeQueue, result.rc)) return result;
-        if (!ResolveVideodec2(module, "sceVideodec2ReleaseComputeQueue", result.ReleaseComputeQueue, result.rc)) return result;
-        if (!ResolveVideodec2(module, "sceVideodec2QueryDecoderMemoryInfo", result.QueryDecoderMemoryInfo, result.rc)) return result;
-        if (!ResolveVideodec2(module, "sceVideodec2CreateDecoder", result.CreateDecoder, result.rc)) return result;
-        if (!ResolveVideodec2(module, "sceVideodec2DeleteDecoder", result.DeleteDecoder, result.rc)) return result;
-        if (!ResolveVideodec2(module, "sceVideodec2MapDirectMemory", result.MapDirectMemory, result.rc)) return result;
-        if (!ResolveVideodec2(module, "sceVideodec2Reset", result.Reset, result.rc)) return result;
-        if (!ResolveVideodec2(module, "sceVideodec2Decode", result.Decode, result.rc)) return result;
-        if (!ResolveVideodec2(module, "sceVideodec2Flush", result.Flush, result.rc)) return result;
+        const int sysmodule = sceSysmoduleLoadModule(Videodec2SysmoduleId);
+        std::fprintf(stderr, "EDEN_HW_VIDEODEC sysmodule-load id=%u rc=0x%08x\n",
+                     static_cast<unsigned>(Videodec2SysmoduleId), static_cast<unsigned>(sysmodule));
+        if (sysmodule < 0) { result.rc = sysmodule; return result; }
+        result.QueryComputeMemoryInfo = &sceVideodec2QueryComputeMemoryInfo;
+        result.AllocateComputeQueue = &sceVideodec2AllocateComputeQueue;
+        result.ReleaseComputeQueue = &sceVideodec2ReleaseComputeQueue;
+        result.QueryDecoderMemoryInfo = &sceVideodec2QueryDecoderMemoryInfo;
+        result.CreateDecoder = &sceVideodec2CreateDecoder;
+        result.DeleteDecoder = &sceVideodec2DeleteDecoder;
+        result.MapDirectMemory = &sceVideodec2MapDirectMemory;
+        result.Reset = &sceVideodec2Reset;
+        result.Decode = &sceVideodec2Decode;
+        result.Flush = &sceVideodec2Flush;
         result.ready = true;
         return result;
     }();

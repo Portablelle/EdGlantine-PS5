@@ -3152,7 +3152,8 @@ if(PS5_NATIVE)
     target_include_directories(eden-headless BEFORE PRIVATE "${FFmpeg_INCLUDE_DIR}")
     target_link_libraries(eden-headless PRIVATE
         "${sdk}/target/lib/libSceImeDialog.so" "${sdk}/target/lib/libSceSysmodule.so"
-        "${PORT_ROOT}/build/stubs/libSceCommonDialog.so")
+        "${PORT_ROOT}/build/stubs/libSceCommonDialog.so"
+        "${PORT_ROOT}/build/stubs/libSceVideodec2.so")
 endif()
 add_library(eden-metadata STATIC "${EDEN_PORT_DIR}/metadata_bridge.cpp")
 target_include_directories(eden-metadata PUBLIC "${EDEN_PORT_DIR}" PRIVATE "${PROJECT_SOURCE_DIR}/src")

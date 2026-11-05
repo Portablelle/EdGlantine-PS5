@@ -98,7 +98,7 @@ typedef struct SceVideodec2OutputInfo {
     uint32_t pitch_bytes;          /* out: pitch in bytes (== pitch*2 for P010) */
 } SceVideodec2OutputInfo;
 
-// ABI signatures only: used in decltype for the kernel-resolved table, never linked imports.
+// Imports of the firmware module: the app links tools/stubs/libSceVideodec2.c for them.
 
 int32_t sceVideodec2QueryComputeMemoryInfo(SceVideodec2ComputeMemoryInfo *memory);
 
