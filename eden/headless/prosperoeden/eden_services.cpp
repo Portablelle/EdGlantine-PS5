@@ -326,8 +326,6 @@ std::string GameFolderOf(const std::string& file) {
     return slash == std::string::npos ? std::string{} : Eden::AssetsPath("roms/" + file.substr(0, slash));
 }
 
-int CountInstalledGames() { return static_cast<int>(GameFiles().size()); }
-
 // The labels of a setting, in the player's language (tools/launcher/strings.py lists them).
 template <std::size_t N>
 std::vector<std::string> Labels(const char* const (&values)[N]) {
@@ -630,11 +628,17 @@ pe::ui::Home EdenServices::home() {
     const std::lock_guard lock(bridge_);
     pe::ui::Home home;
     home.setup_ready = setup_.empty() && Eden::FilesystemAccess();
+    // Keys and firmware are only needed by NSP and XCI games: NS2 games (NUP files) and folder
+    // dumps run without them, so missing keys are only worth a notice when a game needs them.
+    const std::vector<std::string> files = Eden::FilesystemAccess() ? GameFiles() : std::vector<std::string>{};
+    const bool keys_needed = std::any_of(files.begin(), files.end(), [](const std::string& file) {
+        return !Eden::DumpPaths::ValidEntry(file) && !IsNupFile(file);
+    });
     if (!Eden::FilesystemAccess()) {
         // No data is kept anywhere else (storage_paths.h): say so, and start nothing.
         home.status = fill(tr("ProsperoEden could not get access to the console's storage, so it cannot read your settings, saves and games. Nothing was changed. Close ProsperoEden and open it again. (Code {0})"),
                            {std::to_string(Eden::FilesystemAccessStatus())});
-    } else if (!home.setup_ready) {
+    } else if (!home.setup_ready && keys_needed) {
         home.status = fill(tr("Setup required: {0} Open Settings, Game files to choose the folder that holds your "
                               "keys, firmware and roms folders (or add the files to {1}), then reopen ProsperoEden."),
                            {SetupMessage(setup_), Eden::AssetsDir()});
@@ -708,10 +712,10 @@ pe::ui::Home EdenServices::home() {
         if (!IsFile(Eden::AssetsPath("roms/" + name))) continue;
         home.recents.push_back({name, GameTitle(name), EnsureCover(name)});
     }
-    const int installed = CountInstalledGames();
+    const int installed = static_cast<int>(files.size());
     home.system_status = fill(installed == 1 ? tr("{0} game installed") : tr("{0} games installed"),
                               {std::to_string(installed)}) +
-        "  /  " + (home.setup_ready ? tr("Firmware ready") : tr("Setup required"));
+        "  /  " + (home.setup_ready ? tr("Firmware ready") : keys_needed ? tr("Setup required") : tr("prod.keys missing"));
     return home;
 }
 
