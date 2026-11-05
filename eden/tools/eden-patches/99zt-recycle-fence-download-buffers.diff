@@ -1,0 +1,66 @@
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -845,6 +845,15 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
+     }
+     Nx2Profile::Add(Nx2Profile::Counter::DownloadBytes, total_size_bytes);
+     Nx2Profile::Add(Nx2Profile::Counter::DownloadCopies, downloads.size());
++    // Downloads whose fence has passed (PopAsyncBuffers runs only then): their staging buffers go
++    // back to the pool now, not at the end of the frame. An NS2 title's compute work can signal
++    // dozens of fences a frame, each with a download of up to 8 MiB in a 16 MiB buffer, and the
++    // slower the frame the more buffers it held (Donkey Kong Bananza: over 3 GiB at about 12 fps).
++    // From viejunerd/Eglantine-PS5- tools/eglantine-patches/0014.
++    for (auto& buffer : async_buffers_death_ring) {
++        runtime.FreeDeferredStagingBuffer(buffer);
++    }
++    async_buffers_death_ring.clear();
+     auto download_staging = runtime.DownloadStagingBuffer(total_size_bytes, true);
+     boost::container::small_vector<BufferCopy, 4> normalized_copies;
+     runtime.PreCopyBarrier();
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+@@ -389,7 +389,8 @@ VkFormat BufferCacheRuntime::TexelBufferFormat(VideoCore::Surface::PixelFormat f
+ }
+ 
+ void BufferCacheRuntime::FreeDeferredStagingBuffer(StagingBufferRef& ref) {
+-    staging_pool.FreeDeferred(ref);
++    // Only ever called once the fence or tick of the buffer's copy has passed.
++    staging_pool.FreeDeferred(ref, true);
+ }
+ 
+ u64 BufferCacheRuntime::GetDeviceLocalMemory() const {
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -107,7 +107,7 @@ StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool
+     return GetStagingBuffer(size, usage, deferred);
+ }
+ 
+-void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
++void StagingBufferPool::FreeDeferred(StagingBufferRef& ref, bool completed) {
+     auto& entries = GetCache(ref.usage)[ref.log2_level].entries;
+     const auto is_this_one = [&ref](const StagingBuffer& entry) {
+         return entry.index == ref.index;
+@@ -115,7 +115,7 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
+     auto it = std::find_if(entries.begin(), entries.end(), is_this_one);
+     ASSERT(it != entries.end());
+     ASSERT(it->deferred);
+-    it->tick = scheduler.CurrentTick();
++    it->tick = completed ? 0 : scheduler.CurrentTick();
+     it->deferred = false;
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+@@ -39,7 +39,8 @@ public:
+     ~StagingBufferPool();
+ 
+     StagingBufferRef Request(size_t size, MemoryUsage usage, bool deferred = false);
+-    void FreeDeferred(StagingBufferRef& ref);
++    /// completed: the GPU is done with it (its fence passed), so it can be handed out right away.
++    void FreeDeferred(StagingBufferRef& ref, bool completed = false);
+ 
+     [[nodiscard]] VkBuffer StreamBuf() const noexcept {
+         return *stream_buffer;
