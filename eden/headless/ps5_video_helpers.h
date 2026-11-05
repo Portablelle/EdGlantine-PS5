@@ -58,6 +58,61 @@ inline std::optional<bool> IsBSlice(Bytes nal) {
     return type % 5 == 1;
 }
 
+// What orders a frame picture for display, from the first slice header of its access unit
+// (7.3.3, 8.2.1). Fields are absent from the SPS this backend admits (frame_mbs_only).
+struct H264SliceOrder {
+    bool idr{}, reference{};
+    std::uint32_t poc_lsb{};
+};
+inline std::optional<H264SliceOrder> ParseH264SliceOrder(Bytes nal, const Picture& sps) {
+    if (nal.empty()) return {};
+    auto data = Rbsp(nal, 32);
+    Bits bits{data};
+    bits.UE(); // first_mb_in_slice
+    if (bits.UE() > 9) return {}; // slice_type
+    if (bits.UE() > 255) return {}; // pic_parameter_set_id
+    bits.Read(sps.frame_num_bits);
+    H264SliceOrder order;
+    order.idr = (nal[0] & 31) == 5;
+    order.reference = (nal[0] & 0x60) != 0;
+    if (order.idr) bits.UE(); // idr_pic_id
+    if (sps.poc_type == 0) order.poc_lsb = bits.Read(sps.poc_lsb_bits);
+    if (!bits.valid) return {};
+    return order;
+}
+
+// Display order of H.264 frame pictures (8.2.1.1 for pic_order_cnt_type 0; type 2 outputs in
+// decode order). Keys grow with display order across IDR pictures. Memory management
+// operation 5, which also restarts the count, is not tracked.
+class H264DisplayOrder {
+public:
+    std::optional<std::uint64_t> Key(const H264SliceOrder& order, const Picture& sps) {
+        if (order.idr) {
+            ++epoch;
+            prev_msb = prev_lsb = 0;
+            decode_index = 0;
+        }
+        std::int64_t count;
+        if (sps.poc_type == 2) {
+            count = decode_index++;
+        } else if (sps.poc_type == 0) {
+            const std::int64_t max_lsb = std::int64_t{1} << sps.poc_lsb_bits;
+            const std::int64_t lsb = order.poc_lsb;
+            std::int64_t msb = prev_msb;
+            if (lsb < prev_lsb && prev_lsb - lsb >= max_lsb / 2) msb += max_lsb;
+            else if (lsb > prev_lsb && lsb - prev_lsb > max_lsb / 2) msb -= max_lsb;
+            count = msb + lsb;
+            if (order.reference) { prev_msb = msb; prev_lsb = lsb; }
+        } else return {};
+        if (count < -(std::int64_t{1} << 31) || count >= (std::int64_t{1} << 31)) return {};
+        return (epoch << 32) | static_cast<std::uint32_t>(count + (std::int64_t{1} << 31));
+    }
+
+private:
+    std::uint64_t epoch{};
+    std::int64_t prev_msb{}, prev_lsb{}, decode_index{};
+};
+
 struct Vp9Header {
     bool shown{}, existing{}, key{}, color_config{}, full_range{};
     unsigned profile{}, matrix{2};
