@@ -1,0 +1,87 @@
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -101,6 +101,7 @@ add_library(video_core STATIC
+     native_query_trace.h
+     native_root_table.h
+     native_semaphore.h
++    gpu_timestamp.h
+     gpu_split.cpp
+     gpu_split.h
+     gpu_thread.cpp
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -33,27 +33,16 @@
+ #include "video_core/engines/maxwell_dma.h"
+ #include "video_core/gpu.h"
+ #include "video_core/gpu_thread.h"
++#include "video_core/gpu_timestamp.h"
+ #include "video_core/host1x/host1x.h"
+ #include "video_core/host1x/syncpoint_manager.h"
+ #include "video_core/memory_manager.h"
++#include "video_core/nx2.h"
+ #include "video_core/renderer_base.h"
+ #include "video_core/shader_notify.h"
+ 
+ namespace Tegra {
+ 
+-namespace {
+-constexpr u64 GpuClockMultiplier(Settings::GpuClock clock) {
+-    switch (clock) {
+-    case Settings::GpuClock::Boost:
+-        return 256;
+-    case Settings::GpuClock::Overclock:
+-        return 512;
+-    default:
+-        return 1;
+-    }
+-}
+-} // Anonymous namespace
+-
+ struct GPU::Impl {
+     explicit Impl(Core::System& system_, bool is_async_, bool use_nvdec_)
+         : system{system_}
+@@ -170,8 +159,8 @@ struct GPU::Impl {
+     }
+ 
+     [[nodiscard]] u64 GetTicks() const {
+-        const u64 gpu_tick = system.CoreTiming().GetGPUTicks();
+-        return gpu_tick / GpuClockMultiplier(Settings::values.gpu_clock.GetValue());
++        return ReadGpuTimestamp(system.CoreTiming(), g_nx2_ampere.load(std::memory_order_relaxed),
++                                Settings::values.gpu_clock.GetValue());
+     }
+ 
+     void RendererFrameEndNotify() {
+diff --git a/src/video_core/gpu_timestamp.h b/src/video_core/gpu_timestamp.h
+new file mode 100644
+--- /dev/null
++++ b/src/video_core/gpu_timestamp.h
+@@ -0,0 +1,27 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include "common/common_types.h"
++#include "common/settings_enums.h"
++
++namespace Tegra {
++
++template <typename Timing>
++[[nodiscard]] u64 ReadGpuTimestamp(const Timing& timing, bool ampere, Settings::GpuClock clock) {
++    if (ampere) {
++        return static_cast<u64>(timing.GetGlobalTimeNs().count());
++    }
++    const u64 ticks = timing.GetGPUTicks();
++    switch (clock) {
++    case Settings::GpuClock::Boost:
++        return ticks / 256;
++    case Settings::GpuClock::Overclock:
++        return ticks / 512;
++    default:
++        return ticks;
++    }
++}
++
++} // namespace Tegra

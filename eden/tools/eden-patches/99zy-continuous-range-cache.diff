@@ -1,0 +1,78 @@
+diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
+--- a/src/video_core/memory_manager.cpp
++++ b/src/video_core/memory_manager.cpp
+@@ -6,6 +6,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <array>
+ 
+ #include "common/alignment.h"
+ #include "common/paged_scalar.h"
+@@ -155,6 +156,7 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
+     }
+     flush_run();
+     kind_map.Map(gpu_addr, gpu_addr + size, kind);
++    map_serial.fetch_add(1, std::memory_order_release);
+     return gpu_addr;
+ }
+ 
+@@ -210,6 +212,7 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
+         std::unique_lock<std::mutex> lock(guard);
+         kind_map.Map(gpu_addr, gpu_addr + size, kind);
+     }
++    map_serial.fetch_add(1, std::memory_order_release);
+     return gpu_addr;
+ }
+ 
+@@ -544,6 +547,29 @@ bool MemoryManager::IsMemoryDirty(GPUVAddr gpu_addr, size_t size,
+ }
+ 
+ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
++    // Native storage buffers ask this for up to 8 MiB on each bind, ~70,000 times a second in
++    // title 1's forest (17% of the GPU thread walking pages): keep answers per thread until the
++    // page table changes.
++    struct Entry {
++        size_t owner;
++        GPUVAddr gpu_addr;
++        size_t size;
++        u64 serial;
++        size_t result;
++    };
++    thread_local std::array<Entry, 64> cache{};
++    const u64 serial = map_serial.load(std::memory_order_acquire);
++    Entry& entry = cache[((gpu_addr ^ size) * 0x9E3779B97F4A7C15ULL) >> 58];
++    if (entry.owner == unique_identifier + 1 && entry.gpu_addr == gpu_addr && entry.size == size &&
++        entry.serial == serial) {
++        return entry.result;
++    }
++    const size_t result = MaxContinuousRangeUncached(gpu_addr, size);
++    entry = {unique_identifier + 1, gpu_addr, size, serial, result};
++    return result;
++}
++
++size_t MemoryManager::MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const {
+     std::optional<DAddr> old_page_addr{};
+     size_t range_so_far = 0;
+     bool result{false};
+diff --git a/src/video_core/memory_manager.h b/src/video_core/memory_manager.h
+--- a/src/video_core/memory_manager.h
++++ b/src/video_core/memory_manager.h
+@@ -180,6 +180,8 @@ private:
+     template <typename FuncMapped, typename FuncReserved, typename FuncUnmapped>
+     inline void MemoryOperation(GPUVAddr gpu_src_addr, std::size_t size, bool is_big_page, FuncMapped&& func_mapped, FuncReserved&& func_reserved, FuncUnmapped&& func_unmapped) const;
+ 
++    size_t MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const;
++
+     void ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe) const;
+     void WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe);
+ 
+@@ -244,6 +246,8 @@ private:
+ 
+     bool native_tiling{};
+     mutable std::mutex guard;
++    /// Bumped after each page table change; MaxContinuousRange answers are kept until then.
++    std::atomic<u64> map_serial{};
+ 
+     static constexpr size_t continuous_bits = 64;
+ 
