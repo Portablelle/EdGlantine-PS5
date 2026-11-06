@@ -65,7 +65,7 @@ CPU draw preparation is the main known bottleneck.
 
 Recent work, newest first. Each item links to its pull request.
 
-### Lichii fixes, third batch (PR_LINK)
+### Lichii fixes, third batch ([#45](https://github.com/Portablelle/EdGlantine-PS5/pull/45))
 
 Four more changes ported from Lichii into the core, each adapted to it. None
 has been tried on a console yet.
