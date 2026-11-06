@@ -104,7 +104,9 @@ rejected, so every one of their dispatches was skipped. Three layers so far:
   [#48](https://github.com/Portablelle/EdGlantine-PS5/pull/48)). After it, three of
   the seven shaders are accepted on the console.
 - **`UIMAD` with an immediate addend** (`0x4a4`, layer `99zzzv`). Three more
-  stopped at it on 00.067.000. Not yet tried on a console.
+  stopped at it on 00.067.000. On 00.067.001 all six run, but the top half of
+  the menu movie is covered with colourful noise and there is still no text.
+  The six probably read data that the seventh shader prepares.
 
 - **High registers next to the extended uniform bank** (layer `99zzzw`). The
   seventh shader uses uniform registers UR16 and up, which take R168-R215, and
