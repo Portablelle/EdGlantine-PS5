@@ -91,6 +91,10 @@ struct Codec {
     std::optional<u32> operation_syncpoint{7};
     u64 next_completion_value = 42, pending_input_bytes{}, next_submission_id{1};
     bool started = true, ffmpeg_vp9{};
+    // Native VP9 hardware routing fields cleared by Reset.
+    bool vp9_hardware{};
+    struct Dimensions {} vp9_dimensions;
+    const char* codec_name{};
     struct RegisteredImage { u32 id; u64 completion_value; bool available; };
     std::vector<RegisteredImage> registered_images{{10, 41, false}, {11, 42, false}};
     std::vector<int> pending_inputs, output_properties, decoded_frames, h264_timestamps;
