@@ -84,6 +84,11 @@ Taken from [viejunerd's EglantinePS5 build](https://github.com/viejunerd/Eglanti
   during boot could crash the app.
 - **No global Vulkan pipeline cache.** It hung NS2 games at 98% on every launch
   after the first in viejunerd's build. Per-game caches are kept.
+- **OoT's movies play.** The game asks for its AV1 decoder with NV12 output,
+  which was refused, and the game stopped on its menu. AV1 now goes through
+  dav1d, built into FFmpeg for the PS5. It decodes several frames at once,
+  where libgav1 fell behind on the 1080p menu movie.
+  `EDEN_NX2_AV1_LIBGAV1=1` keeps libgav1.
 - **The GPU thread wakes on new work.** While channels wait on a semaphore, it
   used to sleep a fixed 1 ms. It now wakes as soon as work arrives, and checks
   the semaphores every 0.25 ms.
