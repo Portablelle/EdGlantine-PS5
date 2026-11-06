@@ -20,6 +20,11 @@ Checks, with the production lower_to_maxwell.h and register_pressure.h:
   Maxwell words as the GPR forms IMAD.WIDE (0x825) and IMAD (0x424) on the mapped registers;
 - the translator salt changed, so pipelines cached by the older translator are not reused.
 Fails before this change (the captured instruction is rejected).
+
+On 00.067.002 the same shader got past 0x60 and stopped at 0x190: IMAD.HI R1, R208, 0x38e38e39, RZ
+(words d0017827 38e38e39 078e00ff 000fe200). 99zzzx shadows every form of the common integer and
+float ALU operations from the operand form (bits 9-11); this check also covers that word, a few
+forms only the generic rule handles, and an operation it leaves out (DADD).
 """
 from pathlib import Path
 import os
@@ -109,6 +114,11 @@ int main() {
         {0x810, {16, 24, 64}}, {0xa10, {16, 24, 64}}, {0xc10, {16, 24, 64}}, {0x423, {16, 24, 64}},
         {0x623, {16, 24, 64}}, {0x823, {16, 24, 64}}, {0xa23, {16, 24, 64}}, {0xc23, {16, 24, 64}},
         {0xa24, {16, 24, 64}}, {0xc24, {16, 24, 64}},
+        // Generic rule (99zzzx): IMAD.HI immediate/constant/uniform B and immediate C, FMNMX,
+        // FSETP, LOP3 and PRMT with an immediate C, IMAD.WIDE with a constant B.
+        {0x827, {16, 24, 64}}, {0xa27, {16, 24, 64}}, {0xc27, {16, 24, 64}}, {0x427, {16, 24, 64}},
+        {0x209, {16, 24, 32}}, {0x809, {16, 24}}, {0x20b, {24, 32}}, {0x80b, {24}},
+        {0x412, {16, 24, 64}}, {0x816, {16, 24, 64}}, {0xa25, {16, 24, 64}},
     };
     const u32 high[] = {206, 172, 190, 214};
     for (const auto& form : forms) {
@@ -157,9 +167,21 @@ int main() {
             if (!copy) assert(Bits(w, 0, 8) < 168 || Bits(w, 0, 8) == 200 || Bits(w, 0, 8) >= 246);
         }
     }
-    // Outside the table: still rejected as before (FMNMX register, R206).
+    // The word OoT's last menu-text shader stopped at on 00.067.002 lowers next to UR16, and R208
+    // is not written by anything but the bank copies.
     {
-        const auto lowered = Lower(Make(0x209, 206, 172, 190, 0));
+        const Instruction imad_hi{{0xd0017827, 0x38e38e39, 0x078e00ff, 0x000fe200}};
+        const auto lowered = Lower(imad_hi);
+        if (!lowered) std::printf("FAIL: IMAD.HI: %.*s\n", int(lowered.error.size()), lowered.error.data());
+        assert(lowered);
+        for (u64 w : lowered.instructions) {
+            const bool copy = (w & 0xfff8000000000000ULL) == 0x5c98000000000000ULL && Bits(w, 44, 4) == 10;
+            if (!copy) assert(Bits(w, 0, 8) != 208);
+        }
+    }
+    // Outside both the table and the generic rule: still rejected as before (DADD register, R206).
+    {
+        const auto lowered = Lower(Make(0x229, 206, 172, 190, 0));
         assert(!lowered && std::string_view{lowered.error} == "native register shadowing mode");
     }
     // The UIMAD words the other six menu-text shaders use (99zzzu, 99zzzv) lower exactly as the
@@ -186,7 +208,7 @@ int main() {
             assert(lu.instructions == lg.instructions);
         }
     }
-    std::printf("PASS: IADD3 R206, R152, 0x20 lowers next to UR16 through R164-R167; ALU forms shadowed\n");
+    std::printf("PASS: IADD3 R206, R152, 0x20 and IMAD.HI R1, R208 lower next to UR16; ALU forms shadowed by operand form\n");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='nx2-extended-uniform-shadow-') as tmp:

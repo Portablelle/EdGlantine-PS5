@@ -277,6 +277,15 @@ extern "C" void eden_load_step(const char* stage, const char* detail) {
 int main(int argc, char** argv) {
     if (setenv("EDEN_NX2_MME_JIT", "1", 1) != 0 ||
         setenv("EDEN_NX2_SPLIT", "1", 1) != 0) return 2;
+    // /data/eden-nx2/dump-rejected-shaders.txt: write each native shader the translator rejects to
+    // logs/rejected-shaders/<key>.source.bin (and .mapped.bin), without waiting for an override.
+    // Set before the first shader, since the core reads both variables once.
+    if (std::ifstream(std::string{Eden::kDataDir} + "/dump-rejected-shaders.txt").good()) {
+        const std::string folder = std::string{Eden::kDataDir} + "/logs/rejected-shaders";
+        setenv("EDEN_NATIVE_SHADER_OVERRIDE_DIR", folder.c_str(), 1);
+        setenv("EDEN_NATIVE_SHADER_NO_PAUSE", "1", 1);
+        std::fprintf(stderr, "EDEN_REJECTED_SHADER_DUMP %s\n", folder.c_str());
+    }
     try {
         std::FILE* report = stdout;
         SCOPE_EXIT { if (report != stdout) std::fclose(report); };

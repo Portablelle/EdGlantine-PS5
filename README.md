@@ -98,7 +98,7 @@ tried on a console yet.** The split is still off unless you turn it on (see
 
 OoT's menu shows only the first letter of each line, such as "N" and "P".
 The text is laid out by seven compute shaders that the native translator
-rejected, so every one of their dispatches was skipped. Three layers so far:
+rejected, so every one of their dispatches was skipped. Four layers so far:
 
 - **`UIMAD.WIDE` by an immediate** (Ampere opcode `0x8a5`, a divide by 15,
   [#48](https://github.com/Portablelle/EdGlantine-PS5/pull/48)). After it, three of
@@ -107,15 +107,24 @@ rejected, so every one of their dispatches was skipped. Three layers so far:
   stopped at it on 00.067.000. On 00.067.001 all six run, but the top half of
   the menu movie is covered with colourful noise and there is still no text.
   The six probably read data that the seventh shader prepares.
-
 - **High registers next to the extended uniform bank** (layer `99zzzw`). The
   seventh shader uses uniform registers UR16 and up, which take R168-R215, and
   also its own R206. Guest registers in that range are kept aside and copied
   into a free low register group around each instruction, but `IADD3` with an
   immediate had no entry for this, so the shader was rejected ("native register
   shadowing mode"). The layer adds it and the other common integer and float
-  forms. Not yet tried on a console; the shader may still stop at a later
-  instruction.
+  forms. On 00.067.002 the shader got past it and stopped at `IMAD.HI` with an
+  immediate (`0x827`) on R208.
+- **Every form of the common ALU operations** (layer `99zzzx`). Instead of a list
+  of opcodes, the operand form (bits 9-11) now tells which fields are registers,
+  for IADD3, LOP3, SHF, LEA, PRMT, IMAD, IMAD.WIDE, IMAD.HI, FFMA, FADD, FMUL,
+  SEL, FSEL, FMNMX, IMNMX, ISETP, FSETP and MOV. Not yet tried on a console.
+
+To find what a rejected shader still stops at, create
+`/data/eden-nx2/dump-rejected-shaders.txt` (any content) before starting the app.
+Each native shader the translator rejects is then written to
+`/data/eden-nx2/logs/rejected-shaders/<key>.source.bin`, with the bytes mapped
+after it in `<key>.mapped.bin`, and the game carries on. Delete the file to stop.
 
 ### Lichii mods, movie timing and loader fixes
 
