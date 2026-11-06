@@ -67,21 +67,15 @@ Recent work, newest first. Each item links to its pull request.
 
 ### Lichii fixes, third batch ([#45](https://github.com/Portablelle/EdGlantine-PS5/pull/45))
 
-Four more changes ported from Lichii into the core, each adapted to it. None
-has been tried on a console yet.
+Two more changes ported from Lichii into the core, each adapted to it. None
+has been tried on a console yet. The terrain-layer clear and the cheaper
+storage buffer bindings from this batch are in
+[#47](https://github.com/Portablelle/EdGlantine-PS5/pull/47) instead.
 
 - **OoT white flashes.** Before a macro reads occlusion reports from memory, it
   now waits for the reports whose results the host GPU has not delivered yet.
   Before, it read the old counts, and leaves and terrain flashed white for a
   few frames whenever the camera moved. The wait is capped at 200 ms.
-- **OoT terrain layer.** A clear that is waiting for the next render pass now
-  lands before a blit, image copy or DMA write to the same image. Before, it
-  landed after them and wiped what they wrote, so the terrain layer could be
-  drawn over the scene.
-- **Cheaper storage buffer bindings.** The binding of a storage buffer is
-  remembered until the GPU page table changes, so each draw no longer walks the
-  mappings again. A native 64 KiB uniform bank is uploaded when it is bound
-  instead of only being marked for a later upload.
 - **Fewer copies in memory tracking.** Page runs that are already sorted are
   merged where they lie and counted without two extra copies.
 
