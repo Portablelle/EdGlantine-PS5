@@ -45,9 +45,10 @@ release.
 | **Pokopia** | **Playable**, 45–50 FPS | Starts correctly, and the sky is no longer black. From some camera angles, a few assets flicker and can swap places. The frame rate drops to about 30 depending on what is in view. See the [Pokopia investigation](eden/docs/POKOPIA_RENDERING_INVESTIGATION.md). |
 | **Donkey Kong Bananza** | Not playable, 5–20 FPS | No rendering problem seen any more, but the frame rate is too low to play. See the [Bananza investigation](eden/docs/BANANZA_STARTUP_INVESTIGATION.md). |
 | **Welcome Tour** | Not playable, about 10 FPS | Some assets seem to be missing and show black. |
+| **OoT** | Menu only, 20–40 FPS while it opens | The menu's background movie plays (AV1 through dav1d). The menu text is missing: only the first letter of each line shows. Its compute shaders are still partly rejected by the native shader translator. The menu reached 50–58 FPS on an earlier test build. |
 | **Mario Kart World** | Stops at the first load | Runs out of graphics memory during the first load. History in [issue #20](https://github.com/Portablelle/EdGlantine-PS5/issues/20). |
 
-These are the latest results reported by the player (November 5, 2026), not
+These are the latest results reported by the player (November 5–6, 2026), not
 repeated benchmarks.
 Scenes and settings differ between runs. Exact numbers and conditions are in
 [TEST-REPORT.md](TEST-REPORT.md).
@@ -95,12 +96,18 @@ tried on a console yet.** The split is still off unless you turn it on (see
 
 ### OoT menu text
 
-OoT's menu showed only the first letter of each line, such as "N" and "P".
-The text is laid out by seven compute shaders that divide by 15 with a uniform
-wide multiply by an immediate (`UIMAD.WIDE`, Ampere opcode `0x8a5`). The native
-translator did not know that form, so it rejected the shaders and every one of
-their dispatches was skipped. It now translates it like the immediate `UIMAD`
-next to it (layer `99zzzu`). Not yet tried on a console.
+OoT's menu shows only the first letter of each line, such as "N" and "P".
+The text is laid out by seven compute shaders that the native translator
+rejected, so every one of their dispatches was skipped. Two layers so far:
+
+- **`UIMAD.WIDE` by an immediate** (Ampere opcode `0x8a5`, a divide by 15,
+  [#48](https://github.com/Portablelle/EdGlantine-PS5/pull/48)). After it, three of
+  the seven shaders are accepted on the console.
+- **`UIMAD` with an immediate addend** (`0x4a4`, layer `99zzzv`). Three more
+  stopped at it on 00.067.000. Not yet tried on a console.
+
+The seventh shader is still rejected: it uses high registers that the
+translator keeps for uniform registers ("native register shadowing mode").
 
 ### Lichii mods, movie timing and loader fixes
 
