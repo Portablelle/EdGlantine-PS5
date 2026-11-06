@@ -88,6 +88,58 @@ Five small changes ported from Lichii into the core (layers `99zzzf1` to
 - **ZBIC errors are logged** with zstd's reason, when an NSO segment fails to
   decompress.
 
+### Lichii buffer and texture cache fixes
+
+Three changes from open Lichii pull requests, adapted to this core. **Nothing
+has been tried on a console yet**: the test build compiles, packages and passes
+its checks, and that is all.
+
+- **Cached storage buffer bindings.** Every draw binds each storage buffer
+  again, which took a lock and walked the GPU page table each time. The answer
+  is now kept until a GPU mapping changes. This should save CPU time in draw
+  preparation, the main known cost.
+- **Native uniform banks uploaded directly.** The 64 KiB uniform banks of NS2
+  programs, refreshed once per frame, are copied straight to the GPU instead of
+  having their memory pages unprotected and protected again every frame.
+- **Clears before copies.** A render target clear that is still waiting for its
+  render pass now lands before a blit, image copy or DMA write into the same
+  image, so the clear can never wipe what the copy wrote.
+
+### Lichii shader fixes ([#44](https://github.com/Portablelle/EdGlantine-PS5/pull/44))
+
+Four shader recompiler changes ported from Lichii into the core. None has been
+tried on a console yet.
+
+- **Atomic loops on AMD.** When several shader threads update the same word
+  with an emulated atomic (float add, increment, small stores), each retry now
+  starts from the value the last exchange returned. Reloading the word could
+  keep returning a stale value on AMD, so the loop never ended and the GPU was
+  lost (OoT's first autosave, seen on a desktop AMD card).
+- **Depth-compare textures.** A depth-compare texture always gets a float
+  image, even when its descriptor looks like an integer format. RADV rejected
+  the shader otherwise (a crash in OoT's opening house).
+- **More shaders lowered.** Two more instruction forms (`SHF` with a register
+  shift and `LOP3` with a constant buffer or uniform operand) can use registers
+  that the lowering keeps for itself, instead of rejecting the shader.
+- **No silent register mix-ups.** The gradients of `TXD` and the data of the
+  global `ATOMG` and `RED` atomics are now checked like other operands. Before,
+  a register in the range the lowering keeps for itself was read from the
+  emulated uniform state instead of the guest value.
+
+### Lichii fixes, third batch ([#45](https://github.com/Portablelle/EdGlantine-PS5/pull/45))
+
+Two more changes ported from Lichii into the core, each adapted to it. None
+has been tried on a console yet. The terrain-layer clear and the cheaper
+storage buffer bindings from this batch are in
+[#47](https://github.com/Portablelle/EdGlantine-PS5/pull/47) instead.
+
+- **OoT white flashes.** Before a macro reads occlusion reports from memory, it
+  now waits for the reports whose results the host GPU has not delivered yet.
+  Before, it read the old counts, and leaves and terrain flashed white for a
+  few frames whenever the camera moved. The wait is capped at 200 ms.
+- **Fewer copies in memory tracking.** Page runs that are already sorted are
+  merged where they lie and counted without two extra copies.
+
 ### Lichii fixes, second batch ([#43](https://github.com/Portablelle/EdGlantine-PS5/pull/43))
 
 Four more changes ported from Lichii into the core. None has been tried on a
@@ -280,7 +332,11 @@ roms/
 - **Graphics memory.** Large games can run out of the PS5's shared graphics pool
   (issue #20).
 - **GPU thread splitting** is available but off at startup. Turning it on has
-  frozen games.
+  frozen games. It only starts when a `split-enable.request` file holding any
+  text appears in the app folder (`/data/homebrew/PPSA99862/`) during play, so
+  `NX2_SPLIT_PERF` reports `words=0` otherwise. Even when it runs, each NS2
+  command list waits for the second GPU thread to catch up before it is read,
+  which limits what it can gain.
 - **Sparse texture residency** is off by default (`EDEN_NX2_SPARSE_LAYERS=1` opts
   in). It does not yet save any memory.
 - **Partly simulated services.** Some NX2 services are simulated, and graphics

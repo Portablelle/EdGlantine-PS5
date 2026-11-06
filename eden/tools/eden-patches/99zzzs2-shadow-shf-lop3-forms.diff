@@ -1,0 +1,23 @@
+Ported from open Lichii PR #241 (https://github.com/zortos293/Lichii/pull/241), the register
+shadowing part: the SHF register form (0x219) and LOP3.LUT with a constant buffer or uniform B (0xa12,
+0xc12) can shadow their registers in the lowering scratch range instead of rejecting the program.
+The aligned high uniform base retry is not needed here: our reserved register is already aligned.
+
+diff --git a/src/shader_recompiler/frontend/ampere/register_pressure.h b/src/shader_recompiler/frontend/ampere/register_pressure.h
+--- a/src/shader_recompiler/frontend/ampere/register_pressure.h
++++ b/src/shader_recompiler/frontend/ampere/register_pressure.h
+@@ -29,12 +29,14 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
+     case 0x433: case 0x633: operand(16); operand(24); break;
+     case 0x233: operand(16); operand(24); operand(32); break;
+     case 0x812: case 0x824: case 0x831: case 0x424: case 0x624:
++    case 0xa12: case 0xc12: // LOP3.LUT, constant buffer and uniform B: no register in B's field
+         operand(16); operand(24); operand(64); break;
+     case 0x230: case 0x231:
+         operand(16); operand(24); operand(32); operand(64); break;
+     case 0x819:
+         operand(16); operand(24); operand(64); break;
+     case 0x211:
++    case 0x219: // SHF, register form: Rd, low word, shift amount, high word
+         operand(16); operand(24); operand(32); operand(64); break;
+     case 0xa11:
+         operand(16); operand(24); operand(64); break;

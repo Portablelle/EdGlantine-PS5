@@ -1,0 +1,126 @@
+Ported from Lichii PR #184 (https://github.com/zortos293/Lichii/pull/184), its "sorted page
+batches" path: tracker page runs are coalesced in place and, when already sorted and apart,
+counted without the two heap copies. Without the Nx2Perf switch and its verify mode.
+
+diff --git a/src/core/device_memory_manager.inc b/src/core/device_memory_manager.inc
+index aad8267..503c92a 100644
+--- a/src/core/device_memory_manager.inc
++++ b/src/core/device_memory_manager.inc
+@@ -689,6 +689,22 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedBatch(std::span<const std::pa
+     if (ranges.empty()) {
+         return;
+     }
++    // Runs already sorted with gaps between them (the buffer tracker's) are what the sort and
++    // merge below would produce: use them as they are instead of two heap copies (Lichii #184).
++    const bool separated =
++        std::adjacent_find(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) {
++            return a.first > b.first || a.first + a.second >= b.first;
++        }) == ranges.end();
++    if (separated) {
++        const DAddr lock_begin = ranges.front().first;
++        const DAddr lock_end = ranges.back().first + ranges.back().second;
++        Common::ScopedRangeLock lk(counter_guard, lock_begin,
++                                   static_cast<size_t>(lock_end - lock_begin));
++        for (const auto& [addr, size] : ranges) {
++            UpdatePagesCachedCountNoLock(addr, size, delta);
++        }
++        return;
++    }
+     // Make a local copy and sort by address
+     std::vector<std::pair<DAddr, size_t>> tmp(ranges.begin(), ranges.end());
+     std::sort(tmp.begin(), tmp.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+diff --git a/src/video_core/buffer_cache/word_manager.h b/src/video_core/buffer_cache/word_manager.h
+index 911e522..cdc192d 100644
+--- a/src/video_core/buffer_cache/word_manager.h
++++ b/src/video_core/buffer_cache/word_manager.h
+@@ -36,6 +36,9 @@ enum class Type {
+ 
+ template <class DeviceTracker, size_t stack_words, size_t size_bytes>
+ struct WordManager {
++    /// Page runs whose tracking changed. size_t lengths: the batch below takes them as they are.
++    using CollectedRanges = std::vector<std::pair<VAddr, size_t>>;
++
+     static constexpr size_t num_words = Common::DivCeil(size_bytes, BYTES_PER_WORD);
+ 
+     explicit WordManager(VAddr cpu_addr_, DeviceTracker& tracker_) : tracker{&tracker_}, cpu_addr{cpu_addr_} {
+@@ -122,7 +125,7 @@ struct WordManager {
+         std::span<u64> state_words = Span(type);
+         [[maybe_unused]] std::span<u64> untracked_words = Span(Type::Untracked);
+         [[maybe_unused]] std::span<u64> cached_words = Span(Type::CachedCPU);
+-        std::vector<std::pair<VAddr, u64>> ranges;
++        CollectedRanges ranges;
+         IterateWords(dirty_addr - cpu_addr, size, [&](size_t index, u64 mask) {
+             if (type == Type::CPU || type == Type::CachedCPU) {
+                 CollectChangedRanges(!enable, index, untracked_words[index], mask, ranges);
+@@ -169,7 +172,7 @@ struct WordManager {
+             func(cpu_addr + pending_offset * BYTES_PER_PAGE,
+                  (pending_pointer - pending_offset) * BYTES_PER_PAGE);
+         };
+-        std::vector<std::pair<VAddr, u64>> ranges;
++        CollectedRanges ranges;
+         IterateWords(offset, size, [&](size_t index, u64 mask) {
+             if (type == Type::GPU)
+                 mask &= ~untracked_words[index];
+@@ -252,7 +255,7 @@ struct WordManager {
+         auto const cached_words = Span(Type::CachedCPU);
+         auto const untracked_words = Span(Type::Untracked);
+         auto const cpu_words = Span(Type::CPU);
+-        std::vector<std::pair<VAddr, u64>> ranges;
++        CollectedRanges ranges;
+         ++cpu_epoch;
+         for (u64 word_index = 0; word_index < num_words; ++word_index) {
+             const u64 cached_bits = cached_words[word_index];
+@@ -272,7 +275,7 @@ struct WordManager {
+     /// @param current_bits   Current state of the word
+     /// @param new_bits       New state of the word
+     /// @tparam add_to_tracker True when the tracker should start tracking the new pages
+-    void CollectChangedRanges(bool add_to_tracker, u64 word_index, u64 current_bits, u64 new_bits, std::vector<std::pair<VAddr, u64>>& out_ranges) const {
++    void CollectChangedRanges(bool add_to_tracker, u64 word_index, u64 current_bits, u64 new_bits, CollectedRanges& out_ranges) const {
+         u64 changed_bits = (add_to_tracker ? current_bits : ~current_bits) & new_bits;
+         VAddr addr = cpu_addr + word_index * BYTES_PER_WORD;
+         IteratePages(changed_bits, [&](size_t offset, size_t size) {
+@@ -280,28 +283,29 @@ struct WordManager {
+         });
+     }
+ 
+-    void ApplyCollectedRanges(std::vector<std::pair<VAddr, u64>>& ranges, int delta) const {
++    void ApplyCollectedRanges(CollectedRanges& ranges, int delta) const {
+         if (ranges.empty())
+             return;
+         std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+-        // Coalesce adjacent/contiguous ranges
+-        std::vector<std::pair<VAddr, size_t>> coalesced;
+-        coalesced.reserve(ranges.size());
+-        VAddr cur_addr = ranges[0].first;
+-        size_t cur_size = static_cast<size_t>(ranges[0].second);
++        // Coalesce adjacent/contiguous ranges where they lie, without a copy (Lichii #184).
++        CoalesceInPlace(ranges);
++        // Use batch API to reduce lock acquisitions and contention.
++        tracker->UpdatePagesCachedBatch(
++            std::span<const std::pair<VAddr, size_t>>(ranges.data(), ranges.size()), delta);
++        ranges.clear();
++    }
++
++    /// Merges the contiguous neighbours of sorted, disjoint runs where they lie (no copy).
++    static void CoalesceInPlace(CollectedRanges& ranges) noexcept {
++        size_t last = 0;
+         for (size_t i = 1; i < ranges.size(); ++i) {
+-            if (cur_addr + cur_size == ranges[i].first) {
+-                cur_size += static_cast<size_t>(ranges[i].second);
++            if (ranges[last].first + ranges[last].second == ranges[i].first) {
++                ranges[last].second += ranges[i].second;
+             } else {
+-                coalesced.emplace_back(cur_addr, cur_size);
+-                cur_addr = ranges[i].first;
+-                cur_size = static_cast<size_t>(ranges[i].second);
++                ranges[++last] = ranges[i];
+             }
+         }
+-        coalesced.emplace_back(cur_addr, cur_size);
+-        // Use batch API to reduce lock acquisitions and contention.
+-        tracker->UpdatePagesCachedBatch(coalesced, delta);
+-        ranges.clear();
++        ranges.resize(last + 1);
+     }
+ 
+     /// @brief Notify tracker about changes in the CPU tracking state of a word in the buffer

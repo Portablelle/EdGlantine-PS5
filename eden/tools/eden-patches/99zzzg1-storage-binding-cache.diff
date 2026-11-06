@@ -1,0 +1,150 @@
+Ported from open Lichii PR #175 (https://github.com/zortos293/Lichii/pull/175, by mja00): cache
+storage buffer bindings. Every draw binds each storage buffer again, and working one out takes the
+memory layout lock and walks the page table. BufferCache::StorageBufferBinding now keeps its answers
+in a small 4-way cache, keyed by memory manager, pointer, size word and kind of binding, and valid
+until a GPU mapping changes (MemoryManager::MapSerial and the buffer cache mapping generation). The
+continuous-range cache from 99zy also becomes 4-way, as in the PR. Reimplemented on our
+StorageBufferBinding (StorageBufferSize, MappedStoragePrefix), not copied.
+
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index b9afde7..6dc7ae9 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -2618,8 +2618,31 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+                     gpu_memory->GetMemoryLayoutSize(gpu_addr), is_written, native_pointer, cbuf_index,
+                     ssbo_addr);
+ 
+-    const u64 mapped_size = gpu_memory->GetMemoryLayoutSize(gpu_addr);
+     const u64 following_word = native_pointer ? 0 : gpu_memory->Read<u64>(ssbo_addr + 8);
++    // Read both before the lookup: a mapping change during it leaves the entry stale, not wrong.
++    const size_t owner = gpu_memory->GetID() + 1;
++    const u64 map_serial = gpu_memory->MapSerial();
++    const u64 generation = mapping_generation.load(std::memory_order_acquire);
++    const u32 flags = (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U);
++    auto& cache_set = storage_binding_cache[((gpu_addr ^ following_word ^ flags) *
++                                             0x9E3779B97F4A7C15ULL) >> 56];
++    for (size_t way = 0; way < StorageBindingWays; ++way) {
++        const CachedStorageBinding& cached = cache_set[way];
++        if (cached.owner == owner && cached.gpu_addr == gpu_addr &&
++            cached.following_word == following_word && cached.flags == flags &&
++            cached.map_serial == map_serial && cached.generation == generation) {
++            const Binding hit = cached.binding;
++            std::rotate(cache_set.begin(), cache_set.begin() + way, cache_set.begin() + way + 1);
++            return hit;
++        }
++    }
++    const auto remember = [&](const Binding& result) {
++        std::rotate(cache_set.begin(), cache_set.end() - 1, cache_set.end());
++        cache_set[0] = {owner, gpu_addr, following_word, map_serial, generation, flags, result};
++        return result;
++    };
++
++    const u64 mapped_size = gpu_memory->GetMemoryLayoutSize(gpu_addr);
+     u32 size = StorageBufferSize(mapped_size, following_word, native_pointer);
+     if (native_pointer && size) {
+         size = MappedStoragePrefix(gpu_addr, size);
+@@ -2633,7 +2656,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+     const std::optional<DAddr> aligned_device_addr = gpu_memory->GpuToCpuAddress(aligned_gpu_addr);
+     if (!aligned_device_addr || size == 0) {
+         LOG_DEBUG(HW_GPU, "Failed to find storage buffer for cbuf index {}", cbuf_index);
+-        return NULL_BINDING;
++        return remember(NULL_BINDING);
+     }
+     const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+     ASSERT_MSG(device_addr, "Unaligned storage buffer address not found for cbuf index {}",
+@@ -2651,7 +2674,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+         .size = binding_size,
+         .buffer_id = BufferId{},
+     };
+-    return binding;
++    return remember(binding);
+ }
+ 
+ template <class P>
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 6aa8182..ae1943d 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -702,6 +702,21 @@ private:
+     mutable ::Common::unordered_map<u64, MappedPrefix> mapped_prefixes;
+     /// Bumped by UnmapGPUMemory (any thread), whenever a GPU page's mapping type changes.
+     std::atomic<u64> mapping_generation{1};
++    /// StorageBufferBinding's answers (Lichii #175): every draw binds each storage buffer again,
++    /// and working one out takes the memory layout lock and walks the page table. An answer holds
++    /// for the same pointer, size word and kind of binding until a GPU mapping changes.
++    struct CachedStorageBinding {
++        size_t owner; ///< MemoryManager id + 1, 0 when empty
++        GPUVAddr gpu_addr;
++        u64 following_word;
++        u64 map_serial;
++        u64 generation;
++        u32 flags;
++        Binding binding;
++    };
++    static constexpr size_t StorageBindingWays = 4;
++    mutable std::array<std::array<CachedStorageBinding, StorageBindingWays>, 256>
++        storage_binding_cache{};
+     std::vector<MultiRangeSegment> graphics_segments;
+     std::vector<MultiRangeSegment> compute_segments;
+     u64 frame_tick = 0;
+diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
+index e5d2559..a493cfc 100644
+--- a/src/video_core/memory_manager.cpp
++++ b/src/video_core/memory_manager.cpp
+@@ -549,7 +549,8 @@ bool MemoryManager::IsMemoryDirty(GPUVAddr gpu_addr, size_t size,
+ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
+     // Native storage buffers ask this for up to 8 MiB on each bind, ~70,000 times a second in
+     // title 1's forest (17% of the GPU thread walking pages): keep answers per thread until the
+-    // page table changes.
++    // page table changes. Four ways per set (Lichii #175): direct-mapped, conflicting ranges
++    // were still walked thousands of times a second.
+     struct Entry {
+         size_t owner;
+         GPUVAddr gpu_addr;
+@@ -557,15 +558,23 @@ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
+         u64 serial;
+         size_t result;
+     };
+-    thread_local std::array<Entry, 64> cache{};
++    constexpr size_t Ways = 4;
++    thread_local std::array<std::array<Entry, Ways>, 256> cache{};
+     const u64 serial = map_serial.load(std::memory_order_acquire);
+-    Entry& entry = cache[((gpu_addr ^ size) * 0x9E3779B97F4A7C15ULL) >> 58];
+-    if (entry.owner == unique_identifier + 1 && entry.gpu_addr == gpu_addr && entry.size == size &&
+-        entry.serial == serial) {
+-        return entry.result;
++    auto& set = cache[((gpu_addr ^ size) * 0x9E3779B97F4A7C15ULL) >> 56];
++    for (size_t way = 0; way < Ways; ++way) {
++        const Entry& entry = set[way];
++        if (entry.owner == unique_identifier + 1 && entry.gpu_addr == gpu_addr &&
++            entry.size == size && entry.serial == serial) {
++            const size_t result = entry.result;
++            // Most recent answers first; the last way is the one replaced.
++            std::rotate(set.begin(), set.begin() + way, set.begin() + way + 1);
++            return result;
++        }
+     }
+     const size_t result = MaxContinuousRangeUncached(gpu_addr, size);
+-    entry = {unique_identifier + 1, gpu_addr, size, serial, result};
++    std::rotate(set.begin(), set.end() - 1, set.end());
++    set[0] = {unique_identifier + 1, gpu_addr, size, serial, result};
+     return result;
+ }
+ 
+diff --git a/src/video_core/memory_manager.h b/src/video_core/memory_manager.h
+index 0bdd156..240bf56 100644
+--- a/src/video_core/memory_manager.h
++++ b/src/video_core/memory_manager.h
+@@ -156,6 +156,11 @@ public:
+ 
+     size_t MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const;
+ 
++    /// Bumped after each page table change: lookups cached under one value stay valid until then.
++    [[nodiscard]] u64 MapSerial() const {
++        return map_serial.load(std::memory_order_acquire);
++    }
++
+     bool IsWithinGPUAddressRange(GPUVAddr gpu_addr) const {
+         return gpu_addr < address_space_size;
+     }

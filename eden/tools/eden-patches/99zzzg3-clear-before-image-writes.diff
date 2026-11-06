@@ -1,0 +1,43 @@
+Ported from open Lichii PR #185 (https://github.com/zortos293/Lichii/pull/185): land a deferred
+render pass clear before texture cache blits, image copies and DMA writes into an image. Realized
+after them, its clear pass wiped what they wrote (OoT: terrain drawn over the scene). On our core,
+Scheduler::EndRenderPass already realizes a parked clear before work recorded outside a render pass,
+so this is a cheap guard that makes the order explicit at the three write sites.
+
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 0f8e395..d0217b0 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -1170,6 +1170,11 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
+     if (!result) {
+         return false;
+     }
++    // A clear parked for a render pass (Scheduler::DeferColorClear) lands before this copy, not
++    // after it, where its clear pass would wipe what the copy wrote (Lichii #185: OoT's
++    // occlusion depth, cleared then overwritten by a blit of the scene depth). Only when the
++    // copy proceeds: a rejected blit writes nothing.
++    runtime.FlushDeferredClear();
+     const BlitImages images = *result;
+     const ImageId dst_id = images.dst_id;
+     const ImageId src_id = images.src_id;
+@@ -2819,6 +2824,10 @@ ImageId TextureCache<P>::FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr)
+ template <class P>
+ std::pair<u32, u32> TextureCache<P>::PrepareDmaImage(ImageId dst_id, GPUVAddr base_addr,
+                                                      bool mark_as_modified) {
++    // As in BlitImage: land a parked clear before a DMA write; a read writes nothing.
++    if (mark_as_modified) {
++        runtime.FlushDeferredClear();
++    }
+     const auto& image = slot_images[dst_id];
+     const auto base = image.TryFindBase(base_addr);
+     PrepareImage(dst_id, mark_as_modified, false);
+@@ -3873,6 +3882,8 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
+         // same guest data, which is uploaded from guest memory instead.
+         return;
+     }
++    // As in BlitImage: land a parked clear before the copy overwrites the image.
++    runtime.FlushDeferredClear();
+     const bool is_rescaled = True(src.flags & ImageFlagBits::Rescaled);
+     if (is_rescaled) {
+         ASSERT(True(dst.flags & ImageFlagBits::Rescaled));
