@@ -1,0 +1,47 @@
+OoT's menu text: shadow common ALU forms when a program uses the extended uniform bank.
+UR16-UR62 live in R168-R215, so guest GPRs from R168 up are kept in the SSA bank and copied
+into a free low quartet around each instruction (PrepareRegisterPressure). IADD3 with an
+immediate had no entry, so the last menu-text compute shader was rejected at
+IADD3 R206, R152, 0x20 ("native register shadowing mode"). This adds IADD3, LOP3, IMAD, FFMA,
+FADD, FMUL, SEL, IMNMX, ISETP, MOV and S2R forms, and bumps the translator salt.
+
+--- a/src/shader_recompiler/frontend/ampere/native.h
++++ b/src/shader_recompiler/frontend/ampere/native.h
+@@ -43,7 +43,7 @@
+ 
+ // Salt mixed into the pipeline cache identity of native-translated programs. Bump it whenever the
+ // native translation changes so cached results of an older translator are never reused.
+-inline constexpr u64 NATIVE_TRANSLATOR_SALT = 0x4f554e4345a00009ULL;
++inline constexpr u64 NATIVE_TRANSLATOR_SALT = 0x4f554e4345a0000aULL;
+ 
+ // Maxwell Location offset of native instruction `index` (same mapping the lowering uses).
+ [[nodiscard]] constexpr u32 LocationOf(u32 index) {
+--- a/src/shader_recompiler/frontend/ampere/register_pressure.h
++++ b/src/shader_recompiler/frontend/ampere/register_pressure.h
+@@ -26,6 +26,26 @@
+     const u32 opcode = input.Bits(0, 12);
+     switch (opcode) {
+     case 0x802: case 0xb08: case 0xd08: operand(16); break;
++    // Common integer and float ALU forms, so a program that uses the extended uniform bank (UR16 and
++    // up, which takes R168-R215) can still name those GPRs. Register form (bits 9-11 = 1): A at 24,
++    // B at 32, C at 64. Immediate, constant and uniform B (forms 4-6): A at 24, C at 64. Forms 2-3
++    // (immediate or constant C): B moves to 64, except for FADD. OoT's menu text reached IADD3 R206, R152, 0x20.
++    case 0xa02: case 0x919: operand(16); break;                    // MOV constant, S2R
++    case 0x202: operand(16); operand(32); break;                   // MOV register
++    case 0x20c: operand(24); operand(32); break;                   // ISETP register (predicate outputs)
++    case 0x80c: case 0xa0c: case 0xc0c: operand(24); break;        // ISETP immediate/constant/uniform
++    case 0x207: case 0x217: case 0x220: case 0x221:                // SEL, IMNMX, FMUL, FADD register
++        operand(16); operand(24); operand(32); break;
++    case 0x807: case 0xa07: case 0x817: case 0xa17: case 0xc17:
++    case 0x820: case 0xa20: case 0xc20: case 0x821: case 0xa21:
++    case 0x421: case 0x621: // FADD forms 2-3: its second source is the immediate/constant
++        operand(16); operand(24); break;
++    case 0x210: case 0x212: case 0x223: case 0x224:                // IADD3, LOP3, FFMA, IMAD register
++        operand(16); operand(24); operand(32); operand(64); break;
++    case 0x810: case 0xa10: case 0xc10:                            // IADD3 immediate/constant/uniform B
++    case 0x423: case 0x623: case 0x823: case 0xa23: case 0xc23:    // FFMA
++    case 0xa24: case 0xc24:                                        // IMAD constant/uniform B
++        operand(16); operand(24); operand(64); break;
+     case 0x308: operand(16); operand(32); break;
+     case 0x433: case 0x633: operand(16); operand(24); break;
+     case 0x233: operand(16); operand(24); operand(32); break;
