@@ -86,6 +86,20 @@ tried on a console yet.
   a register in the range the lowering keeps for itself was read from the
   emulated uniform state instead of the guest value.
 
+### Lichii fixes, third batch ([#45](https://github.com/Portablelle/EdGlantine-PS5/pull/45))
+
+Two more changes ported from Lichii into the core, each adapted to it. None
+has been tried on a console yet. The terrain-layer clear and the cheaper
+storage buffer bindings from this batch are in
+[#47](https://github.com/Portablelle/EdGlantine-PS5/pull/47) instead.
+
+- **OoT white flashes.** Before a macro reads occlusion reports from memory, it
+  now waits for the reports whose results the host GPU has not delivered yet.
+  Before, it read the old counts, and leaves and terrain flashed white for a
+  few frames whenever the camera moved. The wait is capped at 200 ms.
+- **Fewer copies in memory tracking.** Page runs that are already sorted are
+  merged where they lie and counted without two extra copies.
+
 ### Lichii fixes, second batch ([#43](https://github.com/Portablelle/EdGlantine-PS5/pull/43))
 
 Four more changes ported from Lichii into the core. None has been tried on a
