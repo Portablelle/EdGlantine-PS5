@@ -16,6 +16,8 @@ Checks, with the production lower_to_maxwell.h and register_pressure.h:
 - every ALU form added to the shadowing table rewrites each named high GPR below the limit and
   leaves its other fields alone, and these forms lower with high GPRs next to the extended bank;
 - an opcode outside the table is still rejected the same way;
+- the UIMAD words of the other six menu-text shaders (99zzzu, 99zzzv) lower to exactly the same
+  Maxwell words as the GPR forms IMAD.WIDE (0x825) and IMAD (0x424) on the mapped registers;
 - the translator salt changed, so pipelines cached by the older translator are not reused.
 Fails before this change (the captured instruction is rejected).
 """
@@ -159,6 +161,30 @@ int main() {
     {
         const auto lowered = Lower(Make(0x209, 206, 172, 190, 0));
         assert(!lowered && std::string_view{lowered.error} == "native register shadowing mode");
+    }
+    // The UIMAD words the other six menu-text shaders use (99zzzu, 99zzzv) lower exactly as the
+    // GPR forms the translator already had (IMAD.WIDE 0x825, IMAD 0x424) on the mapped registers:
+    // UR4 -> R220, UR6 -> R222, UR14 -> R230, URZ -> RZ, with the uniform flag (bit 91) cleared.
+    {
+        struct Pair { Instruction uniform, gpr; };
+        const auto gpr = [](const Instruction& u, u32 opcode, u32 d, u32 a, u32 c) {
+            return Instruction{{(u.words[0] & 0xf000U) | opcode | (d << 16) | (a << 24), u.words[1],
+                                (u.words[2] & ~0x080000ffU) | c, u.words[3]}};
+        };
+        const Instruction w0{{0x060478a5, 0x88888889, 0x0f8e003f, 0x002fc600}}; // UIMAD.WIDE.U32 UR4, UR6, 0x88888889, URZ
+        const Instruction w1{{0x040678a5, 0x88888889, 0x0f8e003f, 0x000fc400}}; // UIMAD.WIDE.U32 UR6, UR4, 0x88888889, URZ
+        const Instruction w2{{0x040474a4, 0x00003c00, 0x0f8e0206, 0x000fc600}}; // UIMAD UR4, UR4, UR6, 0x3c00
+        const Instruction w3{{0x040e74a4, 0x00003c00, 0x0f8e020e, 0x000fc400}}; // UIMAD UR14, UR4, UR14, 0x3c00
+        const Pair pairs[] = {
+            {w0, gpr(w0, 0x825, 220, 222, 255)}, {w1, gpr(w1, 0x825, 222, 220, 255)},
+            {w2, gpr(w2, 0x424, 220, 220, 222)}, {w3, gpr(w3, 0x424, 230, 220, 230)},
+        };
+        for (const auto& [uniform, reference] : pairs) {
+            const std::array a{uniform, exit_insn}, b{reference, exit_insn};
+            const auto lu = LowerToMaxwell(a, {}, true, true), lg = LowerToMaxwell(b, {}, true, true);
+            assert(lu && lg);
+            assert(lu.instructions == lg.instructions);
+        }
     }
     std::printf("PASS: IADD3 R206, R152, 0x20 lowers next to UR16 through R164-R167; ALU forms shadowed\n");
 }
