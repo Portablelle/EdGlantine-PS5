@@ -1,0 +1,44 @@
+Lichii PR #203 (zortos293/Lichii, sergio): apply LayeredFS mods to titles whose RomFS is not
+updatable (NUP packages carry their update merged), and check a nested config array index
+against the innermost array. Adapted to our core: a title with no RomFS keeps returning none.
+
+diff --git a/src/core/file_sys/romfs_factory.cpp b/src/core/file_sys/romfs_factory.cpp
+index 5178725..911a601 100644
+--- a/src/core/file_sys/romfs_factory.cpp
++++ b/src/core/file_sys/romfs_factory.cpp
+@@ -38,11 +38,18 @@ void RomFSFactory::SetPackedUpdate(VirtualFile update_raw_file) {
+ }
+ 
+ VirtualFile RomFSFactory::OpenCurrentProcess(u64 current_process_title_id) const {
++    const auto type = ContentRecordType::Program;
+     if (!updatable) {
+-        return file;
++        if (file == nullptr) {
++            return file;
++        }
++        // A NUP already carries its update merged, but LayeredFS mods
++        // (load/<title>/<mod>/romfs) still apply. There is no NCA, so no update step.
++        const PatchManager mods{current_process_title_id, filesystem_controller,
++                                content_provider};
++        return mods.PatchRomFS(nullptr, file, type, nullptr);
+     }
+ 
+-    const auto type = ContentRecordType::Program;
+     const auto nca = content_provider.GetEntry(current_process_title_id, type);
+     const PatchManager patch_manager{current_process_title_id, filesystem_controller,
+                                      content_provider};
+diff --git a/src/frontend_common/config.cpp b/src/frontend_common/config.cpp
+index f61192d..f06cfa2 100644
+--- a/src/frontend_common/config.cpp
++++ b/src/frontend_common/config.cpp
+@@ -1079,7 +1079,9 @@ void Config::SetArrayIndex(const int index) {
+     const int array_index = index + 1;
+ 
+     // You can't exceed the known max size of the array by more than 1
+-    ASSERT(array_stack.front().size + 1 >= array_index);
++    // Check the innermost array, not the outermost: nested arrays such as
++    // DisabledAddOns/<n>/disabled asserted on every entry past the outer size.
++    ASSERT(array_stack.back().size + 1 >= array_index);
+ 
+     // Change the config array size to the current index since you may want
+     // to reduce the number of elements that you read back from the config

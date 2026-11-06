@@ -1,0 +1,22 @@
+Lichii PR #159 (zortos293/Lichii): when a title opens its own RomFS by program index 0 and
+the content provider has no entry for it (NUP containers, loose dumps), fall back to the
+RomFS the loader exposes instead of failing.
+
+diff --git a/src/core/file_sys/romfs_factory.cpp b/src/core/file_sys/romfs_factory.cpp
+index 911a601..4976ca0 100644
+--- a/src/core/file_sys/romfs_factory.cpp
++++ b/src/core/file_sys/romfs_factory.cpp
+@@ -72,7 +72,12 @@ VirtualFile RomFSFactory::OpenPatchedRomFSWithProgramIndex(u64 title_id, u8 prog
+                                                            ContentRecordType type) const {
+     const auto res_title_id = GetBaseTitleIDWithProgramIndex(title_id, program_index);
+ 
+-    return OpenPatchedRomFS(res_title_id, type);
++    auto romfs = OpenPatchedRomFS(res_title_id, type);
++    if (romfs == nullptr && program_index == 0 && !updatable) {
++        // NUP containers and loose dumps are not in the content provider: use the loader's RomFS.
++        return file;
++    }
++    return romfs;
+ }
+ 
+ VirtualFile RomFSFactory::Open(u64 title_id, StorageId storage, ContentRecordType type) const {

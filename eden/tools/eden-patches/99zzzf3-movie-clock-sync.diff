@@ -1,0 +1,126 @@
+Lichii PR #251 (zortos293/Lichii): keep OoT's movies in time with their sound below 60 FPS.
+The game takes one movie frame per game frame; for that title the decoder now follows a real
+clock from the first frame and skips frames more than two frame times late (still decoded,
+not converted nor handed out). Adapted from Lichii's nx2_gsv decode worker to our synchronous
+native_video_decoder PumpOutput. Lichii's EDEN_NX2_MOVIE_CLOCK counters are not ported.
+
+diff --git a/src/core/hle/service/am/service/native_video_decoder.cpp b/src/core/hle/service/am/service/native_video_decoder.cpp
+index e88005e..ba685bd 100644
+--- a/src/core/hle/service/am/service/native_video_decoder.cpp
++++ b/src/core/hle/service/am/service/native_video_decoder.cpp
+@@ -187,9 +187,60 @@ private:
+             operation_syncpoint.reset();
+         }
+         started = false;
++        EndMovieClock();
+         if (submission_event) submission_event->Clear(kernel);
+     }
+ 
++    // Lichii #251. OoT takes one movie frame per game frame, so below 60 FPS its movies fell
++    // behind their sound. For that title the decoder follows a real clock started at the first
++    // frame and skips frames that are more than two frame times late. A gap of over a second
++    // between takes (the game paused) moves the clock instead. EDEN_NX2_MOVIE_CLOCK_SYNC=0 turns
++    // this off, =1 turns it on for any title.
++    static constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
++    static constexpr auto MovieClockPause = std::chrono::seconds{1};
++    using MovieClock = std::chrono::steady_clock;
++
++    bool SyncsToClock() const {
++        static const int forced = [] {
++            const char* value = std::getenv("EDEN_NX2_MOVIE_CLOCK_SYNC");
++            return value == nullptr ? -1 : (value[0] == '1' ? 1 : 0);
++        }();
++        if (forced >= 0) return forced == 1;
++        return system.GetApplicationProcessProgramID() == OcarinaOfTimeProgramId;
++    }
++
++    u64 MovieFrameMicroseconds() const {
++        const u32 rate = configuration ? configuration->frame_rate : 0;
++        return rate != 0 && rate <= 240 ? u64{1'000'000} / rate : u64{1'000'000} / 60;
++    }
++
++    bool IsLate(u64 timestamp) const {
++        // A stream whose timestamps do not move is never late.
++        if (!movie_clock_running || timestamp <= movie_clock_start_timestamp) return false;
++        const auto now = MovieClock::now();
++        if (now - movie_clock_last_take > MovieClockPause) return false;
++        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - movie_clock_start).count();
++        const u64 due = movie_clock_start_timestamp + static_cast<u64>((std::max<s64>)(elapsed, 0));
++        return timestamp + 2 * MovieFrameMicroseconds() < due;
++    }
++
++    void StartMovieClock(u64 timestamp) {
++        if (movie_clock_running || !SyncsToClock()) return;
++        movie_clock_running = true;
++        movie_clock_start = MovieClock::now();
++        movie_clock_last_take = movie_clock_start;
++        movie_clock_start_timestamp = timestamp;
++    }
++
++    void EndMovieClock() {
++        if (movie_late_dropped != 0) {
++            LOG_INFO(Service_AM, "native video skipped {} late frames to keep the movie in time",
++                     movie_late_dropped);
++        }
++        movie_late_dropped = 0;
++        movie_clock_running = false;
++    }
++
+     struct DecodedFrame {
+         std::array<std::vector<u8>, 3> planes;
+         std::array<u32, 3> widths;
+@@ -555,6 +606,13 @@ private:
+                 R_TRY(DecodePendingInput());
+                 if (decoded_frames.empty()) continue;
+             }
++            if (!decoded_frames.front().eos && (decoded_frames.size() > 1 || !pending_inputs.empty()) &&
++                IsLate(decoded_frames.front().timestamp)) {
++                // Still decoded (later frames refer to it), but not converted nor handed out.
++                decoded_frames.pop_front();
++                ++movie_late_dropped;
++                continue;
++            }
+             const auto& frame = decoded_frames.front();
+             const auto& pool = *image->pool;
+             const u32 pool_width = (pool.packed_dimensions & 0xffffU) + 1;
+@@ -621,6 +679,8 @@ private:
+             properties[8] = frame.eos ? 1 : 0;
+             output_properties.push_back(properties);
+             image->available = false;
++            if (frame.eos) EndMovieClock();
++            else StartMovieClock(frame.timestamp);
+             system.Host1x().GetSyncpointManager().IncrementGuest(*operation_syncpoint);
+             system.Host1x().GetSyncpointManager().IncrementHost(*operation_syncpoint);
+             LOG_DEBUG(Service_AM, "native AV1 output written image={}, dimensions={}x{}, threshold={}",
+@@ -646,6 +706,11 @@ private:
+                 properties = output_properties.front();
+                 output_properties.pop_front();
+                 result = ResultSuccess;
++                const auto now = MovieClock::now();
++                if (movie_clock_running && now - movie_clock_last_take > MovieClockPause) {
++                    movie_clock_start += now - movie_clock_last_take;
++                }
++                movie_clock_last_take = now;
+             }
+         }
+         LOG_DEBUG(Service_AM, "native video output properties result={:#x}, image={}, eos={}, pending_frames={}, pending_inputs={}",
+@@ -781,6 +846,7 @@ private:
+                     decoded_frames.clear();
+                     output_properties.clear();
+                     CompletePendingFences();
++                    EndMovieClock();
+                     if (submission_event) submission_event->Clear(kernel);
+                 }
+             }
+@@ -1063,6 +1129,11 @@ private:
+     u64 pending_input_bytes{};
+     u64 next_submission_id{1};
+     bool started{};
++    bool movie_clock_running{};
++    MovieClock::time_point movie_clock_start{};
++    MovieClock::time_point movie_clock_last_take{};
++    u64 movie_clock_start_timestamp{};
++    u64 movie_late_dropped{};
+     Kernel::KProcess* process;
+     NativeVideoKind kind;
+     Kernel::KTransferMemory* transfer_memory{};

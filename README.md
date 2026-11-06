@@ -65,6 +65,29 @@ CPU draw preparation is the main known bottleneck.
 
 Recent work, newest first. Each item links to its pull request.
 
+### Lichii mods, movie timing and loader fixes
+
+Five small changes ported from Lichii into the core (layers `99zzzf1` to
+`99zzzf5`). None of them has been tried on a console yet.
+
+- **Mods for NUP games.** RomFS mods (`romfs` folders of a game's mods) now
+  apply to NUP packages too. A NUP's update is already merged, so there is no
+  update step.
+- **OoT's movies keep up with their sound.** The game shows one movie frame per
+  game frame, so below 60 FPS its movies fell behind the audio. For OoT the
+  decoder now follows a real clock and skips frames that are more than two
+  frame times late. They are still decoded, but not converted or handed to the
+  game. A pause of over a second moves the clock instead.
+  `EDEN_NX2_MOVIE_CLOCK_SYNC=0` turns this off, and `=1` turns it on for any
+  game.
+- **RomFS by program index.** A game that opens its own RomFS by program
+  index 0 gets the loaded RomFS when the package isn't in the content
+  provider (NUP packages, loose dumps).
+- **Quotes in `.pchtxt` text.** A quote of the other kind inside a quoted
+  string no longer ends it.
+- **ZBIC errors are logged** with zstd's reason, when an NSO segment fails to
+  decompress.
+
 ### Lichii fixes, second batch ([#43](https://github.com/Portablelle/EdGlantine-PS5/pull/43))
 
 Four more changes ported from Lichii into the core. None has been tried on a
