@@ -137,6 +137,11 @@ about 15 FPS. That is a different defect, not a rejected shader.
   shader keys, separated by spaces, commas or lines. Those shaders are skipped as
   if unsupported. The log names each lowered shader's key ("Lowered native shader
   at ...: key=..."). Skip one per run to find which shader causes a visual defect.
+- **Dump chosen shaders.** `/data/eden-nx2/dump-shaders.txt` takes keys in the same
+  format. Those shaders still run, and their source, the mapped bytes from their
+  program base (header included) and the lowered Maxwell words are written once to
+  `/data/eden-nx2/logs/rejected-shaders/`, to study a shader that lowers but draws
+  wrongly.
 - **Collect a run in one command.**
   `python3 eden/tools/ps5-collect.py --host <PS5 address>` downloads the logs, the
   dumped shaders and the newest screenshot (converted to JPEG when `imagecodecs`

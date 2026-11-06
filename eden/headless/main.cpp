@@ -290,17 +290,22 @@ int main(int argc, char** argv) {
     // /data/eden-nx2/reject-shaders.txt: native shader keys (as logged by "Lowered native shader at
     // ...: key=..."), separated by spaces, commas or lines, that are skipped as if unsupported. Skip
     // one shader per run to find which one causes a visual defect.
-    if (std::ifstream keys_file{std::string{Eden::kDataDir} + "/reject-shaders.txt"}) {
+    // /data/eden-nx2/dump-shaders.txt, same format: those shaders still run, and their source, the
+    // mapped bytes and the lowered words are written to logs/rejected-shaders/ (needs the dump on).
+    const auto read_keys = [](const char* file, const char* variable, const char* tag) {
+        std::ifstream keys_file{std::string{Eden::kDataDir} + "/" + file};
         std::string keys, word;
         while (keys_file >> word) {
             for (char& c : word) if (c == ',') c = ' ';
             keys += word + ",";
         }
         if (!keys.empty()) {
-            setenv("EDEN_NATIVE_REJECT_KEYS", keys.c_str(), 1);
-            std::fprintf(stderr, "EDEN_REJECT_SHADER_KEYS %s\n", keys.c_str());
+            setenv(variable, keys.c_str(), 1);
+            std::fprintf(stderr, "%s %s\n", tag, keys.c_str());
         }
-    }
+    };
+    read_keys("reject-shaders.txt", "EDEN_NATIVE_REJECT_KEYS", "EDEN_REJECT_SHADER_KEYS");
+    read_keys("dump-shaders.txt", "EDEN_NATIVE_DUMP_KEYS", "EDEN_DUMP_SHADER_KEYS");
     try {
         std::FILE* report = stdout;
         SCOPE_EXIT { if (report != stdout) std::fclose(report); };

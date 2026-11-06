@@ -1,10 +1,54 @@
 Log each lowered native shader's program key, so /data/eden-nx2/reject-shaders.txt
 (EDEN_NATIVE_REJECT_KEYS) can name one shader to skip on the next run and show which shader
-causes a visual defect.
+causes a visual defect. EDEN_NATIVE_DUMP_KEYS (/data/eden-nx2/dump-shaders.txt) writes the source,
+mapped bytes and lowered words of chosen shaders that lower, for study off the console.
 
 --- a/src/video_core/shader_environment.cpp
 +++ b/src/video_core/shader_environment.cpp
-@@ -652,8 +652,11 @@
+@@ -612,6 +612,42 @@
+         }
+     }
+     if (lowered) {
++        // Diagnostic: program keys whose source, the mapped bytes from the program base (header
++        // included) and the lowered Maxwell words are written once to EDEN_NATIVE_SHADER_OVERRIDE_DIR,
++        // so a shader that lowers but draws wrongly can be studied off the console
++        // (/data/eden-nx2/dump-shaders.txt on the PS5).
++        if (const char* wanted = std::getenv("EDEN_NATIVE_DUMP_KEYS")) {
++            const char* directory = std::getenv("EDEN_NATIVE_SHADER_OVERRIDE_DIR");
++            const auto key = fmt::format("{:016x}", Shader::Ampere::NativeProgramKey(native));
++            static std::mutex dumped_mutex;
++            static std::set<std::string> dumped;
++            std::scoped_lock dump_lock{dumped_mutex};
++            if (directory && std::string_view{wanted}.find(key) != std::string_view::npos &&
++                dumped.insert(key).second) {
++                const auto folder = std::filesystem::path{directory};
++                std::filesystem::create_directories(folder);
++                {
++                    std::ofstream source(folder / (key + ".source.bin"), std::ios::binary);
++                    source.write(reinterpret_cast<const char*>(native.data()), native.size() * sizeof(Instruction));
++                }
++                {
++                    std::ofstream mapped(folder / (key + ".mapped.bin"), std::ios::binary);
++                    std::array<u8, 0x1000> block{};
++                    for (u32 offset = 0; offset < 0x10000; offset += 0x1000) {
++                        if (!gpu_memory->IsFullyMappedRange(program_base + offset, block.size())) break;
++                        gpu_memory->ReadBlock(program_base + offset, block.data(), block.size());
++                        mapped.write(reinterpret_cast<const char*>(block.data()), block.size());
++                    }
++                }
++                {
++                    std::ofstream maxwell(folder / (key + ".lowered.bin"), std::ios::binary);
++                    maxwell.write(reinterpret_cast<const char*>(lowered.instructions.data()),
++                                  lowered.instructions.size() * sizeof(u64));
++                }
++                LOG_WARNING(Shader, "Native shader dumped on request: key={}, program={:#x}, header={}, folder={}",
++                            key, program_base, native_header_size, folder.string());
++            }
++        }
+         // Diagnostic: comma-separated program keys that must be rejected as if unsupported.
+         if (const char* reject = std::getenv("EDEN_NATIVE_REJECT_KEYS")) {
+             const auto key = fmt::format("{:016x}", Shader::Ampere::NativeProgramKey(native));
+@@ -652,8 +688,11 @@
      Shader::Ampere::AppendNativeAddressMap(code, lowered.source_instruction_offsets);
      cached_lowest = 0;
      cached_highest = static_cast<u32>((code.size() - 1) * sizeof(u64));
