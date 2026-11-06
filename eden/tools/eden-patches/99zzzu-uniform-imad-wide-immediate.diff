@@ -1,0 +1,65 @@
+OoT's menu text: translate UIMAD.WIDE with an immediate (Ampere opcode 0x8a5).
+Seven OoT compute shaders were rejected at it, so their dispatches were skipped
+and each menu line showed only its first letter.
+
+
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -149,7 +149,7 @@
+     };
+     for (const auto& instruction : code) {
+         const u32 op = instruction.Bits(0, 12);
+-        const bool uniform_destination = op == 0x291 || op == 0x2be || op == 0x896 || op == 0x883 || op == 0x2a4 || op == 0x8a4 || op == 0x290 || op == 0x890 ||
++        const bool uniform_destination = op == 0x291 || op == 0x2be || op == 0x896 || op == 0x883 || op == 0x2a4 || op == 0x8a4 || op == 0x8a5 || op == 0x290 || op == 0x890 ||
+             op == 0x891 || op == 0x892 || op == 0x899 || op == 0x882 || op == 0xc82 || op == 0x2bd || op == 0x3c4 ||
+             op == 0x3c2 || op == 0x886 || op == 0xab9 || op == 0xabb || op == 0x9c3 || op == 0x287 || op == 0x887 ||
+             op == 0x292 || op == 0x299;
+@@ -158,7 +158,7 @@
+         case 0x291: case 0x2a4: case 0x290: case 0x292: case 0x299:
+             uses_extended_uniform_bank |= extended_uniform(instruction.Bits(32, 8));
+             [[fallthrough]];
+-        case 0x8a4: case 0x890: case 0x891: case 0x892: case 0x899:
++        case 0x8a4: case 0x8a5: case 0x890: case 0x891: case 0x892: case 0x899:
+             uses_extended_uniform_bank |= extended_uniform(instruction.Bits(24, 8)) || extended_uniform(instruction.Bits(64, 8));
+             break;
+         case 0x2be:
+@@ -204,7 +204,7 @@
+             break;
+         default: break;
+         }
+-        uses_uniform_bank |= op == 0xf60 || op == 0xc13 || op == 0xc19 || op == 0xd06 || op == 0x2a5 || op == 0xd05 || op == 0xc09 || op == 0xf63 || op == 0xf66 || op == 0xd08 || (op == 0x83b && instruction.Bits(91, 1)) || op == 0x2be || op == 0x526 || op == 0x988 || (op == 0x984 && instruction.Bits(91, 1)) || op == 0xc11 || op == 0x883 || (op == 0x98e && instruction.Bits(91, 1)) || op == 0x291 || op == 0x896 || op == 0x892 || op == 0x89c || op == 0x3c4 || op == 0x2bd || op == 0xc10 || op == 0xc0b || op == 0xc0c || op == 0x986 || op == 0x981 || op == 0x9a8 || op == 0xc12 || op == 0xc17 || op == 0xe24 || op == 0xc24 || op == 0xd00 || op == 0xd09 || op == 0x9c3 || op == 0xc45 || op == 0x2a4 || op == 0x8a4 || op == 0x891 || op == 0x890 || op == 0x290 || op == 0x28c || op == 0x88c || op == 0x287 || op == 0x887 || op == 0x958 || op == 0xab9 || op == 0xabb || op == 0x899 || op == 0xc20 || op == 0xe21 || op == 0xc23 || op == 0xe23 || op == 0xc02 || op == 0x292 || op == 0x299 ||
++        uses_uniform_bank |= op == 0xf60 || op == 0xc13 || op == 0xc19 || op == 0xd06 || op == 0x2a5 || op == 0x8a5 || op == 0xd05 || op == 0xc09 || op == 0xf63 || op == 0xf66 || op == 0xd08 || (op == 0x83b && instruction.Bits(91, 1)) || op == 0x2be || op == 0x526 || op == 0x988 || (op == 0x984 && instruction.Bits(91, 1)) || op == 0xc11 || op == 0x883 || (op == 0x98e && instruction.Bits(91, 1)) || op == 0x291 || op == 0x896 || op == 0x892 || op == 0x89c || op == 0x3c4 || op == 0x2bd || op == 0xc10 || op == 0xc0b || op == 0xc0c || op == 0x986 || op == 0x981 || op == 0x9a8 || op == 0xc12 || op == 0xc17 || op == 0xe24 || op == 0xc24 || op == 0xd00 || op == 0xd09 || op == 0x9c3 || op == 0xc45 || op == 0x2a4 || op == 0x8a4 || op == 0x891 || op == 0x890 || op == 0x290 || op == 0x28c || op == 0x88c || op == 0x287 || op == 0x887 || op == 0x958 || op == 0xab9 || op == 0xabb || op == 0x899 || op == 0xc20 || op == 0xe21 || op == 0xc23 || op == 0xe23 || op == 0xc02 || op == 0x292 || op == 0x299 ||
+                              op == 0x886 || op == 0x3c2 || op == 0xc82 || op == 0x882 || (op == 0x81c && instruction.Bits(67, 1));
+     }
+     const bool uses_async_copy = std::any_of(code.begin(), code.end(), [](const auto& instruction) {
+@@ -347,7 +347,11 @@
+         if (opcode == 0x292 && (insn.Bits(12, 4) != 7 || insn.Bits(40, 24) || insn.Bits(80, 1) ||
+                                 insn.Bits(81, 3) != 7 || insn.Bits(87, 4) != 15 || !insn.Bits(91, 1)))
+             return fail(index, "native uniform logic mode");
+-        if (opcode == 0x291 || opcode == 0x2a4 || opcode == 0x2a5 || opcode == 0x8a4 || opcode == 0x891 || opcode == 0x892 || opcode == 0x890 || opcode == 0x290 || opcode == 0x292) {
++        // UIMAD.WIDE(.U32) with an immediate (0x8a5) becomes IMAD.WIDE immediate (0x825) on the mapped
++        // registers, as UIMAD immediate (0x8a4) becomes 0x824. OoT's menu text compute shaders divide by
++        // 15 with it (multiplier 0x88888889); rejected, they skipped every dispatch and the menu showed
++        // only the first letter of each line.
++        if (opcode == 0x291 || opcode == 0x2a4 || opcode == 0x2a5 || opcode == 0x8a4 || opcode == 0x8a5 || opcode == 0x891 || opcode == 0x892 || opcode == 0x890 || opcode == 0x290 || opcode == 0x292) {
+             const u32 dst = uniform_register(insn.Bits(16, 8));
+             const u32 a = uniform_register(insn.Bits(24, 8));
+             const u32 c = uniform_register(insn.Bits(64, 8));
+@@ -359,7 +363,7 @@
+                 if (b == ~0U) return fail(index, "native uniform arithmetic second register");
+                 insn.words[1] = (insn.words[1] & ~0xffU) | b;
+             }
+-            opcode = opcode == 0x291 ? 0x211 : opcode == 0x2a4 ? 0x224 : opcode == 0x2a5 ? 0x225 : opcode == 0x8a4 ? 0x824 : opcode == 0x891 ? 0x811 : opcode == 0x892 ? 0x812 : opcode == 0x890 ? 0x810 : opcode == 0x292 ? 0x212 : 0x210;
++            opcode = opcode == 0x291 ? 0x211 : opcode == 0x2a4 ? 0x224 : opcode == 0x2a5 ? 0x225 : opcode == 0x8a4 ? 0x824 : opcode == 0x8a5 ? 0x825 : opcode == 0x891 ? 0x811 : opcode == 0x892 ? 0x812 : opcode == 0x890 ? 0x810 : opcode == 0x292 ? 0x212 : 0x210;
+         }
+         const bool uniform_predicate_bank = original_opcode == 0x290 || original_opcode == 0x890 || original_opcode == 0x892;
+         if (uniform_predicate_bank) {
+@@ -378,7 +382,7 @@
+             }
+         }
+         const bool uniform_predication = !uniform_predicate_bank && (opcode == 0x899 || opcode == 0xabb || opcode == 0xab9 || opcode == 0xc82 || opcode == 0x882 ||
+-            original_opcode == 0x291 || original_opcode == 0x2a4 || original_opcode == 0x2a5 || original_opcode == 0x8a4 || original_opcode == 0x891 || original_opcode == 0x890 || original_opcode == 0x290);
++            original_opcode == 0x291 || original_opcode == 0x2a4 || original_opcode == 0x2a5 || original_opcode == 0x8a4 || original_opcode == 0x8a5 || original_opcode == 0x891 || original_opcode == 0x890 || original_opcode == 0x290);
+         const u32 native_predicate = insn.Bits(12, 4);
+         const bool guarded_uniform = uniform_predication && native_predicate != 7;
+         if (guarded_uniform && (native_predicate & 7) == 7)
