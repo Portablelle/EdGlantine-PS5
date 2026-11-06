@@ -65,6 +65,29 @@ CPU draw preparation is the main known bottleneck.
 
 Recent work, newest first. Each item links to its pull request.
 
+### Fixes from viejunerd's build for Mario Kart World and the GPU thread
+
+Taken from [viejunerd's EglantinePS5 build](https://github.com/viejunerd/Eglantine-PS5-)
+(`tools/eglantine-patches`). None of them has been tried on a console yet.
+
+- **Compact memory for Mario Kart World.** It is on for this game unless the
+  game's own settings turn it off. Written memory that is mostly zeroes is kept
+  in 16 KiB pages.
+- **Smaller kernel tables.** Each memory manager sizes its page reference counts
+  to its own region, not to all of the console's memory.
+- **Smaller GPU queue.** Command lists keep 32 entries in place instead of 512,
+  so the GPU thread's queue takes about 2 MiB instead of about 25 MiB.
+- **No more abort on a 4 GiB vertex stream.** It is clamped and logged, which
+  is what aborted Mario Kart World as it booted in viejunerd's build.
+- **Out-of-range syncpoints are dropped** and logged once, instead of crashing.
+- **Controller callbacks after the applet resource exists.** A motion sample
+  during boot could crash the app.
+- **No global Vulkan pipeline cache.** It hung NS2 games at 98% on every launch
+  after the first in viejunerd's build. Per-game caches are kept.
+- **The GPU thread wakes on new work.** While channels wait on a semaphore, it
+  used to sleep a fixed 1 ms. It now wakes as soon as work arrives, and checks
+  the semaphores every 0.25 ms.
+
 ### NUP packages ([#28](https://github.com/Portablelle/EdGlantine-PS5/pull/28))
 
 `.nup` files can go in `roms/` next to NSP and XCI. A NUP is Eglantine's
