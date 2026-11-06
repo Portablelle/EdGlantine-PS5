@@ -277,14 +277,29 @@ extern "C" void eden_load_step(const char* stage, const char* detail) {
 int main(int argc, char** argv) {
     if (setenv("EDEN_NX2_MME_JIT", "1", 1) != 0 ||
         setenv("EDEN_NX2_SPLIT", "1", 1) != 0) return 2;
-    // /data/eden-nx2/dump-rejected-shaders.txt: write each native shader the translator rejects to
-    // logs/rejected-shaders/<key>.source.bin (and .mapped.bin), without waiting for an override.
-    // Set before the first shader, since the core reads both variables once.
-    if (std::ifstream(std::string{Eden::kDataDir} + "/dump-rejected-shaders.txt").good()) {
+    // Shader debugging switches, read once before the first shader (the core reads these variables
+    // once). Each native shader the translator rejects is written to logs/rejected-shaders/<key>
+    // .source.bin (and .mapped.bin) and the game carries on, so the next blocker can be fixed off
+    // the console. On by default; /data/eden-nx2/dump-rejected-shaders-off.txt turns it off.
+    if (!std::ifstream(std::string{Eden::kDataDir} + "/dump-rejected-shaders-off.txt").good()) {
         const std::string folder = std::string{Eden::kDataDir} + "/logs/rejected-shaders";
         setenv("EDEN_NATIVE_SHADER_OVERRIDE_DIR", folder.c_str(), 1);
         setenv("EDEN_NATIVE_SHADER_NO_PAUSE", "1", 1);
         std::fprintf(stderr, "EDEN_REJECTED_SHADER_DUMP %s\n", folder.c_str());
+    }
+    // /data/eden-nx2/reject-shaders.txt: native shader keys (as logged by "Lowered native shader at
+    // ...: key=..."), separated by spaces, commas or lines, that are skipped as if unsupported. Skip
+    // one shader per run to find which one causes a visual defect.
+    if (std::ifstream keys_file{std::string{Eden::kDataDir} + "/reject-shaders.txt"}) {
+        std::string keys, word;
+        while (keys_file >> word) {
+            for (char& c : word) if (c == ',') c = ' ';
+            keys += word + ",";
+        }
+        if (!keys.empty()) {
+            setenv("EDEN_NATIVE_REJECT_KEYS", keys.c_str(), 1);
+            std::fprintf(stderr, "EDEN_REJECT_SHADER_KEYS %s\n", keys.c_str());
+        }
     }
     try {
         std::FILE* report = stdout;

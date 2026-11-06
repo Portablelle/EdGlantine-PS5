@@ -122,11 +122,30 @@ rejected, so every one of their dispatches was skipped. Four layers so far:
   shader dumped on 00.067.003, the whole program (2934 instructions) now lowers
   off the console. Not yet tried on a console.
 
-To find what a rejected shader still stops at, create
-`/data/eden-nx2/dump-rejected-shaders.txt` (any content) before starting the app.
-Each native shader the translator rejects is then written to
-`/data/eden-nx2/logs/rejected-shaders/<key>.source.bin`, with the bytes mapped
-after it in `<key>.mapped.bin`, and the game carries on. Delete the file to stop.
+On 00.067.004 no shader is rejected any more: the noise is gone and the movie
+and logo show, but the menu still shows only the first letter of each line, at
+about 15 FPS. That is a different defect, not a rejected shader.
+
+### Debugging tools
+
+- **Rejected shaders are dumped.** Each native shader the translator rejects is
+  written to `/data/eden-nx2/logs/rejected-shaders/<key>.source.bin` (and the
+  bytes mapped after it to `<key>.mapped.bin`), and the game carries on. This is
+  on by default; create `/data/eden-nx2/dump-rejected-shaders-off.txt` to turn it
+  off.
+- **Skip chosen shaders.** `/data/eden-nx2/reject-shaders.txt` lists native
+  shader keys, separated by spaces, commas or lines. Those shaders are skipped as
+  if unsupported. The log names each lowered shader's key ("Lowered native shader
+  at ...: key=..."). Skip one per run to find which shader causes a visual defect.
+- **Collect a run in one command.**
+  `python3 eden/tools/ps5-collect.py --host <PS5 address>` downloads the logs, the
+  dumped shaders and the newest screenshot (converted to JPEG when `imagecodecs`
+  and Pillow are installed). It writes `report.json` and `report.txt`, which list
+  the version, the rejected and lowered native shaders with their keys, the last
+  performance lines and the most frequent warnings. Add `--scan <ssh host>:<patched
+  source tree>` to run every dumped shader through the translator on that host
+  (`eden/tools/native-shader-scan/scan.cpp`), which lists everything that still
+  blocks it.
 
 ### Lichii mods, movie timing and loader fixes
 

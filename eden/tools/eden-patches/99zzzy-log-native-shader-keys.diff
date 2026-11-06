@@ -1,0 +1,20 @@
+Log each lowered native shader's program key, so /data/eden-nx2/reject-shaders.txt
+(EDEN_NATIVE_REJECT_KEYS) can name one shader to skip on the next run and show which shader
+causes a visual defect.
+
+--- a/src/video_core/shader_environment.cpp
++++ b/src/video_core/shader_environment.cpp
+@@ -652,8 +652,11 @@
+     Shader::Ampere::AppendNativeAddressMap(code, lowered.source_instruction_offsets);
+     cached_lowest = 0;
+     cached_highest = static_cast<u32>((code.size() - 1) * sizeof(u64));
+-    LOG_INFO(Shader, "Lowered native shader at {:#x}: {} source bytes, {} instructions",
+-             program_base, native_source_size, lowered.instructions.size());
++    // The key is what /data/eden-nx2/reject-shaders.txt names (EDEN_NATIVE_REJECT_KEYS) to skip one
++    // shader on the next run, which tells which shader causes a visual defect.
++    LOG_INFO(Shader, "Lowered native shader at {:#x}: key={:016x}, {} source bytes, {} instructions",
++             program_base, Shader::Ampere::NativeProgramKey(native), native_source_size,
++             lowered.instructions.size());
+ }
+ 
+ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
