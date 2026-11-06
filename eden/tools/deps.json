@@ -12,6 +12,16 @@
       "creates": ".deps/mirror-67bada77f8a43a90da2e94e89b8e7da73c256989/CMakeLists.txt"
     },
     {
+      "name": "dav1d",
+      "about": "dav1d 1.5.4 source, the AV1 decoder for NS2 movies (OoT), built into FFmpeg for the PS5",
+      "kind": "archive",
+      "url": "https://github.com/videolan/dav1d/archive/54706fc6bc0cdecab7e9593974a4039cc038fca7.tar.gz",
+      "sha512": "00f2ee7c0c2f2df1b3e38d8bec6fd661c18e4e6fadd02c02b6238f1bed7512e8507933886b502226f833dee40c71ee4bc075de8d4cfd86873bcbaf6e233a4370",
+      "extract": ".deps/dav1d-54706fc6bc",
+      "strip": 1,
+      "creates": ".deps/dav1d-54706fc6bc/meson.build"
+    },
+    {
       "name": "ffmpeg",
       "about": "FFmpeg source as pinned by Eden's cpmfile.json, built for the PS5 decoders",
       "kind": "archive",
