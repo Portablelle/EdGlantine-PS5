@@ -98,7 +98,7 @@ tried on a console yet.** The split is still off unless you turn it on (see
 
 OoT's menu shows only the first letter of each line, such as "N" and "P".
 The text is laid out by seven compute shaders that the native translator
-rejected, so every one of their dispatches was skipped. Two layers so far:
+rejected, so every one of their dispatches was skipped. Three layers so far:
 
 - **`UIMAD.WIDE` by an immediate** (Ampere opcode `0x8a5`, a divide by 15,
   [#48](https://github.com/Portablelle/EdGlantine-PS5/pull/48)). After it, three of
@@ -106,8 +106,14 @@ rejected, so every one of their dispatches was skipped. Two layers so far:
 - **`UIMAD` with an immediate addend** (`0x4a4`, layer `99zzzv`). Three more
   stopped at it on 00.067.000. Not yet tried on a console.
 
-The seventh shader is still rejected: it uses high registers that the
-translator keeps for uniform registers ("native register shadowing mode").
+- **High registers next to the extended uniform bank** (layer `99zzzw`). The
+  seventh shader uses uniform registers UR16 and up, which take R168-R215, and
+  also its own R206. Guest registers in that range are kept aside and copied
+  into a free low register group around each instruction, but `IADD3` with an
+  immediate had no entry for this, so the shader was rejected ("native register
+  shadowing mode"). The layer adds it and the other common integer and float
+  forms. Not yet tried on a console; the shader may still stop at a later
+  instruction.
 
 ### Lichii mods, movie timing and loader fixes
 
