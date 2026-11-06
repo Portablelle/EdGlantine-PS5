@@ -1,0 +1,55 @@
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -108,6 +108,7 @@ void BufferCache<P>::TickFrame() {
+         return;
+     }
+     runtime.TickFrame(slot_buffers);
++    native_indirect_uniforms_this_frame.clear();
+     // Every 600 frames, and every 5 s (a load at ~20 fps: issue #20).
+     static u64 frames{};
+     static auto last_report = std::chrono::steady_clock::now();
+@@ -1192,6 +1193,23 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+             return alignment > 1 && (offset % alignment) != 0;
+         }
+     }();
++    // Native programs keep tables next to their code in a 64 KiB bank read with indirect offsets
++    // (Lichii #150). Writes to that memory can go unnoticed by the memory tracker, leaving stale
++    // host contents, so upload such a bank again once per frame.
++    if (has_host_buffer && (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
++        size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling() &&
++        !memory_tracker.IsRegionGpuModified(device_addr, size) &&
++        native_indirect_uniforms_this_frame.insert(device_addr).second) {
++        // The bank size is only an upper limit: stop at the end of the mapped memory.
++        u64 mapped_size = 0;
++        while (mapped_size < size &&
++               device_memory.GetPointer<u8>(device_addr + mapped_size) != nullptr) {
++            mapped_size += Core::DEVICE_PAGESIZE - ((device_addr + mapped_size) & Core::DEVICE_PAGEMASK);
++        }
++        if (mapped_size != 0) {
++            memory_tracker.MarkRegionAsCpuModified(device_addr, (std::min<u64>)(mapped_size, size));
++        }
++    }
+     const bool use_fast_buffer = needs_alignment_stream
+         || (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size
+             && !memory_tracker.IsRegionGpuModified(device_addr, size));
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -16,6 +16,7 @@
+ #include <mutex>
+ #include <numeric>
+ #include <span>
++#include <unordered_set>
+ #include <vector>
+ 
+ #include "common/container/unordered_map.h"
+@@ -367,6 +368,8 @@ public:
+     Common::SpinRecursiveMutex mutex;
+     Runtime& runtime;
+     bool any_buffer_uploaded = false;
++    /// Indirectly read banks of native programs already uploaded this frame (Lichii #150).
++    std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
+ 
+     /// EDEN_NX2_DRAW_TUNING=0 turns off the per-draw shortcuts below. From viejunerd/Eglantine-PS5-
+     /// tools/eglantine-patches/0017, after MythosOfs/Orchid a3be6e11b, 5ffe9eb53, 4476c8671 and

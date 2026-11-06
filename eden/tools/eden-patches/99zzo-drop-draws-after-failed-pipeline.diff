@@ -1,0 +1,94 @@
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -1046,6 +1046,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+             cmdbuf.BindDescriptorBuffersEXT(binding_info);
+         }
+         if (bind_pipeline) {
++            scheduler.SetGraphicsPipelineMissing(!pipeline);
+             if (!pipeline) {
+                 return;
+             }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -942,7 +942,10 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+         const u32 num_instances{instance_count};
+         const DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
+ 
+-        scheduler.Record([draw_params](vk::CommandBuffer cmdbuf) {
++        scheduler.Record([this, draw_params](vk::CommandBuffer cmdbuf) {
++            if (scheduler.GraphicsPipelineMissing()) {
++                return;
++            }
+             if (draw_params.is_indexed) {
+                 cmdbuf.DrawIndexed(draw_params.num_vertices, draw_params.num_instances,
+                                    draw_params.first_index, draw_params.base_vertex,
+@@ -978,8 +981,11 @@ void RasterizerVulkan::DrawIndirect() {
+         const auto& buffer = indirect_buffer.first;
+         const auto& offset = indirect_buffer.second;
+         if (params.is_byte_count) {
+-            scheduler.Record([buffer_obj = buffer->Handle(), offset,
++            scheduler.Record([this, buffer_obj = buffer->Handle(), offset,
+                               stride = params.stride](vk::CommandBuffer cmdbuf) {
++                if (scheduler.GraphicsPipelineMissing()) {
++                    return;
++                }
+                 cmdbuf.DrawIndirectByteCountEXT(1, 0, buffer_obj, offset, 0,
+                                                 static_cast<u32>(stride));
+             });
+@@ -989,9 +995,12 @@ void RasterizerVulkan::DrawIndirect() {
+             const auto count = buffer_cache.GetDrawIndirectCount();
+             const auto& draw_buffer = count.first;
+             const auto& offset_base = count.second;
+-            scheduler.Record([draw_buffer_obj = draw_buffer->Handle(),
++            scheduler.Record([this, draw_buffer_obj = draw_buffer->Handle(),
+                               buffer_obj = buffer->Handle(), offset_base, offset,
+                               params](vk::CommandBuffer cmdbuf) {
++                if (scheduler.GraphicsPipelineMissing()) {
++                    return;
++                }
+                 if (params.is_indexed) {
+                     cmdbuf.DrawIndexedIndirectCount(
+                         buffer_obj, offset, draw_buffer_obj, offset_base,
+@@ -1004,7 +1013,11 @@ void RasterizerVulkan::DrawIndirect() {
+             });
+             return;
+         }
+-        scheduler.Record([buffer_obj = buffer->Handle(), offset, params](vk::CommandBuffer cmdbuf) {
++        scheduler.Record([this, buffer_obj = buffer->Handle(), offset,
++                          params](vk::CommandBuffer cmdbuf) {
++            if (scheduler.GraphicsPipelineMissing()) {
++                return;
++            }
+             if (params.is_indexed) {
+                 cmdbuf.DrawIndexedIndirect(buffer_obj, offset,
+                                            static_cast<u32>(params.max_draw_counts),
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -95,6 +95,16 @@ public:
+     /// Update the pipeline to the current execution context.
+     bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline);
+ 
++    /// Worker thread only: whether the bound graphics pipeline failed to build, so the draws
++    /// recorded after it must be dropped instead of reaching the driver without a pipeline
++    /// (Lichii #142).
++    void SetGraphicsPipelineMissing(bool missing) {
++        graphics_pipeline_missing = missing;
++    }
++    [[nodiscard]] bool GraphicsPipelineMissing() const {
++        return graphics_pipeline_missing;
++    }
++
+     /// Update the rescaling state. Returns true if the state has to be updated.
+     bool UpdateRescaling(bool is_rescaling);
+ 
+@@ -362,6 +372,7 @@ private:
+     std::mutex queue_mutex;
+     std::condition_variable_any event_cv;
+     bool worker_waiting{}; ///< The worker is waiting for work (guarded by queue_mutex)
++    bool graphics_pipeline_missing{}; ///< Worker thread only, see SetGraphicsPipelineMissing
+     std::jthread worker_thread;
+ 
+     std::chrono::steady_clock::duration frame_interval{};

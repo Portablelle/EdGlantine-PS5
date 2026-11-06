@@ -1,0 +1,84 @@
+diff --git a/src/shader_recompiler/ir_opt/constant_propagation_pass.cpp b/src/shader_recompiler/ir_opt/constant_propagation_pass.cpp
+--- a/src/shader_recompiler/ir_opt/constant_propagation_pass.cpp
++++ b/src/shader_recompiler/ir_opt/constant_propagation_pass.cpp
+@@ -337,6 +337,29 @@ bool FoldXmadMultiply(IR::Block& block, IR::Inst& inst) {
+     return true;
+ }
+ 
++/// Replaces (BitFieldUExtract(a, 16, 16) << 16) + BitFieldUExtract(a, 0, 16) with a: what an XMAD
++/// multiplication by 1 leaves once its products by 0 and 1 are folded (Lichii #150)
++bool FoldHalvesRecombine(IR::Inst& inst) {
++    for (size_t arg = 0; arg < 2; ++arg) {
++        IR::Inst* const shl{inst.Arg(arg).TryInstRecursive()};
++        IR::Inst* const low{inst.Arg(1 - arg).TryInstRecursive()};
++        if (!shl || !low || shl->GetOpcode() != IR::Opcode::ShiftLeftLogical32 ||
++            shl->Arg(1) != IR::Value{16U} || low->GetOpcode() != IR::Opcode::BitFieldUExtract ||
++            low->Arg(1) != IR::Value{0U} || low->Arg(2) != IR::Value{16U}) {
++            continue;
++        }
++        IR::Inst* const high{shl->Arg(0).TryInstRecursive()};
++        if (!high || high->GetOpcode() != IR::Opcode::BitFieldUExtract ||
++            high->Arg(1) != IR::Value{16U} || high->Arg(2) != IR::Value{16U} ||
++            high->Arg(0).Resolve() != low->Arg(0).Resolve()) {
++            continue;
++        }
++        inst.ReplaceUsesWith(low->Arg(0));
++        return true;
++    }
++    return false;
++}
++
+ template <typename T>
+ void FoldAdd(IR::Block& block, IR::Inst& inst) {
+     if (inst.HasAssociatedPseudoOperation()) {
+@@ -351,6 +374,9 @@ void FoldAdd(IR::Block& block, IR::Inst& inst) {
+         return;
+     }
+     if constexpr (std::is_same_v<T, u32>) {
++        if (FoldHalvesRecombine(inst)) {
++            return;
++        }
+         if (FoldXmadMultiply(block, inst)) {
+             return;
+         }
+@@ -360,6 +386,30 @@ void FoldAdd(IR::Block& block, IR::Inst& inst) {
+     }
+ }
+ 
++/// Folds products by 0 and 1 (Lichii #150). An XMAD multiplication by a 16-bit immediate leaves
++/// them behind (the cross term of the high halves), and OoT's IMAD.WIDE pointer + offset then hid
++/// the pointer from storage buffer tracking, which bound the offset word as the buffer instead.
++void FoldIMul32(IR::Inst& inst) {
++    if (FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return a * b; })) {
++        return;
++    }
++    for (size_t arg = 0; arg < 2; ++arg) {
++        const IR::Value factor{inst.Arg(arg)};
++        if (!factor.IsImmediate()) {
++            continue;
++        }
++        if (factor.U32() == 0) {
++            inst.ReplaceUsesWith(IR::Value{0U});
++            return;
++        }
++        if (factor.U32() == 1) {
++            const IR::Value other{inst.Arg(1 - arg)};
++            inst.ReplaceUsesWith(other);
++            return;
++        }
++    }
++}
++
+ void FoldISub32(IR::Inst& inst) {
+     if (FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return a - b; })) {
+         return;
+@@ -964,8 +1014,7 @@ void ConstantPropagation(Environment& env, IR::Block& block, IR::Inst& inst) {
+     case IR::Opcode::ISub32:
+         return FoldISub32(inst);
+     case IR::Opcode::IMul32:
+-        FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return a * b; });
+-        return;
++        return FoldIMul32(inst);
+     case IR::Opcode::ShiftRightArithmetic32:
+         FoldWhenAllImmediates(inst, [](s32 a, s32 b) { return static_cast<u32>(a >> b); });
+         return;

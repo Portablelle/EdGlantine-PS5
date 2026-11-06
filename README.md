@@ -65,6 +65,25 @@ CPU draw preparation is the main known bottleneck.
 
 Recent work, newest first. Each item links to its pull request.
 
+### Lichii GPU and shader fixes ([#41](https://github.com/Portablelle/EdGlantine-PS5/pull/41))
+
+Seven fixes ported from Lichii into the core. None has been tried on a console
+yet.
+
+- **Black scenes on AMD.** Shaders that end some pixels early inside nested
+  branches no longer write their colours before those pixels are discarded.
+- **Movie crash.** Two threads can no longer read the list of CPU-written memory
+  at the same time.
+- **Crash after a failed pipeline.** Draws that follow a graphics pipeline that
+  failed to build are dropped instead of reaching the driver.
+- **Global `ATOM.CAS`.** Shaders that use a 32-bit compare-and-swap on a raw
+  address now compile.
+- **Depth-stencil copies.** Reinterpreting a depth-stencil image copies the
+  depth aspect only, with the right image layout.
+- **OoT sky and culling.** Multiplies by 0 and 1 are simplified, so the shader
+  sees the real buffer pointer. Native 64 KiB uniform banks are uploaded again
+  once per frame, so tables next to the code don't go stale.
+
 ### Fixes from viejunerd's build for Mario Kart World and the GPU thread
 
 Taken from [viejunerd's EglantinePS5 build](https://github.com/viejunerd/Eglantine-PS5-)
