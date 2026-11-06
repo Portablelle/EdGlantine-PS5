@@ -1,0 +1,112 @@
+Ported from Lichii PR #194 (https://github.com/zortos293/Lichii/pull/194), from Frizti's
+oot-gather-fix: upload a native 64 KiB uniform bank directly, and memoize storage buffer
+bindings until the GPU page table changes. The rest of #194 (host-mapped buffers, pipeline
+cache files, FSR3) is not ported.
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index b9afde7..cf5ad1f 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -1206,8 +1206,16 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+                device_memory.GetPointer<u8>(device_addr + mapped_size) != nullptr) {
+             mapped_size += Core::DEVICE_PAGESIZE - ((device_addr + mapped_size) & Core::DEVICE_PAGEMASK);
+         }
+-        if (mapped_size != 0) {
+-            memory_tracker.MarkRegionAsCpuModified(device_addr, (std::min<u64>)(mapped_size, size));
++        // Uploaded here (Lichii #194): marked CPU-modified only, the bank was uploaded when the
++        // buffer was next synchronized, which a fast-buffer bind of it does not do.
++        const u64 upload_size = (std::min<u64>)(mapped_size, size);
++        if (upload_size != 0) {
++            std::array<BufferCopy, 1> copies{BufferCopy{
++                .src_offset = 0,
++                .dst_offset = buffer.Offset(device_addr),
++                .size = upload_size,
++            }};
++            UploadMemory(buffer, upload_size, upload_size, copies);
+         }
+     }
+     const bool use_fast_buffer = needs_alignment_stream
+@@ -2618,22 +2626,55 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+                     gpu_memory->GetMemoryLayoutSize(gpu_addr), is_written, native_pointer, cbuf_index,
+                     ssbo_addr);
+ 
+-    const u64 mapped_size = gpu_memory->GetMemoryLayoutSize(gpu_addr);
+     const u64 following_word = native_pointer ? 0 : gpu_memory->Read<u64>(ssbo_addr + 8);
++    // The binding only depends on the pointer, the word after it and the mappings: memoized until
++    // the page table changes (Lichii #194, from Frizti), it skips the layout and address walks
++    // that each storage buffer of each draw repeated.
++    const u32 alignment = runtime.GetStorageBufferAlignment();
++    struct CachedBinding {
++        size_t owner;
++        GPUVAddr gpu_addr;
++        u64 following_word;
++        u64 serial;
++        u32 alignment;
++        u32 flags;
++        Binding binding;
++    };
++    constexpr size_t ways = 4;
++    thread_local std::array<std::array<CachedBinding, ways>, 512> binding_cache{};
++    const u32 flags = (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U);
++    const size_t owner = gpu_memory->GetID() + 1;
++    const u64 serial = gpu_memory->MapSerial();
++    auto& set = binding_cache[((gpu_addr ^ following_word ^ flags) * 0x9E3779B97F4A7C15ULL) >> 55];
++    for (size_t way = 0; way < ways; ++way) {
++        const CachedBinding& cached = set[way];
++        if (cached.owner == owner && cached.gpu_addr == gpu_addr &&
++            cached.following_word == following_word && cached.serial == serial &&
++            cached.alignment == alignment && cached.flags == flags) {
++            const Binding hit = cached.binding;
++            std::rotate(set.begin(), set.begin() + way, set.begin() + way + 1);
++            return hit;
++        }
++    }
++    const auto remember = [&](const Binding& result) {
++        std::rotate(set.begin(), set.end() - 1, set.end());
++        set[0] = {owner, gpu_addr, following_word, serial, alignment, flags, result};
++        return result;
++    };
++    const u64 mapped_size = gpu_memory->GetMemoryLayoutSize(gpu_addr);
+     u32 size = StorageBufferSize(mapped_size, following_word, native_pointer);
+     if (native_pointer && size) {
+         size = MappedStoragePrefix(gpu_addr, size);
+     }
+ 
+     // Alignment only applies to the offset of the buffer
+-    const u32 alignment = runtime.GetStorageBufferAlignment();
+     const GPUVAddr aligned_gpu_addr = Common::AlignDown(gpu_addr, alignment);
+     const u32 aligned_size = static_cast<u32>(gpu_addr - aligned_gpu_addr) + size;
+ 
+     const std::optional<DAddr> aligned_device_addr = gpu_memory->GpuToCpuAddress(aligned_gpu_addr);
+     if (!aligned_device_addr || size == 0) {
+         LOG_DEBUG(HW_GPU, "Failed to find storage buffer for cbuf index {}", cbuf_index);
+-        return NULL_BINDING;
++        return remember(NULL_BINDING);
+     }
+     const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+     ASSERT_MSG(device_addr, "Unaligned storage buffer address not found for cbuf index {}",
+@@ -2651,7 +2692,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+         .size = binding_size,
+         .buffer_id = BufferId{},
+     };
+-    return binding;
++    return remember(binding);
+ }
+ 
+ template <class P>
+diff --git a/src/video_core/memory_manager.h b/src/video_core/memory_manager.h
+index 0bdd156..a9ec433 100644
+--- a/src/video_core/memory_manager.h
++++ b/src/video_core/memory_manager.h
+@@ -156,6 +156,11 @@ public:
+ 
+     size_t MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const;
+ 
++    /// Changes whenever the page table does: answers derived from the mappings stay valid until then.
++    [[nodiscard]] u64 MapSerial() const noexcept {
++        return map_serial.load(std::memory_order_acquire);
++    }
++
+     bool IsWithinGPUAddressRange(GPUVAddr gpu_addr) const {
+         return gpu_addr < address_space_size;
+     }
