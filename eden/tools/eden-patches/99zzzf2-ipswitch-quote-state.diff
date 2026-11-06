@@ -1,0 +1,25 @@
+Lichii PR #221 (zortos293/Lichii), second part only: while scanning a .pchtxt line for its
+comment, a quote of the other kind inside a quoted string no longer toggles the quote state
+(so "it's" or '"' no longer make a following // or # look like text). The first part, skipping
+lines that are not patch records, is already done by headless/CMakeLists.txt (IsPatchRecord and
+IsPatchFlag over Eden's IPSwitch parser), which replaces the code before Parse().
+
+diff --git a/src/core/file_sys/ips_layer.cpp b/src/core/file_sys/ips_layer.cpp
+index 32e9041..682bb56 100644
+--- a/src/core/file_sys/ips_layer.cpp
++++ b/src/core/file_sys/ips_layer.cpp
+@@ -267,7 +267,13 @@ void IPSwitchCompiler::Parse(std::span<u8 const> bytes) {
+                 || (!quote && p[0] == '#')) {
+                     break;
+                 } else if (p[0] == '\"' || p[0] == '\'') {
+-                    quote = (p[0] == quote) ? '\0' : p[0];
++                    // A quote of the other kind inside a quoted string is text: only the
++                    // opening kind closes it.
++                    if (!quote) {
++                        quote = p[0];
++                    } else if (p[0] == quote) {
++                        quote = '\0';
++                    }
+                     ++p;
+                     last_char = p;
+                 } else if (p + 1 < sline.cend() && p[0] == '\\') {

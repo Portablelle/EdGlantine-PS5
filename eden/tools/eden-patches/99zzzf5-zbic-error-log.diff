@@ -1,0 +1,28 @@
+Lichii PR #160 (zortos293/Lichii, for Lichii #95), logging part only: say why a ZBIC segment did
+not decompress (zstd's error name and both sizes). Refusing to load such an NSO is already done
+on the PS5 by headless/CMakeLists.txt, which decodes each segment in place and returns no module
+when one fails; the nso.cpp hunk is left out so that pin keeps matching. Lichii's
+-fno-profile-instr-use is not needed: our PGO profile only covers video_core, shader_recompiler
+and dynarmic.
+
+diff --git a/src/common/zbic_compression.cpp b/src/common/zbic_compression.cpp
+index a298c6f..01fd528 100644
+--- a/src/common/zbic_compression.cpp
++++ b/src/common/zbic_compression.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include <cstring>
+ 
++#include "common/logging.h"
+ #include "common/zbic_compression.h"
+ 
+ #define ZSTD_ZBIC_SUPPORT 1
+@@ -45,6 +46,8 @@ int DecompressDataZBIC(std::span<u8> dst, std::span<const u8> src) {
+     }
+     const size_t res = ZSTD_decompress(dst.data(), dst.size(), src.data(), src.size());
+     if (ZSTD_isError(res)) {
++        LOG_ERROR(Loader, "ZBIC decompression of {} bytes into {} bytes failed: {}", src.size(),
++                  dst.size(), ZSTD_getErrorName(res));
+         return -1;
+     }
+     return static_cast<int>(res);
