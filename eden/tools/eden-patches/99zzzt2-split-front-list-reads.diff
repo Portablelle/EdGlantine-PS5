@@ -1,0 +1,292 @@
+Front-side write tracking for the GPU thread split, part 2: the front reads NS2 command list
+segments without waiting for the back when nothing queued or cached can have written them, and
+polls of a suspended semaphore acquire wait for the back less often. Ideas from Lichii PRs #179
+(https://github.com/zortos293/Lichii/pull/179: LIST_FAST, skip the writer wait once the written
+pages have settled, checked on the back), #243 (https://github.com/zortos293/Lichii/pull/243:
+front reads that wait only for writes that matter) and #231
+(https://github.com/zortos293/Lichii/pull/231: acquire polls without a drain). Written for this
+core (mode 1, macros on the back), not copied.
+
+A segment waits as before (GpuSplit::Synchronize) unless reads are unsafe, its entry has no sync
+flag, it is at most 64 KiB, all its pages are mapped and unmarked in 99zzzt1's bitmap, and no page
+was newly marked in the last second. Every early read is checked on the back where the wait used
+to be (IsMemoryDirty, then the same bytes); a difference logs NX2_SPLIT_TRACK_MISS and turns early
+reads off for the run. A met GEQUAL acquire resumes from guest memory; an unmet one skips the wait
+while the back is busy, for at most 1 ms. New NX2_SPLIT_PERF fields count all of it.
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 2dd8e97..1cd8f2f 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <atomic>
++#include <chrono>
+ #include <cstdlib>
+ #include <cstdio>
+ #include <cstring>
+@@ -23,6 +24,7 @@
+ #include "video_core/memory_manager.h"
+ #include "video_core/native_dma_capture.h"
+ #ifdef EDEN_NX2_PS5_PROTO
++#include "video_core/gpu_written_pages.h"
+ #include "video_core/native_dma_snapshot.h"
+ #include "video_core/native_semaphore_observation.h"
+ #endif
+@@ -33,6 +35,121 @@ namespace Tegra {
+ constexpr u32 MacroRegistersStart = 0xE00;
+ constexpr u32 ComputeInline = 0x6D;
+ 
++#ifdef EDEN_NX2_PS5_PROTO
++namespace {
++// Front-side write tracking for command list segments (GPU thread split, mode 1).
++// Ideas from Lichii (github.com/zortos293/Lichii) PRs #179 (EDEN_NX2_LIST_FAST: skip the wait
++// for queued writers once no page has been newly GPU-written for a while, checked on the back)
++// and #243 (front reads that wait only for the writes that can matter). Written for this core.
++//
++// Each segment used to wait for the back (GpuSplit::Synchronize): the back checked whether its
++// caches held GPU writes to the segment, then copied it. Now the front copies it from guest
++// memory itself when:
++//  - reads are unsafe and the entry has no sync flag (the flag is how the GPU orders a command
++//    fetch after earlier work; such entries still wait);
++//  - every 4 KiB page of the segment is mapped and none of them was ever GPU-written
++//    (gpu_written_pages.h);
++//  - no page anywhere was newly GPU-written in the last second, so the set of written pages is
++//    settled (a queued draw or copy writing a command page for the first time is the case the
++//    bitmap cannot see yet);
++//  - the segment is at most 64 KiB.
++// Otherwise it waits as before. Every early read is checked on the back, in order, where the
++// wait used to be: if the old path would have read other bytes there (dirty caches, or other
++// guest memory contents), it logs NX2_SPLIT_TRACK_MISS and turns the early reads off for the
++// rest of the run.
++constexpr size_t MaxFrontSegmentBytes = 64 * 1024;
++constexpr auto SettleTime = std::chrono::seconds{1};
++
++struct FrontListState {
++    u64 marks = ~u64{0};
++    std::chrono::steady_clock::time_point marks_changed{};
++};
++FrontListState front_list_state; // front thread only
++
++struct FrontSegmentCheck {
++    MemoryManager* memory;
++    GPUVAddr address;
++    u32* front_words;
++    size_t bytes;
++
++    void operator()() const {
++        using Split = VideoCommon::SplitPerformance;
++        const bool dirty = memory->IsMemoryDirty(address, bytes);
++        bool same = false;
++        if (!dirty) {
++            static std::vector<u32> back_words; // back thread only
++            back_words.resize(bytes / sizeof(u32));
++            memory->ReadBlockUnsafe(address, back_words.data(), bytes);
++            same = std::memcmp(back_words.data(), front_words, bytes) == 0;
++        }
++        auto& observation = VideoCommon::NativeSemaphoreObservation::state;
++        if (observation.enabled.load(std::memory_order_relaxed)) {
++            ++observation.header_reads;
++            observation.header_bytes.fetch_add(bytes);
++            if (dirty) ++observation.header_dirty;
++        }
++        ++Split::list_verified;
++        if (dirty || !same) {
++            const auto misses = ++Split::list_misses;
++            VideoCommon::SplitTracking::disabled.store(true, std::memory_order_release);
++            if (misses <= 16) {
++                std::fprintf(stderr, "NX2_SPLIT_TRACK_MISS gpu=%llx bytes=%llu dirty=%d\n",
++                             static_cast<unsigned long long>(address),
++                             static_cast<unsigned long long>(bytes), dirty ? 1 : 0);
++            }
++        }
++        delete[] front_words;
++    }
++};
++
++/// Front: copies the segment into `destination` without waiting for the back, when nothing
++/// queued or cached can have written it (see above). False: the caller waits as before.
++bool ReadSegmentOnFront(MemoryManager& memory, const CommandListHeader& header,
++                        void* destination, size_t bytes, bool use_safe) {
++    using Split = VideoCommon::SplitPerformance;
++    namespace Pages = VideoCommon::GpuWrittenPages;
++    if (VideoCommon::SplitTracking::disabled.load(std::memory_order_acquire)) {
++        ++Split::list_fb_off;
++        return false;
++    }
++    if (use_safe || header.sync.Value() != 0 || bytes == 0 || bytes > MaxFrontSegmentBytes) {
++        ++Split::list_fb_other;
++        return false;
++    }
++    const u64 marks = Pages::new_marks.load(std::memory_order_acquire);
++    const auto now = std::chrono::steady_clock::now();
++    if (marks != front_list_state.marks) {
++        front_list_state.marks = marks;
++        front_list_state.marks_changed = now;
++        ++Split::list_fb_settle;
++        return false;
++    }
++    if (now - front_list_state.marks_changed < SettleTime) {
++        ++Split::list_fb_settle;
++        return false;
++    }
++    const GPUVAddr address = header.addr;
++    for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < address + bytes; page += 0x1000) {
++        const auto device = memory.GpuToCpuAddress(page);
++        if (!device) {
++            ++Split::list_fb_other;
++            return false;
++        }
++        if (Pages::Any(*device, 1)) {
++            ++Split::list_fb_written;
++            return false;
++        }
++    }
++    memory.ReadBlockUnsafe(address, destination, bytes);
++    auto* const front_words = new u32[bytes / sizeof(u32)];
++    std::memcpy(front_words, destination, bytes);
++    VideoCommon::GpuSplit::Get().Defer(FrontSegmentCheck{&memory, address, front_words, bytes});
++    ++Split::list_direct;
++    return true;
++}
++} // namespace
++#endif
++
+ DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Control::ChannelState& channel_state_)
+     : system{system_}
+     , memory_manager{memory_manager_}
+@@ -187,9 +304,14 @@ bool DmaPusher::Step() {
+             if (command_resume_offset == 0) {
+                 command_headers.resize_destructive(header.size);
+ #ifdef EDEN_NX2_PS5_PROTO
+-                if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
++                if (auto& split = VideoCommon::GpuSplit::Get(); split.Active() &&
++                    ReadSegmentOnFront(memory_manager, header, command_headers.data(),
++                                       size_t{header.size} * sizeof(CommandHeader), use_safe)) {
++                    // Read on the front; the back checks it where the wait used to be.
++                } else if (split.Active()) {
+                     // Even unsafe DMA must not read ahead of back-owned writes. Check cache
+                     // dirtiness and take the owned snapshot on the renderer owner in order.
++                    ++VideoCommon::SplitPerformance::list_waits;
+                     split.Synchronize([memory = &memory_manager, address = dma_state.dma_get,
+                                        destination = command_headers.data(),
+                                        bytes = size_t{header.size} * sizeof(CommandHeader), use_safe] {
+diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
+index c410566..1bf445d 100644
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
+ #include "video_core/native_diagnostics.h"
++#include <chrono>
+ #include <cstdlib>
+ 
+ #include "common/assert.h"
+@@ -177,6 +178,36 @@ bool Puller::CanResumeNativeAcquire(DmaPusher& dma_pusher) const {
+     if (!native_acquire) {
+         return false;
+     }
++#ifdef EDEN_NX2_PS5_PROTO
++    // Split: answer from guest memory without waiting for the back where that is safe. Idea
++    // from Lichii (github.com/zortos293/Lichii) PR #231 (polls of a waiting acquire without a
++    // drain); written for this core.
++    //  - A GEQUAL acquire that guest memory already meets is met: the counters only grow, so
++    //    whatever the back still writes meets it too (the rule ProcessSemaphoreTriggerMethod
++    //    already uses when the acquire is first seen).
++    //  - An acquire guest memory does not meet stays "not yet" while the back is busy, for at
++    //    most 1 ms since the last poll that waited: the back keeps running what is queued, and
++    //    the next poll that finds it caught up (or the 1 ms limit) waits and reads through its
++    //    caches as before. A poll only ever delays a resume this way, never makes one early.
++    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active() && !Settings::IsGPULevelHigh() &&
++        !dma_pusher.memory_manager.IsShuttingDown()) {
++        using Split = VideoCommon::SplitPerformance;
++        ++Split::sem_polls;
++        const u32 word = dma_pusher.memory_manager.Read<u32>(native_acquire->address);
++        const bool met = native_acquire->Matches(word);
++        if (met && native_acquire->operation == static_cast<u32>(GpuSemaphoreOperation::AcquireGequal)) {
++            ++Split::sem_fast;
++            return true;
++        }
++        const long long now = std::chrono::duration_cast<std::chrono::nanoseconds>(
++            std::chrono::steady_clock::now().time_since_epoch()).count();
++        if (!met && !split.BackCaughtUp() && now - last_drained_poll_ns < 1'000'000) {
++            ++Split::sem_skip;
++            return false;
++        }
++        last_drained_poll_ns = now;
++    }
++#endif
+     // The release may still be queued for the split GPU thread's back half (and the caches
+     // ReadNativeSemaphoreWord asks are its state).
+     DrainBack();
+diff --git a/src/video_core/engines/puller.h b/src/video_core/engines/puller.h
+index 8dde844..b4423be 100644
+--- a/src/video_core/engines/puller.h
++++ b/src/video_core/engines/puller.h
+@@ -137,6 +137,8 @@ private:
+     [[nodiscard]] bool ExecuteMethodOnEngine(DmaPusher& dma_pusher, u32 method);
+ 
+     std::optional<NativeSemaphoreWait> native_acquire;
++    /// Steady clock (ns) of the last poll of native_acquire that waited for the split's back.
++    mutable long long last_drained_poll_ns{};
+ 
+     /// Mapping of command subchannels to their bound engine ids
+     std::array<EngineID, 8> bound_engines{};
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+index 6f6471b..0add899 100644
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -28,13 +28,38 @@ class EngineInterface;
+ }
+ 
+ namespace VideoCommon {
++// Front-side write tracking (dma_pusher.cpp, puller.cpp). Off for the rest of the run once the
++// back finds a command list segment the front read early that the old wait would have read
++// differently.
++struct SplitTracking {
++    inline static std::atomic<bool> disabled{};
++};
++
+ struct SplitPerformance {
+     inline static std::atomic<unsigned long long> words{}, batches{}, drains{}, wait_ns{}, backend_ns{}, sync_reads{};
++    // Command list segments: read on the front without a wait (list_direct), read after a wait
++    // for the back (list_waits), and why a segment waited: a GPU-written page, new GPU-written
++    // pages in the last second (settle), tracking turned off, or another reason (safe reads,
++    // the entry's sync flag, unmapped, larger than 64 KiB). The back checks every early read
++    // (list_verified); list_misses counts reads it found wrong.
++    inline static std::atomic<unsigned long long> list_direct{}, list_waits{}, list_fb_written{},
++        list_fb_settle{}, list_fb_off{}, list_fb_other{}, list_verified{}, list_misses{};
++    // Polls of a suspended semaphore acquire: all of them, those answered from guest memory
++    // without waiting for the back (met GEQUAL: sem_fast; not met while the back is busy:
++    // sem_skip), the rest wait for the back as before.
++    inline static std::atomic<unsigned long long> sem_polls{}, sem_fast{}, sem_skip{};
+     static void Report(long long now) {
+             using Split = VideoCommon::SplitPerformance;
+-            std::fprintf(stderr, "NX2_SPLIT_PERF mono_ns=%lld words=%llu batches=%llu drains=%llu wait_ns=%llu backend_ns=%llu sync_reads=%llu\n", now,
++            std::fprintf(stderr, "NX2_SPLIT_PERF mono_ns=%lld words=%llu batches=%llu drains=%llu wait_ns=%llu backend_ns=%llu sync_reads=%llu"
++                         " list_direct=%llu list_waits=%llu list_fb_written=%llu list_fb_settle=%llu list_fb_off=%llu list_fb_other=%llu"
++                         " list_verified=%llu list_misses=%llu sem_polls=%llu sem_fast=%llu sem_skip=%llu track=%s\n", now,
+                          Split::words.load(), Split::batches.load(), Split::drains.load(),
+-                         Split::wait_ns.load(), Split::backend_ns.load(), Split::sync_reads.load());
++                         Split::wait_ns.load(), Split::backend_ns.load(), Split::sync_reads.load(),
++                         Split::list_direct.load(), Split::list_waits.load(), Split::list_fb_written.load(),
++                         Split::list_fb_settle.load(), Split::list_fb_off.load(), Split::list_fb_other.load(),
++                         Split::list_verified.load(), Split::list_misses.load(), Split::sem_polls.load(),
++                         Split::sem_fast.load(), Split::sem_skip.load(),
++                         SplitTracking::disabled.load() ? "off" : "on");
+ 
+ }
+ 
+@@ -161,6 +186,11 @@ public:
+     static inline bool check_owner{};
+     static void CheckOwner(const char* where);
+ 
++    /// Whether the back has run everything sent so far (front only; nothing is published).
++    [[nodiscard]] bool BackCaughtUp() const {
++        return consumed.load(std::memory_order_acquire) == write_position;
++    }
++
+     /// Makes what was sent visible to the back.
+     void Publish();
+     /// Waits until the back executed everything sent so far.
