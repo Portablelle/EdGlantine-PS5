@@ -65,6 +65,27 @@ CPU draw preparation is the main known bottleneck.
 
 Recent work, newest first. Each item links to its pull request.
 
+### Lichii shader fixes (PR_LINK)
+
+Four shader recompiler changes ported from Lichii into the core. None has been
+tried on a console yet.
+
+- **Atomic loops on AMD.** When several shader threads update the same word
+  with an emulated atomic (float add, increment, small stores), each retry now
+  starts from the value the last exchange returned. Reloading the word could
+  keep returning a stale value on AMD, so the loop never ended and the GPU was
+  lost (OoT's first autosave, seen on a desktop AMD card).
+- **Depth-compare textures.** A depth-compare texture always gets a float
+  image, even when its descriptor looks like an integer format. RADV rejected
+  the shader otherwise (a crash in OoT's opening house).
+- **More shaders lowered.** Two more instruction forms (`SHF` with a register
+  shift and `LOP3` with a constant buffer or uniform operand) can use registers
+  that the lowering keeps for itself, instead of rejecting the shader.
+- **No silent register mix-ups.** The gradients of `TXD` and the data of the
+  global `ATOMG` and `RED` atomics are now checked like other operands. Before,
+  a register in the range the lowering keeps for itself was read from the
+  emulated uniform state instead of the guest value.
+
 ### Lichii fixes, second batch ([#43](https://github.com/Portablelle/EdGlantine-PS5/pull/43))
 
 Four more changes ported from Lichii into the core. None has been tried on a
