@@ -82,6 +82,41 @@ its checks, and that is all.
   render pass now lands before a blit, image copy or DMA write into the same
   image, so the clear can never wipe what the copy wrote.
 
+### Lichii shader fixes ([#44](https://github.com/Portablelle/EdGlantine-PS5/pull/44))
+
+Four shader recompiler changes ported from Lichii into the core. None has been
+tried on a console yet.
+
+- **Atomic loops on AMD.** When several shader threads update the same word
+  with an emulated atomic (float add, increment, small stores), each retry now
+  starts from the value the last exchange returned. Reloading the word could
+  keep returning a stale value on AMD, so the loop never ended and the GPU was
+  lost (OoT's first autosave, seen on a desktop AMD card).
+- **Depth-compare textures.** A depth-compare texture always gets a float
+  image, even when its descriptor looks like an integer format. RADV rejected
+  the shader otherwise (a crash in OoT's opening house).
+- **More shaders lowered.** Two more instruction forms (`SHF` with a register
+  shift and `LOP3` with a constant buffer or uniform operand) can use registers
+  that the lowering keeps for itself, instead of rejecting the shader.
+- **No silent register mix-ups.** The gradients of `TXD` and the data of the
+  global `ATOMG` and `RED` atomics are now checked like other operands. Before,
+  a register in the range the lowering keeps for itself was read from the
+  emulated uniform state instead of the guest value.
+
+### Lichii fixes, third batch ([#45](https://github.com/Portablelle/EdGlantine-PS5/pull/45))
+
+Two more changes ported from Lichii into the core, each adapted to it. None
+has been tried on a console yet. The terrain-layer clear and the cheaper
+storage buffer bindings from this batch are in
+[#47](https://github.com/Portablelle/EdGlantine-PS5/pull/47) instead.
+
+- **OoT white flashes.** Before a macro reads occlusion reports from memory, it
+  now waits for the reports whose results the host GPU has not delivered yet.
+  Before, it read the old counts, and leaves and terrain flashed white for a
+  few frames whenever the camera moved. The wait is capped at 200 ms.
+- **Fewer copies in memory tracking.** Page runs that are already sorted are
+  merged where they lie and counted without two extra copies.
+
 ### Lichii fixes, second batch ([#43](https://github.com/Portablelle/EdGlantine-PS5/pull/43))
 
 Four more changes ported from Lichii into the core. None has been tried on a

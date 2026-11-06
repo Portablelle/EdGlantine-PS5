@@ -1,0 +1,20 @@
+Ported from open Lichii PR #173 (https://github.com/zortos293/Lichii/pull/173): a depth-compare
+texture keeps a float image even when its descriptor reads as an integer format (a garbage TIC in
+OoT made RADV's spirv_to_nir reject the module and crash).
+
+diff --git a/src/shader_recompiler/ir_opt/texture_pass.cpp b/src/shader_recompiler/ir_opt/texture_pass.cpp
+--- a/src/shader_recompiler/ir_opt/texture_pass.cpp
++++ b/src/shader_recompiler/ir_opt/texture_pass.cpp
+@@ -946,7 +946,11 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
+                 });
+             } else {
+                 if (!cbuf.buffer_source.enabled) count = std::min(count, sampled_dynamic_cap);
+-                const bool is_integer{!cbuf.buffer_source.enabled && is_texture_pixel_format_integer(cbuf)};
++                // Depth-compare sampling returns a float in Vulkan, so its image must be float
++                // even when a garbage or unknown descriptor reads as an integer format (RADV's
++                // spirv_to_nir rejects the module otherwise).
++                const bool is_integer{flags.is_depth == 0 && !cbuf.buffer_source.enabled &&
++                                      is_texture_pixel_format_integer(cbuf)};
+                 index = descriptors.Add(TextureDescriptor{
+                     .type = flags.type,
+                     .is_depth = flags.is_depth != 0,

@@ -1,0 +1,50 @@
+Ported from open Lichii PRs #189 (https://github.com/zortos293/Lichii/pull/189) and #149
+(https://github.com/zortos293/Lichii/pull/149), the shader part: TXD's gradients and the data operand
+of ATOMG and RED (bits 32-39) are checked against the lowering scratch range and shadowed, instead
+of silently reading the emulated uniform state. #149's SURED part has nothing to attach to here.
+
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -323,7 +323,11 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
+         RegisterPressure pressure{insn};
+         bool requires_shadow = false;
+         for (u32 bit : {16U, 24U, 32U, 64U}) {
+-            if (bit == 32 && insn.Bits(9, 3) != 1 && opcode != 0xb60 && opcode != 0xb66 && opcode != 0x986) continue;
++            // Bits 32-39 name a register in register forms and in these opcodes: TEX/TLD, the
++            // store data, TXD's gradients and the data operand of RED (0x98e) and the global
++            // atomic (0x9a8), all listed with operand 32 in RegisterPressure.
++            if (bit == 32 && insn.Bits(9, 3) != 1 && opcode != 0xb60 && opcode != 0xb66 && opcode != 0x986 &&
++                opcode != 0xb6c && opcode != 0x98e && opcode != 0x9a8) continue;
+             const u32 reg = insn.Bits(bit, 8);
+             if (reg >= reserved_register && reg < 255) requires_shadow = true;
+         }
+diff --git a/src/shader_recompiler/frontend/ampere/register_pressure.h b/src/shader_recompiler/frontend/ampere/register_pressure.h
+--- a/src/shader_recompiler/frontend/ampere/register_pressure.h
++++ b/src/shader_recompiler/frontend/ampere/register_pressure.h
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ #pragma once
+ #include <array>
++#include <bit>
+ #include <vector>
+ #include "shader_recompiler/frontend/ampere/instruction.h"
+ 
+@@ -64,6 +65,17 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
+         operand(opcode == 0x981 ? 16 : 32, count);
+         operand(24, input.Bits(72, 1) ? 2 : 1); break;
+     }
++    case 0x9a8: // ATOMG: result in Rd, data operand at bit 32.
++        operand(16); operand(32); break;
++    case 0x98e: // RED: address in Ra (a pair for .E), data operand at bit 32.
++        operand(24, input.Bits(72, 1) ? 2 : 1);
++        operand(32, input.Bits(73, 3) == 2 || input.Bits(73, 3) == 5 ? 2 : 1); break;
++    case 0xb6c: { // TXD: Rd (a pair past one channel), coordinates (x, y[, layer]), four gradients
++                  // and the second destination pair.
++        const u32 channels = static_cast<u32>(std::popcount(input.Bits(72, 4)));
++        operand(16, channels > 1 ? 2 : 1); operand(24, input.Bits(61, 3) == 5 ? 3 : 2);
++        operand(32, 4); operand(64, 2); break;
++    }
+     default:
+         result.valid = false; return result;
+     }
