@@ -110,7 +110,7 @@ LOWERED = re.compile(r'Lowered native shader at (0x[0-9a-f]+): (?:key=([0-9a-f]+
                      r'(\d+) instructions')
 DUMPED = re.compile(r'Native shader (?:dumped \(not paused\)|paused): key=([0-9a-f]+), offset=(0x[0-9a-f]+), '
                     r'reason=(.*?), program=(0x[0-9a-f]+)')
-DRAW_TRACE = re.compile(r'NX2_DRAW_TRACE (.*)$')
+DRAW_TRACE = re.compile(r'(NX2_(?:DRAW|DISPATCH)_TRACE) (.*)$')
 LEVEL = re.compile(r'^\[\s*[\d.]+\] (\S+) <(Warning|Error|Critical)> (\S+?):\d+:\S+?: (.*)$')
 
 
@@ -122,6 +122,13 @@ def summarize_draw_trace(trace_lines):
     frames = collections.OrderedDict()
     short = gpu = 0
     for text in trace_lines:
+        if text.startswith('dispatch '):
+            fields = dict(TRACE_FIELD.findall(text))
+            compact = (f'dispatch key={fields.get("key")} grid={fields.get("grid")} block={fields.get("block")}'
+                       + (' indirect' if 'indirect=' in text else ''))
+            gpu += 'gpu-modified' in text
+            frames.setdefault(fields.get('frame', '?'), []).append(compact)
+            continue
         head = dict(TRACE_FIELD.findall(text.split(' host=')[0].split(' indirect=')[0]))
         indexed = head.get('indexed') == 'true'
         count = head.get('index_count' if indexed else 'vertex_count')
@@ -149,7 +156,7 @@ def summarize(out, version, screenshot, scan_output):
     draw_trace = []
     for line in log.splitlines():
         if (m := DRAW_TRACE.search(line)):
-            draw_trace.append(m[1])
+            draw_trace.append(m[2] if m[1] == 'NX2_DRAW_TRACE' else 'dispatch ' + m[2])
             continue
         if (m := REJECTED.search(line)):
             entry = rejected.setdefault(m[1], {'address': m[1], 'offset': m[2], 'reason': m[3],
@@ -197,11 +204,11 @@ def summarize(out, version, screenshot, scan_output):
     lines.append(f'Screenshot: {screenshot or "none"}')
     trace = report['draw_trace']
     if trace['lines']:
-        lines.append(f'Draw trace (trace-draws.txt): {trace["lines"]} draws in {len(trace["frames"])} frames, '
+        lines.append(f'Draw trace (trace-draws.txt): {trace["lines"]} draws and dispatches in {len(trace["frames"])} frames, '
                      f'full lines in draw-trace.txt')
         for frame, draws in trace['frames'].items():
             lines.append(f'  frame {frame}: {len(draws)} draws')
-            lines += [f'    {d}' for d in draws[:16]]
+            lines += [f'    {d}' for d in draws[:24]]
         if trace['short_streams']:
             lines.append(f'  bound vertex streams shorter than the draw reads: {trace["short_streams"]}')
         if trace['gpu_modified']:
