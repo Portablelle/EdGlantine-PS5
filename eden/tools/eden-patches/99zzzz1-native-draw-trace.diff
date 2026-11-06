@@ -1,0 +1,447 @@
+Opt-in draw trace for chosen native shaders. EDEN_NX2_TRACE_DRAW_KEYS (set by the PS5 frontend
+from /data/eden-nx2/trace-draws.txt) names native shader keys. The key of each lowered native
+program is recorded by address in shader_environment.cpp; for a few frames, every draw whose
+vertex or pixel program has a traced key logs one NX2_DRAW_TRACE line: the draw kind (direct,
+indirect, issued by a macro), counts, firsts, base vertex and instance, topology, the host draw
+parameters, the indirect arguments as guest memory holds them and whether the buffer cache marks
+them GPU modified, the macro's parameters and where they were read from, the vertex attributes,
+each bound vertex stream and the index buffer with their GPU/CPU modified state, and the first
+guest words of a few vertices. Off, it costs one static load per draw.
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 4a98fdf..0bc917f 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -960,6 +960,87 @@ bool BufferCache<P>::IsRegionCpuModified(DAddr addr, size_t size) {
+     return memory_tracker.IsRegionCpuModified(addr, size);
+ }
+ 
++template <class P>
++std::string BufferCache<P>::Nx2TraceDrawBuffers(bool is_indexed, u32 first, u32 count) {
++    const auto& regs = maxwell3d->regs;
++    const auto& draw_state = maxwell3d->draw_manager.draw_state;
++    std::string text;
++    const auto flags = [&](DAddr address, u64 size) {
++        if (address == 0 || size == 0) return std::string{"-"};
++        return fmt::format("{}{}", IsRegionGpuModified(address, size) ? "G" : "g",
++                           IsRegionCpuModified(address, size) ? "C" : "c");
++    };
++    // Indices: the guest words, their range, and the highest vertex they name.
++    u64 highest_vertex = u64{first} + count;
++    if (is_indexed) {
++        const auto& index = draw_state.index_buffer;
++        const u32 index_size = static_cast<u32>(index.FormatSizeInBytes());
++        const Binding& binding = channel_state->index_buffer;
++        const GPUVAddr start = index.StartAddress() + u64{index.first} * index_size;
++        const u32 read = std::min<u32>(index.count, 4096);
++        std::vector<u8> bytes(size_t{read} * index_size);
++        u32 lowest = ~0u, highest = 0;
++        std::string words;
++        if (read && gpu_memory->IsFullyMappedRange(start, bytes.size())) {
++            gpu_memory->ReadBlockUnsafe(start, bytes.data(), bytes.size());
++            for (u32 i = 0; i < read; ++i) {
++                u32 value = 0;
++                std::memcpy(&value, bytes.data() + size_t{i} * index_size, index_size);
++                lowest = std::min(lowest, value);
++                highest = std::max(highest, value);
++                if (i < 12) words += fmt::format(" {}", value);
++            }
++        }
++        highest_vertex = u64{highest} + 1 + static_cast<s32>(draw_state.base_index);
++        text += fmt::format(" index=[gpu {:#x} format {} first {} count {} inline {} bound {:#x}+{:#x} {} "
++                            "range {}..{} words{}]",
++                            index.StartAddress(), static_cast<u32>(index.format), index.first, index.count,
++                            draw_state.inline_index_draw_indexes.size(), binding.device_addr, binding.size,
++                            flags(binding.device_addr, binding.size), lowest == ~0u ? 0 : lowest, highest,
++                            words);
++    }
++    // Attributes that read a stream (the constant ones read none).
++    for (u32 i = 0; i < regs.vertex_attrib_format.size(); ++i) {
++        const auto& attribute = regs.vertex_attrib_format[i];
++        if (attribute.hex == 0) continue;
++        text += fmt::format(" attr{}=[{:#010x} stream {} offset {} size {:#x} type {}{}]", i, attribute.hex,
++                            attribute.buffer.Value(), attribute.offset.Value(),
++                            static_cast<u32>(attribute.size.Value()), static_cast<u32>(attribute.type.Value()),
++                            attribute.constant ? " constant" : "");
++    }
++    for (u32 index = 0; index < NUM_VERTEX_BUFFERS; ++index) {
++        const auto& stream = regs.vertex_streams[index];
++        if (!stream.enable) continue;
++        const Binding& binding = channel_state->vertex_buffers[index];
++        const u32 stride = stream.stride;
++        const bool instanced = regs.vertex_stream_instances.IsInstancingEnabled(index);
++        const u64 needed = instanced ? 0 : highest_vertex * stride;
++        const auto& synced = nx2_synced_vertex_buffers[index];
++        const u64 epoch = binding.device_addr ? memory_tracker.CpuWriteEpoch(binding.device_addr, binding.size) : 0;
++        text += fmt::format(" stream{}=[gpu {:#x} stride {} instanced {} frequency {} native_size {:#x} bound {:#x}+{:#x} "
++                            "needs {:#x}{} {} epoch {} synced {}",
++                            index, stream.Address(), stride, instanced, stream.frequency,
++                            regs.NativeVertexStreamSize(index), binding.device_addr, binding.size, needed,
++                            needed > binding.size ? " SHORT" : "", flags(binding.device_addr, binding.size),
++                            epoch == ~u64{0} ? -1 : static_cast<s64>(epoch),
++                            synced.epoch == ~u64{0} ? -1 : static_cast<s64>(synced.epoch));
++        // The first 16 bytes of a few vertices: 0-3 (the first quad), 4-7 and the last one.
++        const u32 vertex_first = is_indexed ? static_cast<u32>(std::max<s64>(0, static_cast<s32>(draw_state.base_index))) : first;
++        const u32 last = static_cast<u32>(std::max<u64>(highest_vertex, 1) - 1);
++        for (const u32 vertex : {vertex_first, vertex_first + 1, vertex_first + 2, vertex_first + 4,
++                                 vertex_first + 6, vertex_first + 8, last}) {
++            if (stride == 0 && vertex != vertex_first) break;
++            const GPUVAddr address = stream.Address() + u64{vertex} * stride;
++            std::array<u32, 4> words{};
++            if (!gpu_memory->IsFullyMappedRange(address, sizeof(words))) continue;
++            gpu_memory->ReadBlockUnsafe(address, words.data(), sizeof(words));
++            text += fmt::format(" v{}:{:08x}", vertex, fmt::join(words, ","));
++        }
++        text += "]";
++    }
++    return text;
++}
++
+ template <class P>
+ void BufferCache<P>::BindHostIndexBuffer() {
+     Buffer& buffer = slot_buffers[channel_state->index_buffer.buffer_id];
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index ae1943d..1e7fb06 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -16,6 +16,7 @@
+ #include <mutex>
+ #include <numeric>
+ #include <span>
++#include <string>
+ #include <unordered_set>
+ #include <vector>
+ 
+@@ -348,6 +349,11 @@ public:
+     /// Return true when a CPU region is modified from the CPU
+     [[nodiscard]] bool IsRegionCpuModified(DAddr addr, size_t size);
+ 
++    /// Opt-in draw trace (native_draw_trace.h): the bound vertex streams and index buffer of the
++    /// current draw, the attributes that read them, whether their pages are GPU or CPU modified,
++    /// and the first guest words of the vertices the draw reads.
++    [[nodiscard]] std::string Nx2TraceDrawBuffers(bool is_indexed, u32 first, u32 count);
++
+     void SetDrawIndirect(
+         const Tegra::Engines::Maxwell3D::DrawManager::IndirectParams* current_draw_indirect_) {
+         current_draw_indirect = current_draw_indirect_;
+diff --git a/src/video_core/macro.cpp b/src/video_core/macro.cpp
+index 7125eb1..8d18ef4 100644
+--- a/src/video_core/macro.cpp
++++ b/src/video_core/macro.cpp
+@@ -5,6 +5,8 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "video_core/native_diagnostics.h"
++#include "video_core/native_draw_trace.h"
++#include "common/scope_exit.h"
+ #include <array>
+ #include <atomic>
+ #include <chrono>
+@@ -1359,6 +1361,23 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
+         if (NativeDrawHle::TryExecute(system, *this, maxwell3d, method, parameters)) return;
+ #endif
+         maxwell3d.RefreshParameters();
++        // Opt-in draw trace (native_draw_trace.h): the draws this macro issues name it.
++        if (VideoCommon::NativeDrawTrace::Enabled()) {
++            auto& context = VideoCommon::NativeDrawTrace::current_macro;
++            context = {};
++            context.active = true;
++            context.method = method;
++            context.refreshed = maxwell3d.AnyParametersDirty();
++            context.parameter_count = static_cast<u32>(parameters.size());
++            for (size_t i = 0; i < parameters.size() && i < context.parameters.size(); ++i) {
++                context.parameters[i] = parameters[i];
++                context.addresses[i] = maxwell3d.GetMacroAddress(i);
++            }
++        }
++        SCOPE_EXIT {
++            if (VideoCommon::NativeDrawTrace::Enabled())
++                VideoCommon::NativeDrawTrace::current_macro.active = false;
++        };
+         const bool force_interpreter =
+             SelectNativeMacroExecution(method) == NativeMacroExecution::Interpreter;
+         const auto context = reinterpret_cast<std::uintptr_t>(this);
+diff --git a/src/video_core/native_draw_trace.h b/src/video_core/native_draw_trace.h
+new file mode 100644
+index 0000000..28fadcd
+--- /dev/null
++++ b/src/video_core/native_draw_trace.h
+@@ -0,0 +1,131 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++// Opt-in draw trace for chosen native shaders (EDEN_NX2_TRACE_DRAW_KEYS, set by the PS5 frontend
++// from /data/eden-nx2/trace-draws.txt). A native shader's key is computed when it is lowered
++// (shader_environment.cpp); the program address -> key table lets the rasterizer tell, at draw
++// time, that a draw uses a traced shader and log its parameters, the macro that issued it and its
++// vertex and index buffers. With the variable unset, Enabled() is one load of a static and nothing
++// else runs.
++#include <array>
++#include <atomic>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <optional>
++#include <span>
++#include <string>
++#include <unordered_map>
++#include <unordered_set>
++#include "common/common_types.h"
++
++namespace VideoCommon::NativeDrawTrace {
++
++struct Keys {
++    std::unordered_set<u64> keys;
++    bool enabled{};
++};
++
++inline const Keys& TracedKeys() {
++    static const Keys keys = [] {
++        Keys result;
++        const char* value = std::getenv("EDEN_NX2_TRACE_DRAW_KEYS");
++        if (!value) return result;
++        std::string text{value};
++        for (char& c : text) if (c == ',' || c == ';' || c == '\n') c = ' ';
++        size_t position = 0;
++        while (position < text.size()) {
++            while (position < text.size() && text[position] == ' ') ++position;
++            const size_t end = text.find(' ', position);
++            const std::string word = text.substr(position, end == std::string::npos ? std::string::npos : end - position);
++            if (!word.empty()) {
++                char* stop = nullptr;
++                const u64 key = std::strtoull(word.c_str(), &stop, 16);
++                if (stop && *stop == '\0') result.keys.insert(key);
++            }
++            if (end == std::string::npos) break;
++            position = end + 1;
++        }
++        result.enabled = !result.keys.empty();
++        return result;
++    }();
++    return keys;
++}
++
++inline bool Enabled() {
++    return TracedKeys().enabled;
++}
++
++struct ProgramTable {
++    std::mutex mutex;
++    std::unordered_map<u64, u64> key_by_address;
++};
++
++inline ProgramTable& Programs() {
++    static ProgramTable table;
++    return table;
++}
++
++/// Called when a native shader is lowered: remembers which key the program at this address has.
++inline void RecordProgram(u64 program_address, u64 key) {
++    if (!Enabled()) return;
++    auto& table = Programs();
++    std::scoped_lock lock{table.mutex};
++    table.key_by_address[program_address] = key;
++}
++
++/// The key of the native program at this address, if one was lowered there and it is traced.
++inline std::optional<u64> TracedKeyAt(u64 program_address) {
++    if (!Enabled() || program_address == 0) return std::nullopt;
++    auto& table = Programs();
++    std::scoped_lock lock{table.mutex};
++    const auto it = table.key_by_address.find(program_address);
++    if (it == table.key_by_address.end() || !TracedKeys().keys.contains(it->second)) return std::nullopt;
++    return it->second;
++}
++
++/// Frames counted by RasterizerVulkan::TickFrame.
++inline std::atomic<u64> frame{};
++
++/// The macro being executed on this thread (the draws it issues run on the same thread with
++/// EDEN_NX2_SPLIT=1, the PS5 default): its method, first parameters, and where the parameters
++/// were read from (0 = inline in the command list).
++struct MacroContext {
++    u32 method{};
++    u32 parameter_count{};
++    std::array<u32, 24> parameters{};
++    std::array<u64, 24> addresses{};
++    bool active{};
++    bool refreshed{};
++};
++inline thread_local MacroContext current_macro{};
++
++/// Which draws of which frames are logged: every traced draw of the first two frames that have
++/// one, then of one frame every 120 frames, eight frames in all, at most 64 draws a frame.
++struct Budget {
++    u64 last_frame{~u64{0}};
++    u64 last_logged_frame{};
++    u32 frames_logged{};
++    u32 draws_this_frame{};
++    bool logging_this_frame{};
++};
++
++inline bool ShouldLog() {
++    static std::mutex mutex;
++    static Budget budget;
++    std::scoped_lock lock{mutex};
++    const u64 now = frame.load(std::memory_order_relaxed);
++    if (now != budget.last_frame) {
++        budget.last_frame = now;
++        budget.draws_this_frame = 0;
++        budget.logging_this_frame =
++            budget.frames_logged < 8 &&
++            (budget.frames_logged < 2 || now - budget.last_logged_frame >= 120);
++        if (budget.logging_this_frame) {
++            ++budget.frames_logged;
++            budget.last_logged_frame = now;
++        }
++    }
++    return budget.logging_this_frame && budget.draws_this_frame++ < 64;
++}
++
++} // namespace VideoCommon::NativeDrawTrace
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 3adc939..b6aaad6 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1,6 +1,7 @@
+ #include "video_core/position_capture_gate.h"
+ #include "video_core/native_wait_profile.h"
+ #include "video_core/native_draw_indirect.h"
++#include "video_core/native_draw_trace.h"
+ // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
+@@ -829,6 +830,85 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
+ }
+ } // Anonymous namespace
+ 
++// Opt-in draw trace (native_draw_trace.h, /data/eden-nx2/trace-draws.txt on the PS5): one line per
++// draw whose vertex or pixel shader has a traced key, for a few frames.
++template <class BufferCacheT>
++void TraceNativeDraw(Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& gpu_memory,
++                     BufferCacheT& buffer_cache, bool is_indexed, u32 instance_count,
++                     const DrawParams* draw_params,
++                     const Tegra::Engines::Maxwell3D::DrawManager::IndirectParams* indirect) {
++    namespace Trace = VideoCommon::NativeDrawTrace;
++    const auto& regs = maxwell3d.regs;
++    const auto program = [&](size_t stage) -> u64 {
++        if (!regs.IsShaderConfigEnabled(stage)) return 0;
++        return (u64{regs.pipelines[stage].reserved[0] & 0xff} << 32) | regs.pipelines[stage].reserved[1];
++    };
++    std::optional<u64> key;
++    u64 traced_program = 0;
++    for (const size_t stage : {size_t{1}, size_t{0}, size_t{5}}) {
++        if ((key = Trace::TracedKeyAt(program(stage)))) {
++            traced_program = program(stage);
++            break;
++        }
++    }
++    if (!key || !Trace::ShouldLog()) return;
++    const auto& draw_state = maxwell3d.draw_manager.draw_state;
++    const auto& macro = Trace::current_macro;
++    const auto gpu_flag = [&](GPUVAddr address, u64 size) -> std::string {
++        if (address == 0) return "inline";
++        const auto device = gpu_memory.GpuToCpuAddress(address);
++        if (!device) return "unmapped";
++        return buffer_cache.IsRegionGpuModified(*device, size) ? "gpu-modified" : "guest";
++    };
++    std::string kind = indirect ? "indirect" : "direct";
++    if (macro.active) kind += "+macro";
++    if (maxwell3d.engine_state == Tegra::Engines::Maxwell3D::EngineHint::OnHLEMacro) kind += "+hle";
++    if (draw_state.draw_mode == Tegra::Engines::Maxwell3D::DrawManager::DrawMode::Instance) kind += "+instanced-mode";
++    if (draw_state.draw_mode == Tegra::Engines::Maxwell3D::DrawManager::DrawMode::InlineIndex) kind += "+inline-index";
++    std::string line = fmt::format(
++        "NX2_DRAW_TRACE frame={} key={:016x} program={:#x} vs={:#x} ps={:#x} kind={} indexed={} topology={} "
++        "vertex_first={} vertex_count={} index_first={} index_count={} base_vertex={} base_instance={} "
++        "instances={}",
++        Trace::frame.load(std::memory_order_relaxed), *key, traced_program, program(1), program(5), kind,
++        is_indexed, static_cast<u32>(draw_state.topology), draw_state.vertex_buffer.first,
++        draw_state.vertex_buffer.count, draw_state.index_buffer.first, draw_state.index_buffer.count,
++        static_cast<s32>(draw_state.base_index), draw_state.base_instance, instance_count);
++    if (draw_params) {
++        line += fmt::format(" host=[vertices {} instances {} first_index {} base_vertex {} base_instance {} indexed {}]",
++                            draw_params->num_vertices, draw_params->num_instances, draw_params->first_index,
++                            static_cast<s32>(draw_params->base_vertex), draw_params->base_instance,
++                            draw_params->is_indexed);
++    }
++    if (indirect) {
++        std::array<u32, 5> words{};
++        if (gpu_memory.IsFullyMappedRange(indirect->indirect_start_address, sizeof(words)))
++            gpu_memory.ReadBlockUnsafe(indirect->indirect_start_address, words.data(), sizeof(words));
++        line += fmt::format(" indirect=[address {:#x} guest {:08x} {} byte_count {} include_count {} max_draws {} stride {} buffer_size {:#x}]",
++                            indirect->indirect_start_address, fmt::join(words, ","),
++                            gpu_flag(indirect->indirect_start_address, sizeof(words)), indirect->is_byte_count,
++                            indirect->include_count, indirect->max_draw_counts, indirect->stride,
++                            indirect->buffer_size);
++        if (indirect->include_count) {
++            u32 count = 0;
++            if (gpu_memory.IsFullyMappedRange(indirect->count_start_address, sizeof(count)))
++                gpu_memory.ReadBlockUnsafe(indirect->count_start_address, &count, sizeof(count));
++            line += fmt::format(" count=[address {:#x} guest {} {}]", indirect->count_start_address, count,
++                                gpu_flag(indirect->count_start_address, sizeof(count)));
++        }
++    }
++    if (macro.active) {
++        line += fmt::format(" macro=[method {:#x} params {} dirty {}", macro.method, macro.parameter_count,
++                            macro.refreshed);
++        for (u32 i = 0; i < macro.parameter_count && i < macro.parameters.size(); ++i) {
++            line += fmt::format(" {:#x}", macro.parameters[i]);
++            if (macro.addresses[i]) line += fmt::format("@{:#x}:{}", macro.addresses[i], gpu_flag(macro.addresses[i], 4));
++        }
++        line += "]";
++    }
++    line += buffer_cache.Nx2TraceDrawBuffers(is_indexed, draw_state.vertex_buffer.first, draw_state.vertex_buffer.count);
++    LOG_WARNING(HW_GPU, "{}", line);
++}
++
+ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
+     TraceWindowTarget(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw",
+@@ -944,6 +1024,9 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+         const auto& draw_state = maxwell3d->draw_manager.draw_state;
+         const u32 num_instances{instance_count};
+         const DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
++        if (VideoCommon::NativeDrawTrace::Enabled()) {
++            TraceNativeDraw(*maxwell3d, *gpu_memory, buffer_cache, is_indexed, num_instances, &draw_params, nullptr);
++        }
+ 
+         scheduler.Record([this, draw_params](vk::CommandBuffer cmdbuf) {
+             if (scheduler.GraphicsPipelineMissing()) {
+@@ -980,6 +1063,9 @@ void RasterizerVulkan::DrawIndirect() {
+     const auto& params = maxwell3d->draw_manager.indirect_state;
+     buffer_cache.SetDrawIndirect(&params);
+     PrepareDraw(params.is_indexed, [this, &params] {
++        if (VideoCommon::NativeDrawTrace::Enabled()) {
++            TraceNativeDraw(*maxwell3d, *gpu_memory, buffer_cache, params.is_indexed, 1, nullptr, &params);
++        }
+         const auto indirect_buffer = buffer_cache.GetDrawIndirectBuffer();
+         const auto& buffer = indirect_buffer.first;
+         const auto& offset = indirect_buffer.second;
+@@ -1704,6 +1790,7 @@ void RasterizerVulkan::FlushCommands() {
+ 
+ void RasterizerVulkan::TickFrame() {
+     draw_counter = 0;
++    VideoCommon::NativeDrawTrace::frame.fetch_add(1, std::memory_order_relaxed);
+     guest_descriptor_queue.TickFrame();
+     compute_pass_descriptor_queue.TickFrame();
+     descriptor_buffer_ring.TickFrame();
+diff --git a/src/video_core/shader_environment.cpp b/src/video_core/shader_environment.cpp
+index 2e52f9e..ba1e59b 100644
+--- a/src/video_core/shader_environment.cpp
++++ b/src/video_core/shader_environment.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "video_core/native_draw_trace.h"
+ #include "video_core/native_diagnostics.h"
+ #include <algorithm>
+ #include <atomic>
+@@ -693,6 +694,8 @@ void GenericEnvironment::InitializeNativeCode(u32 source_header_size,
+     LOG_INFO(Shader, "Lowered native shader at {:#x}: key={:016x}, {} source bytes, {} instructions",
+              program_base, Shader::Ampere::NativeProgramKey(native), native_source_size,
+              lowered.instructions.size());
++    // Opt-in draw trace: lets the rasterizer tell which key the program at this address has.
++    VideoCommon::NativeDrawTrace::RecordProgram(program_base, Shader::Ampere::NativeProgramKey(native));
+ }
+ 
+ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,

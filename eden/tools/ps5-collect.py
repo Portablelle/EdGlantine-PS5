@@ -110,7 +110,33 @@ LOWERED = re.compile(r'Lowered native shader at (0x[0-9a-f]+): (?:key=([0-9a-f]+
                      r'(\d+) instructions')
 DUMPED = re.compile(r'Native shader (?:dumped \(not paused\)|paused): key=([0-9a-f]+), offset=(0x[0-9a-f]+), '
                     r'reason=(.*?), program=(0x[0-9a-f]+)')
+DRAW_TRACE = re.compile(r'NX2_DRAW_TRACE (.*)$')
 LEVEL = re.compile(r'^\[\s*[\d.]+\] (\S+) <(Warning|Error|Critical)> (\S+?):\d+:\S+?: (.*)$')
+
+
+TRACE_FIELD = re.compile(r'(\w+)=(\S+)')
+
+
+def summarize_draw_trace(trace_lines):
+    """Groups NX2_DRAW_TRACE lines by frame with one compact line per draw."""
+    frames = collections.OrderedDict()
+    short = gpu = 0
+    for text in trace_lines:
+        head = dict(TRACE_FIELD.findall(text.split(' host=')[0].split(' indirect=')[0]))
+        indexed = head.get('indexed') == 'true'
+        count = head.get('index_count' if indexed else 'vertex_count')
+        compact = (f'key={head.get("key")} kind={head.get("kind")} topology={head.get("topology")} '
+                   f'{"indices" if indexed else "vertices"}={count} first='
+                   f'{head.get("index_first" if indexed else "vertex_first")} instances={head.get("instances")}')
+        if (m := re.search(r'indirect=\[address (\S+) guest (\S+) (\S+)', text)):
+            compact += f' indirect={m[2]} ({m[3]})'
+        streams = re.findall(r'stream(\d+)=\[gpu \S+ stride (\d+) .*?bound \S+ needs (\S+?)( SHORT)? (\S+)', text)
+        for index, stride, needs, is_short, flags in streams:
+            compact += f' s{index}:stride {stride} needs {needs}{" SHORT" if is_short else ""} {flags}'
+        short += any(st[3] for st in streams)
+        gpu += ('gpu-modified' in text) or any(st[4].startswith('G') for st in streams)
+        frames.setdefault(head.get('frame', '?'), []).append(compact)
+    return {'lines': len(trace_lines), 'frames': frames, 'short_streams': short, 'gpu_modified': gpu}
 
 
 def summarize(out, version, screenshot, scan_output):
@@ -120,7 +146,11 @@ def summarize(out, version, screenshot, scan_output):
     lowered = {}
     keys = {}
     warnings = collections.Counter()
+    draw_trace = []
     for line in log.splitlines():
+        if (m := DRAW_TRACE.search(line)):
+            draw_trace.append(m[1])
+            continue
         if (m := REJECTED.search(line)):
             entry = rejected.setdefault(m[1], {'address': m[1], 'offset': m[2], 'reason': m[3],
                                                'words': m[4], 'count': 0})
@@ -150,7 +180,10 @@ def summarize(out, version, screenshot, scan_output):
         'last_stderr_lines': perf,
         'top_warnings': warnings.most_common(15),
         'scan': scan_output,
+        'draw_trace': summarize_draw_trace(draw_trace),
     }
+    if draw_trace:
+        (out / 'draw-trace.txt').write_text('\n'.join(draw_trace) + '\n')
     (out / 'report.json').write_text(json.dumps(report, indent=2))
     lines = [f'EdGlantine run collected {report["collected"]}, version {version}', '']
     lines.append(f'Rejected native shaders: {len(rejected)}')
@@ -162,6 +195,17 @@ def summarize(out, version, screenshot, scan_output):
         lines.append(f'  {e["address"]} key={e["key"] or "?"} {e["instructions"]} instructions')
     lines.append(f'Dumped shaders: {", ".join(report["dumped_shaders"]) or "none"}')
     lines.append(f'Screenshot: {screenshot or "none"}')
+    trace = report['draw_trace']
+    if trace['lines']:
+        lines.append(f'Draw trace (trace-draws.txt): {trace["lines"]} draws in {len(trace["frames"])} frames, '
+                     f'full lines in draw-trace.txt')
+        for frame, draws in trace['frames'].items():
+            lines.append(f'  frame {frame}: {len(draws)} draws')
+            lines += [f'    {d}' for d in draws[:16]]
+        if trace['short_streams']:
+            lines.append(f'  bound vertex streams shorter than the draw reads: {trace["short_streams"]}')
+        if trace['gpu_modified']:
+            lines.append(f'  draws reading GPU-modified buffers or arguments: {trace["gpu_modified"]}')
     lines.append('Most frequent warnings:')
     lines += [f'  {n:6d} {text}' for text, n in report['top_warnings']]
     if scan_output:
