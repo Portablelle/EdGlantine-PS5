@@ -65,6 +65,34 @@ CPU draw preparation is the main known bottleneck.
 
 Recent work, newest first. Each item links to its pull request.
 
+### GPU split: fewer waits between the two GPU threads
+
+The GPU split runs the GPU work on two threads: a front thread reads the
+game's command lists, and a back thread runs them. Until now, the front waited
+for the back to catch up before it read each NS2 command list, so the two
+threads barely ran at the same time. Two new layers (`99zzzt1`, `99zzzt2`) let
+the front skip most of these waits. The ideas come from Lichii pull requests
+[#179](https://github.com/zortos293/Lichii/pull/179),
+[#243](https://github.com/zortos293/Lichii/pull/243) and
+[#231](https://github.com/zortos293/Lichii/pull/231). **This has not been
+tried on a console yet.** The split is still off unless you turn it on (see
+[Known issues](#known-issues-and-limits)).
+
+- **Command lists read without waiting.** The back now records every memory
+  page the emulated GPU writes. The front reads a command list right away when
+  none of its pages was ever written by the GPU, and no new page was written in
+  the last second. In any other case it waits as before.
+- **Every early read is checked.** The back checks each early read at the point
+  where the front used to wait. If the bytes differ, it logs
+  `NX2_SPLIT_TRACK_MISS`, and the front waits for every command list for the
+  rest of the run.
+- **Semaphore polls.** A channel that waits on a semaphore resumes without
+  waiting for the back when guest memory already meets a "greater or equal"
+  wait. A poll that does not meet the wait no longer waits for a busy back
+  (at most 1 ms between polls that do).
+- **New counters** in the `NX2_SPLIT_PERF` log line show how often each path is
+  taken.
+
 ### OoT menu text
 
 OoT's menu showed only the first letter of each line, such as "N" and "P".
@@ -341,11 +369,14 @@ roms/
 - **Graphics memory.** Large games can run out of the PS5's shared graphics pool
   (issue #20).
 - **GPU thread splitting** is available but off at startup. Turning it on has
-  frozen games. It only starts when a `split-enable.request` file holding any
-  text appears in the app folder (`/data/homebrew/PPSA99862/`) during play, so
-  `NX2_SPLIT_PERF` reports `words=0` otherwise. Even when it runs, each NS2
-  command list waits for the second GPU thread to catch up before it is read,
-  which limits what it can gain.
+  frozen games. To turn it on, put a `split-enable.request` file holding any
+  text in the app folder (`/data/homebrew/PPSA99862/`) during play. The app
+  reads it within a second, deletes it and logs `NX2_SPLIT_ENABLE_REQUEST`.
+  Each game session needs a new file. Without it, `NX2_SPLIT_PERF` reports
+  `words=0`. The front thread now reads most NS2 command lists without waiting
+  for the back thread (layers `99zzzt1` and `99zzzt2`), but this is
+  **untested on a console**. If the log shows `NX2_SPLIT_TRACK_MISS`, the
+  early reads turned themselves off for the rest of the run. Please report it.
 - **Sparse texture residency** is off by default (`EDEN_NX2_SPARSE_LAYERS=1` opts
   in). It does not yet save any memory.
 - **Partly simulated services.** Some NX2 services are simulated, and graphics
