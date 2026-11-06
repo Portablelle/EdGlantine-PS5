@@ -118,7 +118,9 @@ rejected, so every one of their dispatches was skipped. Four layers so far:
 - **Every form of the common ALU operations** (layer `99zzzx`). Instead of a list
   of opcodes, the operand form (bits 9-11) now tells which fields are registers,
   for IADD3, LOP3, SHF, LEA, PRMT, IMAD, IMAD.WIDE, IMAD.HI, FFMA, FADD, FMUL,
-  SEL, FSEL, FMNMX, IMNMX, ISETP, FSETP and MOV. Not yet tried on a console.
+  SEL, FSEL, FMNMX, IMNMX, ISETP, FSETP, MOV, IABS, I2FP, F2I and LDG. With the
+  shader dumped on 00.067.003, the whole program (2934 instructions) now lowers
+  off the console. Not yet tried on a console.
 
 To find what a rejected shader still stops at, create
 `/data/eden-nx2/dump-rejected-shaders.txt` (any content) before starting the app.

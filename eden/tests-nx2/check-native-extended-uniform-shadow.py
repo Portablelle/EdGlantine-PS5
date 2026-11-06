@@ -24,7 +24,9 @@ Fails before this change (the captured instruction is rejected).
 On 00.067.002 the same shader got past 0x60 and stopped at 0x190: IMAD.HI R1, R208, 0x38e38e39, RZ
 (words d0017827 38e38e39 078e00ff 000fe200). 99zzzx shadows every form of the common integer and
 float ALU operations from the operand form (bits 9-11); this check also covers that word, a few
-forms only the generic rule handles, and an operation it leaves out (DADD).
+forms only the generic rule handles, and an operation it leaves out (DADD). With the dump of that
+shader from 00.067.003 (2934 instructions), the whole program lowers after this layer; it then used
+IABS, I2FP, F2I, LDG (0x381) and IMAD form 7 on high registers too.
 """
 from pathlib import Path
 import os
@@ -119,6 +121,9 @@ int main() {
         {0x827, {16, 24, 64}}, {0xa27, {16, 24, 64}}, {0xc27, {16, 24, 64}}, {0x427, {16, 24, 64}},
         {0x209, {16, 24, 32}}, {0x809, {16, 24}}, {0x20b, {24, 32}}, {0x80b, {24}},
         {0x412, {16, 24, 64}}, {0x816, {16, 24, 64}}, {0xa25, {16, 24, 64}},
+        // Also used on high registers by the same shader (dumped on 00.067.003): IABS, I2FP, F2I and
+        // IMAD with a uniform addend (form 7: B at 64).
+        {0x213, {16, 32}}, {0x245, {16, 32}}, {0x305, {16, 32}}, {0xe24, {16, 24, 64}},
     };
     const u32 high[] = {206, 172, 190, 214};
     for (const auto& form : forms) {
