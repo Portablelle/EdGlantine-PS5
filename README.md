@@ -65,6 +65,15 @@ CPU draw preparation is the main known bottleneck.
 
 Recent work, newest first. Each item links to its pull request.
 
+### OoT menu text
+
+OoT's menu showed only the first letter of each line, such as "N" and "P".
+The text is laid out by seven compute shaders that divide by 15 with a uniform
+wide multiply by an immediate (`UIMAD.WIDE`, Ampere opcode `0x8a5`). The native
+translator did not know that form, so it rejected the shaders and every one of
+their dispatches was skipped. It now translates it like the immediate `UIMAD`
+next to it (layer `99zzzu`). Not yet tried on a console.
+
 ### Lichii mods, movie timing and loader fixes
 
 Five small changes ported from Lichii into the core (layers `99zzzf1` to
