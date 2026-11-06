@@ -1,0 +1,252 @@
+Ported from open Lichii PR #250 (https://github.com/zortos293/Lichii/pull/250): skip the GPU-write
+invalidations of the texture, query and shader caches on pages where they never registered anything.
+
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -110,6 +110,7 @@ add_library(video_core STATIC
+     invalidation_accumulator.h
+     memory_manager.cpp
+     memory_manager.h
++    page_filter.h
+     native_qmd.h
+     nx2.h
+     nx2_profile.h
+diff --git a/src/video_core/page_filter.h b/src/video_core/page_filter.h
+new file mode 100644
+--- /dev/null
++++ b/src/video_core/page_filter.h
+@@ -0,0 +1,72 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <atomic>
++#include <memory>
++
++#include "common/common_types.h"
++
++namespace VideoCommon {
++
++/// The 4 KiB device pages a cache has ever registered objects on. Bits are never cleared, so a
++/// clear bit proves the cache holds nothing there and an invalidation of those pages does nothing
++/// (Lichii #250).
++class PageFilter {
++public:
++    PageFilter() : words{std::make_unique<std::atomic<u64>[]>(NumWords)} {}
++
++    void Mark(u64 address, u64 size) {
++        if (size == 0) {
++            return;
++        }
++        const u64 first = address >> PageBits;
++        const u64 last = (address + size - 1) >> PageBits;
++        if (last >= NumWords * 64) {
++            overflow.store(true, std::memory_order_relaxed);
++            return;
++        }
++        for (u64 page = first; page <= last;) {
++            const u64 bit = page % 64;
++            const u64 count = (std::min<u64>)(64 - bit, last - page + 1);
++            const u64 mask = (count == 64 ? ~u64{0} : (u64{1} << count) - 1) << bit;
++            auto& word = words[page / 64];
++            if ((word.load(std::memory_order_relaxed) & mask) != mask) {
++                word.fetch_or(mask, std::memory_order_relaxed);
++            }
++            page += count;
++        }
++    }
++
++    /// Whether the cache may hold objects on [address, address + size).
++    [[nodiscard]] bool Any(u64 address, u64 size) const {
++        if (size == 0) {
++            return false;
++        }
++        const u64 first = address >> PageBits;
++        const u64 last = (address + size - 1) >> PageBits;
++        if (last >= NumWords * 64 || overflow.load(std::memory_order_relaxed)) {
++            return true;
++        }
++        for (u64 page = first; page <= last;) {
++            const u64 bit = page % 64;
++            const u64 count = (std::min<u64>)(64 - bit, last - page + 1);
++            const u64 mask = (count == 64 ? ~u64{0} : (u64{1} << count) - 1) << bit;
++            if (words[page / 64].load(std::memory_order_relaxed) & mask) {
++                return true;
++            }
++            page += count;
++        }
++        return false;
++    }
++
++private:
++    static constexpr u64 PageBits = 12;
++    static constexpr u64 NumWords = (u64{1} << (36 - PageBits)) / 64; // 2 MiB of bits
++    std::unique_ptr<std::atomic<u64>[]> words;
++    std::atomic<bool> overflow{};
++};
++
++} // namespace VideoCommon
+diff --git a/src/video_core/query_cache/query_cache.h b/src/video_core/query_cache/query_cache.h
+--- a/src/video_core/query_cache/query_cache.h
++++ b/src/video_core/query_cache/query_cache.h
+@@ -343,6 +343,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
+     {
+         std::scoped_lock lock(cache_mutex);
+         auto it1 = cached_queries.try_emplace(cont_addr);
++        page_filter.Mark(cpu_addr, 16);
+         auto& sub_container = it1.first->second;
+         auto it_current = sub_container.find(base);
+         if (it_current == sub_container.end()) {
+diff --git a/src/video_core/query_cache/query_cache_base.h b/src/video_core/query_cache/query_cache_base.h
+--- a/src/video_core/query_cache/query_cache_base.h
++++ b/src/video_core/query_cache/query_cache_base.h
+@@ -18,6 +18,7 @@
+ #include "common/common_types.h"
+ #include "video_core/control/channel_state_cache.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
++#include "video_core/page_filter.h"
+ #include "video_core/query_cache/query_base.h"
+ #include "video_core/query_cache/types.h"
+ 
+@@ -41,6 +42,9 @@ class QueryCacheBase : public VideoCommon::ChannelSetupCaches<VideoCommon::Chann
+     using RuntimeType = typename Traits::RuntimeType;
+ 
+ public:
++    /// Device pages this cache ever registered objects on (InnerInvalidation skips the rest).
++    VideoCommon::PageFilter page_filter;
++
+     union QueryLocation {
+         BitField<27, 5, u32> stream_id;
+         BitField<0, 27, u32> query_id;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1501,7 +1501,18 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
+ }
+ 
+ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) {
+-    {
++    // The GPU's own cached writes (constant buffer data, every draw): most land where no image,
++    // query or shader was ever registered, which page_filter tells without the caches' locks
++    // (Lichii #250).
++    const auto any = [&](const VideoCommon::PageFilter& filter) {
++        for (const auto& [addr, size] : sequences) {
++            if (filter.Any(addr, size)) {
++                return true;
++            }
++        }
++        return false;
++    };
++    if (any(texture_cache.page_filter)) {
+         std::scoped_lock lock{texture_cache.mutex};
+         for (const auto& [addr, size] : sequences) {
+             texture_cache.WriteMemory(addr, size);
+@@ -1513,12 +1524,14 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
+             buffer_cache.WriteMemory(addr, size);
+         }
+     }
+-    {
++    if (any(query_cache.page_filter)) {
+         for (const auto& [addr, size] : sequences) {
+             query_cache.InvalidateRegion(addr, size);
+         }
+     }
+-    pipeline_cache.InvalidateRegions(sequences);
++    if (any(pipeline_cache.page_filter)) {
++        pipeline_cache.InvalidateRegions(sequences);
++    }
+ }
+ 
+ 
+diff --git a/src/video_core/shader_cache.cpp b/src/video_core/shader_cache.cpp
+--- a/src/video_core/shader_cache.cpp
++++ b/src/video_core/shader_cache.cpp
+@@ -234,6 +234,8 @@ void ShaderCache::RememberRejection(VAddr cpu_addr, GPUVAddr gpu_addr, const cha
+         return;
+     }
+     const u64 hash = PrefixHash(*gpu_memory, gpu_addr, size);
++    // InnerInvalidation only reaches DropRejections on pages the filter has seen.
++    page_filter.Mark(cpu_addr, size);
+     std::scoped_lock lock{lookup_mutex};
+     rejected_shaders.insert_or_assign(cpu_addr, RejectedShader{hash, size, error});
+ }
+@@ -253,6 +255,7 @@ void ShaderCache::Register(std::unique_ptr<ShaderInfo> data, VAddr addr, size_t
+ 
+     const VAddr addr_end = addr + size;
+     Entry* const entry = NewEntry(addr, addr_end, data.get());
++    page_filter.Mark(addr, size);
+ 
+     const u64 page_end = (addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
+     for (u64 page = addr >> YUZU_PAGEBITS; page < page_end; ++page) {
+diff --git a/src/video_core/shader_cache.h b/src/video_core/shader_cache.h
+--- a/src/video_core/shader_cache.h
++++ b/src/video_core/shader_cache.h
+@@ -20,6 +20,7 @@
+ #include <ranges>
+ #include "video_core/control/channel_state_cache.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
++#include "video_core/page_filter.h"
+ #include "video_core/rasterizer_interface.h"
+ #include "video_core/shader_environment.h"
+ 
+@@ -61,6 +62,9 @@ class ShaderCache : public VideoCommon::ChannelSetupCaches<VideoCommon::ChannelI
+     };
+ 
+ public:
++    /// Device pages this cache ever registered objects on (InnerInvalidation skips the rest).
++    VideoCommon::PageFilter page_filter;
++
+     /// @brief Removes shaders inside a given region
+     /// @note Checks for ranges
+     /// @param addr Start address of the invalidation
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -3109,6 +3109,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
+     if (False(image.flags & ImageFlagBits::Sparse)) {
+         auto map_id =
+             slot_map_views.insert(image.gpu_addr, image.cpu_addr, image.guest_size_bytes, image_id);
++        page_filter.Mark(image.cpu_addr, image.guest_size_bytes);
+         ForEachCPUPage(image.cpu_addr, image.guest_size_bytes,
+                        [this, map_id](u64 page) { page_table[page].push_back(map_id); });
+         image.map_view_id = map_id;
+@@ -3118,6 +3119,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
+     ForEachSparseSegment(
+         image, [this, image_id, &sparse_maps](GPUVAddr gpu_addr, DAddr cpu_addr, size_t size) {
+             auto map_id = slot_map_views.insert(gpu_addr, cpu_addr, size, image_id);
++            page_filter.Mark(cpu_addr, size);
+             ForEachCPUPage(cpu_addr, size,
+                            [this, map_id](u64 page) { page_table[page].push_back(map_id); });
+             sparse_maps.push_back(map_id);
+@@ -3340,6 +3342,7 @@ void TextureCache<P>::RebuildSparseMappings(ImageId image_id, Image& image) {
+     maps.clear();
+     ForEachSparseSegment(image, [this, image_id, &maps, tracked](GPUVAddr gpu_addr, DAddr cpu_addr, size_t size) {
+         const auto map_id = slot_map_views.insert(gpu_addr, cpu_addr, size, image_id);
++        page_filter.Mark(cpu_addr, size);
+         ForEachCPUPage(cpu_addr, size, [this, map_id](u64 page) { page_table[page].push_back(map_id); });
+         maps.push_back(map_id);
+         if (tracked) device_memory.UpdatePagesCachedCount(cpu_addr, size, 1);
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -16,6 +16,7 @@
+ // TODO: find out which don't require stable iters
+ #include <unordered_map>
+ #include "common/container/unordered_map.h"
++#include "video_core/page_filter.h"
+ #include "common/container/unordered_set.h"
+ #include <vector>
+ #include <boost/container/small_vector.hpp>
+@@ -192,6 +193,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
+     };
+ 
+ public:
++    /// Device pages this cache ever registered objects on (InnerInvalidation skips the rest).
++    VideoCommon::PageFilter page_filter;
++
+     explicit TextureCache(Runtime&, Tegra::MaxwellDeviceMemoryManager&);
+ 
+     /// Notify the cache that a new frame has been queued

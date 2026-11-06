@@ -1,0 +1,38 @@
+Ported from Lichii #119 (https://github.com/zortos293/Lichii/pull/119): read an NS2 XCI's
+main.npdm before the kernel memory layout and the guest clock are chosen.
+
+diff --git a/src/core/core.cpp b/src/core/core.cpp
+--- a/src/core/core.cpp
++++ b/src/core/core.cpp
+@@ -24,6 +24,7 @@
+ #include "core/cpu_manager.h"
+ #include "core/debugger/debugger.h"
+ #include "core/device_memory.h"
++#include "core/file_sys/card_image.h"
+ #include "core/file_sys/content_archive.h"
+ #include "core/file_sys/fs_filesystem.h"
+ #include "core/file_sys/nup_container.h"
+@@ -139,6 +140,23 @@ bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::siz
+         return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
+                metadata.IsSwitch2();
+     }
++    // A game card image keeps its program in the secure partition (Lichii #119). Without this,
++    // an NS2 XCI started with the first-generation guest clock and memory layout.
++    if (type == Loader::FileType::XCI) {
++        const FileSys::XCI xci{file, program_id, program_index};
++        if (xci.GetStatus() != Loader::ResultStatus::Success) {
++            return false;
++        }
++        const auto partition = xci.GetSecurePartitionNSP();
++        const auto program = partition != nullptr
++                                 ? partition->GetNCA(xci.GetProgramTitleID(),
++                                                     FileSys::ContentRecordType::Program)
++                                 : nullptr;
++        const auto exefs = program != nullptr ? program->GetExeFS() : nullptr;
++        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
++        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
++               metadata.IsSwitch2();
++    }
+     if (type == Loader::FileType::NSP) {
+         const FileSys::NSP nsp{file, program_id, program_index};
+         if (nsp.GetStatus() != Loader::ResultStatus::Success) {
