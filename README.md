@@ -65,6 +65,23 @@ CPU draw preparation is the main known bottleneck.
 
 Recent work, newest first. Each item links to its pull request.
 
+### Lichii fixes, second batch ([#43](https://github.com/Portablelle/EdGlantine-PS5/pull/43))
+
+Four more changes ported from Lichii into the core. None has been tried on a
+console yet.
+
+- **Fewer cache invalidations.** When the GPU writes memory, for example
+  constant buffer data on almost every draw, the texture, query and shader
+  caches are only asked to invalidate it if they ever registered something on
+  those pages. This saves CPU time in draw preparation.
+- **Cheaper draw bindings.** An index buffer that is already bound is not bound
+  again, and a large buffer that is used again is not re-marked page by page.
+- **NS2 game cards.** An XCI is checked for NS2 metadata before the guest
+  clock and memory layout are chosen, as NSP and NUP files already were.
+- **Swapchain recreation.** The device is idle before an old swapchain is
+  destroyed. A suboptimal image is still presented, and an out-of-date
+  swapchain is recreated before anything is drawn to it.
+
 ### Lichii GPU and shader fixes ([#41](https://github.com/Portablelle/EdGlantine-PS5/pull/41))
 
 Seven fixes ported from Lichii into the core. None has been tried on a console

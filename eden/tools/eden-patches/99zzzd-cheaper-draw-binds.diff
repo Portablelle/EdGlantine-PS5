@@ -1,0 +1,166 @@
+Ported from Lichii #184 (https://github.com/zortos293/Lichii/pull/184), itself from 999sian's
+Lichii #161: skip an index buffer bind that repeats the bound one, and keep the run of usage
+pages already filled so a large binding tracked again costs nothing.
+
+diff --git a/src/video_core/buffer_cache/usage_tracker.h b/src/video_core/buffer_cache/usage_tracker.h
+--- a/src/video_core/buffer_cache/usage_tracker.h
++++ b/src/video_core/buffer_cache/usage_tracker.h
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
+ #include <array>
+ #include <utility>
+ #include <vector>
+@@ -29,6 +30,8 @@ public:
+     void Reset() noexcept {
+         std::ranges::fill(pages, 0ULL);
+         recent.fill({~u64{0}, 0});
++        full_begin = 0;
++        full_end = 0;
+     }
+ 
+     void Track(u64 offset, u64 size) noexcept {
+@@ -50,9 +53,7 @@ public:
+         if (page == page_end) {
+             return;
+         }
+-        for (size_t i = page + 1; i < page_end; i++) {
+-            pages[i] = ~u64{0};
+-        }
++        FillPages(page + 1, page_end);
+         const size_t offset_end = offset + size;
+         const size_t offset_end_page_aligned = Common::AlignDown(offset_end, BUFFER_PAGE_BYTES);
+         TrackPage(page_end, offset_end_page_aligned, offset_end - offset_end_page_aligned);
+@@ -78,6 +79,31 @@ public:
+     }
+ 
+ private:
++    // Pages in [full_begin, full_end) are all ones already (only Reset clears a page): fill around
++    // that run and grow it, so tracking a multi-megabyte binding again costs nothing once filled
++    // (Lichii #184, from 999sian's #161).
++    void FillPages(size_t begin, size_t end) noexcept {
++        if (begin >= end) {
++            return;
++        }
++        if (end < full_begin || begin > full_end) {
++            std::fill(pages.begin() + begin, pages.begin() + end, ~u64{0});
++            if (end - begin > full_end - full_begin) {
++                full_begin = begin;
++                full_end = end;
++            }
++            return;
++        }
++        if (begin < full_begin) {
++            std::fill(pages.begin() + begin, pages.begin() + full_begin, ~u64{0});
++        }
++        if (end > full_end) {
++            std::fill(pages.begin() + full_end, pages.begin() + end, ~u64{0});
++        }
++        full_begin = (std::min)(begin, full_begin);
++        full_end = (std::max)(end, full_end);
++    }
++
+     void TrackPage(u64 page, u64 offset, u64 size) noexcept {
+         const size_t offset_in_page = offset % BUFFER_PAGE_BYTES;
+         const size_t first_bit = offset_in_page >> BUFFER_BYTES_PER_BITSHIFT;
+@@ -100,6 +126,9 @@ private:
+     /// Ranges tracked last, (offset, size).
+     std::array<std::pair<u64, u64>, 4> recent{{{~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}}};
+     size_t recent_cursor{};
++    /// Pages known to be all ones (FillPages).
++    size_t full_begin{};
++    size_t full_end{};
+ };
+ 
+ } // namespace VideoCommon
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+@@ -732,12 +732,25 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
+         ReserveNullBuffer();
+         vk_buffer = *null_buffer;
+     }
++    // The same index buffer is still bound in this command buffer: skip the rebind (Lichii #184,
++    // from 999sian's #161).
++    const u64 epoch = scheduler.RecordingEpoch();
++    if (bound_index_valid && vk_buffer == bound_index_buffer && vk_offset == bound_index_offset &&
++        vk_index_type == bound_index_type && epoch == bound_index_epoch) {
++        return;
++    }
++    bound_index_valid = true;
++    bound_index_buffer = vk_buffer;
++    bound_index_offset = vk_offset;
++    bound_index_type = vk_index_type;
++    bound_index_epoch = epoch;
+     scheduler.Record([vk_buffer, vk_offset, vk_index_type](vk::CommandBuffer cmdbuf) {
+         cmdbuf.BindIndexBuffer(vk_buffer, vk_offset, vk_index_type);
+     });
+ }
+ 
+ void BufferCacheRuntime::BindQuadIndexBuffer(PrimitiveTopology topology, u32 first, u32 count) {
++    bound_index_valid = false;
+     if (count == 0) {
+         ReserveNullBuffer();
+         scheduler.Record([this](vk::CommandBuffer cmdbuf) {
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.h b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.h
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+@@ -303,6 +303,13 @@ private:
+ 
+     bool limit_dynamic_storage_buffers = false;
+     u32 max_dynamic_storage_buffers = (std::numeric_limits<u32>::max)();
++
++    /// The index buffer BindIndexBuffer recorded last, at scheduler recording epoch bound_index_epoch.
++    VkBuffer bound_index_buffer = VK_NULL_HANDLE;
++    VkDeviceSize bound_index_offset = 0;
++    VkIndexType bound_index_type = VK_INDEX_TYPE_UINT32;
++    u64 bound_index_epoch = 0;
++    bool bound_index_valid = false;
+ };
+ 
+ struct BufferCacheParams {
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -475,6 +475,7 @@ void Scheduler::AllocateNewContext() {
+ }
+ 
+ void Scheduler::InvalidateState() {
++    ++recording_epoch;
+     state.graphics_pipeline = nullptr;
+     state.rescaling_defined = false;
+     state.descriptor_buffer_bound = false;
+@@ -494,6 +495,7 @@ void Scheduler::EndRenderPass()
+         if (!state.renderpass) {
+             return;
+         }
++        ++recording_epoch;
+ 
+         query_cache->CounterClose(VideoCommon::QueryType::StreamingByteCount);
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -213,6 +213,12 @@ public:
+         return *master_semaphore;
+     }
+ 
++    /// Changes whenever recorded command buffer state may have been reset (InvalidateState, the end
++    /// of a render pass), so a binding recorded at the same epoch is still bound (Lichii #184).
++    [[nodiscard]] u64 RecordingEpoch() const noexcept {
++        return recording_epoch;
++    }
++
+     std::mutex submit_mutex;
+ 
+ private:
+@@ -356,6 +362,7 @@ private:
+     std::function<void()> on_submit;
+ 
+     State state;
++    u64 recording_epoch = 0;
+ #ifdef EDEN_NX2_PS5_PROTO
+     Tegra::NativeSnapshotBatch<VkBuffer> native_snapshots;
+ #endif
