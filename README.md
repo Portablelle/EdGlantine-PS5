@@ -89,6 +89,10 @@ Taken from [viejunerd's EglantinePS5 build](https://github.com/viejunerd/Eglanti
   dav1d, built into FFmpeg for the PS5. It decodes several frames at once,
   where libgav1 fell behind on the 1080p menu movie.
   `EDEN_NX2_AV1_LIBGAV1=1` keeps libgav1.
+- **Bananza's VP9 movies on the PS5 decoder.** Its VP9 movies (up to 4K) were
+  decoded by FFmpeg on the CPU. They now go to the PS5's hardware decoder, and
+  any stream it refuses or fails on goes back to FFmpeg at the next keyframe.
+  `EDEN_NX2_VP9_HW=0` keeps FFmpeg. Not yet tried on a console.
 - **The GPU thread wakes on new work.** While channels wait on a semaphore, it
   used to sleep a fixed 1 ms. It now wakes as soon as work arrives, and checks
   the semaphores every 0.25 ms.

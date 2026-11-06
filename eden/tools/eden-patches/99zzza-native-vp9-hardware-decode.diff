@@ -1,0 +1,187 @@
+diff --git a/src/core/hle/service/am/service/native_video_decoder.cpp b/src/core/hle/service/am/service/native_video_decoder.cpp
+--- a/src/core/hle/service/am/service/native_video_decoder.cpp
++++ b/src/core/hle/service/am/service/native_video_decoder.cpp
+@@ -28,6 +28,9 @@
+ #include "core/hle/service/kernel_helpers.h"
+ #include "gav1/decoder.h"
+ #include "video_core/host1x/ffmpeg.h"
++#include "video_core/host1x/hardware_video_decoder.h"
++#include "video_core/host1x/video_decode.h"
++#include <optional>
+ #include <map>
+ #include <string_view>
+ #include "core/hle/kernel/k_transfer_memory.h"
+@@ -171,6 +174,9 @@ private:
+         h264_decoder.reset();
+         h264_timestamps.clear();
+         ffmpeg_vp9 = false;
++        vp9_hardware = false;
++        vp9_dimensions = {};
++        codec_name = "av1";
+         if (transfer_memory) transfer_memory->Close(kernel);
+         transfer_memory = nullptr;
+         configuration.reset();
+@@ -193,6 +199,8 @@ private:
+         u32 matrix;
+         bool full_range;
+         bool eos{};
++        // Which decoder produced the frame, for NX2_VIDEO_PERF: libgav1 frames keep the default.
++        const char* backend{"libgav1"};
+         u64 submission_id;
+         u64 timestamp;
+     };
+@@ -276,13 +284,13 @@ private:
+     void PerfReport(const DecodedFrame& frame, bool nv12) {
+         if (++perf_frames % 30 || perf_reports >= 24) return;
+         ++perf_reports;
+-        LOG_INFO(Service_AM, "NX2_VIDEO_PERF frames={} dimensions={}x{} nv12={} packet_ns={} decode_ns={} receive_ns={} planes_ns={} allocate_ns={} convert_ns={} swizzle_ns={} invalidate_ns={} write_ns={}",
+-                 perf_frames, frame.widths[0], frame.heights[0], nv12,
++        LOG_INFO(Service_AM, "NX2_VIDEO_PERF codec={} backend={} frames={} dimensions={}x{} nv12={} packet_ns={} decode_ns={} receive_ns={} planes_ns={} allocate_ns={} convert_ns={} swizzle_ns={} invalidate_ns={} write_ns={}",
++                 codec_name, frame.backend, perf_frames, frame.widths[0], frame.heights[0], nv12,
+                  perf_ns[Packet], perf_ns[Decode], perf_ns[Receive], perf_ns[Planes],
+                  perf_ns[Allocate], perf_ns[Convert], perf_ns[Swizzle], perf_ns[Invalidate], perf_ns[Write]);
+     }
+ 
+-    void QueueH264Frame(const std::shared_ptr<FFmpeg::Frame>& received) {
++    void QueueH264Frame(const std::shared_ptr<FFmpeg::Frame>& received, bool hardware = false) {
+         auto phase = PerfClock::now();
+         const AVFrame* av = received->GetFrame();
+         if (av->format != AV_PIX_FMT_YUV420P && av->format != AV_PIX_FMT_YUVJ420P &&
+@@ -291,6 +299,7 @@ private:
+             return;
+         }
+         DecodedFrame frame{};
++        frame.backend = hardware ? "hw" : "ffmpeg";
+         frame.bitdepth = 8;
+         frame.format = 0;
+         // Keep signalled matrix coefficients. Only unspecified input retains the
+@@ -335,13 +344,86 @@ private:
+     }
+ 
+     void DrainH264() {
+-        for (const auto& frame : h264_backend.Drain()) QueueH264Frame(frame);
+-        h264_backend.Finish();
++        for (const auto& frame : h264_backend.Drain()) QueueH264Frame(frame, true);
++        if (vp9_hardware && h264_backend.IsActive()) {
++            // VP9 restarts on any keyframe: let the next one open the hardware again (movies
++            // that loop or restart after Stop), instead of moving the stream to FFmpeg.
++            h264_backend.Reset();
++        } else {
++            h264_backend.Finish();
++        }
+         avcodec_send_packet(h264_context->GetCodecContext(), nullptr);
+         CollectH264Frames();
+         avcodec_flush_buffers(h264_context->GetCodecContext());
+     }
+ 
++    // Size and profile from the uncompressed header of a VP9 keyframe (VP9 spec 6.2), read from
++    // the first frame of the packet as the hardware session's keyframe test does. Anything
++    // else (inter, intra-only, show-existing or a malformed header) returns nothing.
++    static std::optional<FFmpeg::FrameDimensions> Vp9KeyframeSize(std::span<const u8> packet) {
++        Eden::VideoDecode::Bits bits{packet};
++        if (bits.Read(2) != 2) return std::nullopt; // frame_marker
++        s32 profile = static_cast<s32>(bits.Read(1));
++        profile |= static_cast<s32>(bits.Read(1)) << 1;
++        if (profile == 3) bits.Read(1); // reserved_zero
++        if (bits.Read(1)) return std::nullopt; // show_existing_frame
++        if (bits.Read(1)) return std::nullopt; // frame_type: 1 is a non-key frame
++        bits.Read(2); // show_frame, error_resilient_mode
++        if (bits.Read(24) != 0x498342) return std::nullopt; // frame_sync_code
++        if (profile >= 2) bits.Read(1); // ten_or_twelve_bit
++        const bool odd_profile = profile == 1 || profile == 3;
++        if (bits.Read(3) != 7) { // color_space other than sRGB
++            bits.Read(1); // color_range
++            if (odd_profile) bits.Read(3); // subsampling_x, subsampling_y, reserved_zero
++        } else if (odd_profile) {
++            bits.Read(1); // reserved_zero
++        }
++        const s32 width = static_cast<s32>(bits.Read(16)) + 1;
++        const s32 height = static_cast<s32>(bits.Read(16)) + 1;
++        if (!bits.valid) return std::nullopt;
++        return FFmpeg::FrameDimensions{width, height, profile};
++    }
++
++    // Native VP9 on the frontend's hardware decoder (libSceVideodec2 on PS5). Returns false when
++    // this packet must go to FFmpeg: the hardware refused the stream or failed and recovered
++    // at a keyframe, or no keyframe has opened it yet. Frames are synchronous and paired with
++    // their submission by pts, as in QueueH264Frame.
++    bool DecodeVp9OnHardware(const PendingInput& input) {
++        using Route = FFmpeg::HardwareVideoDecoderSession::Route;
++        using State = FFmpeg::HardwareVideoDecoderSession::State;
++        if (const auto keyframe = Vp9KeyframeSize(input.bytes)) {
++            // A new size needs a new decoder: reopen it at this keyframe.
++            if (h264_backend.IsActive() && *keyframe != vp9_dimensions) h264_backend.Reset();
++            vp9_dimensions = *keyframe;
++        } else if (h264_backend.GetState() == State::Selection) {
++            // The hardware only opens on a keyframe. Until then FFmpeg gets the packet, as
++            // before; it holds no delayed frames (no frame threading), so the switch is clean.
++            return false;
++        }
++        // Allows packets with only hidden frames (no output) on the hardware route.
++        h264_backend.AllowDelayedOutput();
++        const auto previous = h264_backend.GetState();
++        std::shared_ptr<FFmpeg::Frame> frame;
++        const auto route = h264_backend.Decode(Tegra::Host1x::NvdecCommon::VideoCodec::VP9,
++            input.bytes, {}, vp9_dimensions, static_cast<s64>(input.submission_id), {}, frame);
++        const auto state = h264_backend.GetState();
++        if (state != previous) {
++            LOG_INFO(Service_AM, "Native VP9 {}x{} profile {}: {}", vp9_dimensions.width,
++                     vp9_dimensions.height, vp9_dimensions.profile,
++                     state == State::Hardware   ? "hardware decoder" :
++                     state == State::Recovery   ? "hardware failed, waiting for a keyframe" :
++                     state == State::Fallback   ? "hardware failed, using FFmpeg" :
++                                                  "hardware refused, using FFmpeg");
++        }
++        if (route == Route::Software) return false;
++        if (route == Route::Hardware && frame) {
++            h264_timestamps[input.submission_id] = input.timestamp;
++            QueueH264Frame(frame, true);
++        }
++        // Skipped packets are consumed too: PumpOutput must keep progressing to a keyframe.
++        return true;
++    }
++
+     Result DecodePendingH264() {
+         const auto& input = pending_inputs.front();
+         if (input.eos) {
+@@ -355,6 +437,12 @@ private:
+             R_SUCCEED();
+         }
+         auto phase = PerfClock::now();
++        if (vp9_hardware && DecodeVp9OnHardware(input)) {
++            PerfMark(Decode, phase);
++            pending_input_bytes -= input.bytes.size();
++            pending_inputs.pop_front();
++            R_SUCCEED();
++        }
+         auto bytes = ffmpeg_vp9 ? input.bytes : ToAnnexB(input.bytes);
+         if (!ffmpeg_vp9) {
+             // Frames are paired with submissions by pts (QueueH264Frame), so the hardware
+@@ -882,6 +970,16 @@ private:
+                                         h264_decoder = std::move(ffmpeg_decoder);
+                                         h264_context = std::move(ffmpeg_context);
+                                         ffmpeg_vp9 = is_vp9;
++                                        codec_name = is_vp9 ? "vp9" : "h264";
++                                        if (is_vp9) {
++                                            // Per stream: EDEN_NX2_VP9_HW=0 keeps FFmpeg for A/B tests.
++                                            const char* value = std::getenv("EDEN_NX2_VP9_HW");
++                                            const bool allowed = !value || std::string_view{value} != "0";
++                                            vp9_hardware = allowed && FFmpeg::HardwareVideoDecoderAvailable();
++                                            LOG_INFO(Service_AM, "Native VP9 decoder: {}", vp9_hardware ?
++                                                "hardware first, FFmpeg fallback" : allowed ?
++                                                "FFmpeg (no hardware decoder)" : "FFmpeg (EDEN_NX2_VP9_HW=0)");
++                                        }
+                                         result = ResultSuccess;
+                                     }
+                                 }
+@@ -977,6 +1075,10 @@ private:
+     std::vector<u8> h264_extradata;
+     // The FFmpeg path also serves VP9 (frames are passed through unchanged, no extradata).
+     bool ffmpeg_vp9{};
++    // Native VP9 tries the hardware session first (DecodeVp9OnHardware); AV1 never does.
++    bool vp9_hardware{};
++    FFmpeg::FrameDimensions vp9_dimensions{};
++    const char* codec_name{"av1"};
+     std::optional<GraphicsSupervisorProtocol::VideoDecoderConfiguration> configuration;
+     KernelHelpers::ServiceContext context;
+     Kernel::KEvent* submission_event{};
