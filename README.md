@@ -65,6 +65,23 @@ CPU draw preparation is the main known bottleneck.
 
 Recent work, newest first. Each item links to its pull request.
 
+### Lichii buffer and texture cache fixes
+
+Three changes from open Lichii pull requests, adapted to this core. **Nothing
+has been tried on a console yet**: the test build compiles, packages and passes
+its checks, and that is all.
+
+- **Cached storage buffer bindings.** Every draw binds each storage buffer
+  again, which took a lock and walked the GPU page table each time. The answer
+  is now kept until a GPU mapping changes. This should save CPU time in draw
+  preparation, the main known cost.
+- **Native uniform banks uploaded directly.** The 64 KiB uniform banks of NS2
+  programs, refreshed once per frame, are copied straight to the GPU instead of
+  having their memory pages unprotected and protected again every frame.
+- **Clears before copies.** A render target clear that is still waiting for its
+  render pass now lands before a blit, image copy or DMA write into the same
+  image, so the clear can never wipe what the copy wrote.
+
 ### Lichii shader fixes ([#44](https://github.com/Portablelle/EdGlantine-PS5/pull/44))
 
 Four shader recompiler changes ported from Lichii into the core. None has been
@@ -292,7 +309,11 @@ roms/
 - **Graphics memory.** Large games can run out of the PS5's shared graphics pool
   (issue #20).
 - **GPU thread splitting** is available but off at startup. Turning it on has
-  frozen games.
+  frozen games. It only starts when a `split-enable.request` file holding any
+  text appears in the app folder (`/data/homebrew/PPSA99862/`) during play, so
+  `NX2_SPLIT_PERF` reports `words=0` otherwise. Even when it runs, each NS2
+  command list waits for the second GPU thread to catch up before it is read,
+  which limits what it can gain.
 - **Sparse texture residency** is off by default (`EDEN_NX2_SPARSE_LAYERS=1` opts
   in). It does not yet save any memory.
 - **Partly simulated services.** Some NX2 services are simulated, and graphics
