@@ -808,6 +808,8 @@ inline std::atomic<uint64_t> session_title{0};
 // whose values go before the general ones, one value at a time). Settings > Performance has
 // a switch for each general value, and Library > Game settings > Performance one for each of a
 // game's own.
+inline constexpr uint64_t kMarioKartWorldTitle = 0x0400C3F00006E000ULL;
+
 struct PerformanceSettings {
     bool block_list = false;     // compile the blocks of earlier sessions ahead (jit_list.h)
     bool async_shaders = false;  // draw before a new shader is ready: no pause, things missing meanwhile
@@ -846,6 +848,9 @@ inline PerformanceSettings LoadPerformance(uint64_t title_id, const std::string&
                                       kSpeedLimitKeys, int(std::size(kSpeedLimitKeys)), result.speed_limit);
     };
     read("");
+    // Mario Kart World runs out of the PS5's memory during its first load: compact memory is on
+    // for it unless its own settings say otherwise (after viejunerd/Eglantine-PS5- 148d952).
+    if (title_id == kMarioKartWorldTitle) result.compact_memory = true;
     if (title_id) read("/games/" + Settings::TitleKey(title_id));
     return result;
 }

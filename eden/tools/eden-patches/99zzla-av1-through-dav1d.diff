@@ -1,0 +1,66 @@
+diff --git a/src/core/hle/service/am/service/native_video_decoder.cpp b/src/core/hle/service/am/service/native_video_decoder.cpp
+--- a/src/core/hle/service/am/service/native_video_decoder.cpp
++++ b/src/core/hle/service/am/service/native_video_decoder.cpp
+@@ -885,7 +885,37 @@ private:
+                                         result = ResultSuccess;
+                                     }
+                                 }
+-                            } else {
++                            }
++                            // AV1 goes through dav1d (FFmpeg's libdav1d) when the build has it: it
++                            // decodes several frames at once, where libgav1 here used one thread for
++                            // a 1080p movie and fell behind (OoT's menu movie at about 43 of 60 FPS).
++                            // EDEN_NX2_AV1_LIBGAV1=1 keeps libgav1.
++                            static const bool force_libgav1 = [] {
++                                const char* value = std::getenv("EDEN_NX2_AV1_LIBGAV1");
++                                return value != nullptr && value[0] == '1';
++                            }();
++                            if (is_av1 && !force_libgav1) {
++                                auto ffmpeg_decoder = std::make_unique<FFmpeg::Decoder>(
++                                    Tegra::Host1x::NvdecCommon::VideoCodec::AV1);
++                                if (ffmpeg_decoder->GetCodec()) {
++                                    auto ffmpeg_context = std::make_unique<FFmpeg::DecoderContext>(*ffmpeg_decoder);
++                                    // Four threads: the guest cores keep the rest of the CPU.
++                                    ffmpeg_context->GetCodecContext()->thread_count = 4;
++                                    if (ffmpeg_context->OpenContext(*ffmpeg_decoder)) {
++                                        transfer_memory = memory.GetPointerUnsafe();
++                                        transfer_memory->Open(kernel);
++                                        h264_decoder = std::move(ffmpeg_decoder);
++                                        h264_context = std::move(ffmpeg_context);
++                                        // Raw packets, no hardware session: as for VP9.
++                                        ffmpeg_vp9 = true;
++                                        result = ResultSuccess;
++                                    }
++                                }
++                                if (result != ResultSuccess) {
++                                    LOG_WARNING(Service_AM, "No FFmpeg AV1 decoder, using libgav1");
++                                }
++                            }
++                            if (is_av1 && result != ResultSuccess) {
+                                 auto backend = std::make_unique<libgav1::Decoder>();
+                                 libgav1::DecoderSettings settings;
+                                 settings.threads = 4;
+diff --git a/src/video_core/host1x/ffmpeg.cpp b/src/video_core/host1x/ffmpeg.cpp
+--- a/src/video_core/host1x/ffmpeg.cpp
++++ b/src/video_core/host1x/ffmpeg.cpp
+@@ -163,6 +163,8 @@ Decoder::Decoder(Tegra::Host1x::NvdecCommon::VideoCodec codec) {
+             return AV_CODEC_ID_VP8;
+         case Tegra::Host1x::NvdecCommon::VideoCodec::VP9:
+             return AV_CODEC_ID_VP9;
++        case Tegra::Host1x::NvdecCommon::VideoCodec::AV1:
++            return AV_CODEC_ID_AV1;
+         default:
+             UNIMPLEMENTED_MSG("Unknown codec {}", codec);
+             return AV_CODEC_ID_NONE;
+diff --git a/src/video_core/host1x/nvdec_common.h b/src/video_core/host1x/nvdec_common.h
+--- a/src/video_core/host1x/nvdec_common.h
++++ b/src/video_core/host1x/nvdec_common.h
+@@ -22,6 +22,8 @@ enum class VideoCodec : u64 {
+     VP8 = 0x5,
+     H265 = 0x7,
+     VP9 = 0x9,
++    // Not an NVDEC codec: native (NS2) video only, decoded by dav1d through FFmpeg.
++    AV1 = 0x100,
+ };
+ 
+ struct Offset {

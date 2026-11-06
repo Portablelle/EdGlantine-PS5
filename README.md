@@ -65,7 +65,7 @@ CPU draw preparation is the main known bottleneck.
 
 Recent work, newest first. Each item links to its pull request.
 
-### Lichii GPU and shader fixes (PR_LINK)
+### Lichii GPU and shader fixes ([#41](https://github.com/Portablelle/EdGlantine-PS5/pull/41))
 
 Seven fixes ported from Lichii into the core. None has been tried on a console
 yet.
@@ -83,6 +83,34 @@ yet.
 - **OoT sky and culling.** Multiplies by 0 and 1 are simplified, so the shader
   sees the real buffer pointer. Native 64 KiB uniform banks are uploaded again
   once per frame, so tables next to the code don't go stale.
+
+### Fixes from viejunerd's build for Mario Kart World and the GPU thread
+
+Taken from [viejunerd's EglantinePS5 build](https://github.com/viejunerd/Eglantine-PS5-)
+(`tools/eglantine-patches`). None of them has been tried on a console yet.
+
+- **Compact memory for Mario Kart World.** It is on for this game unless the
+  game's own settings turn it off. Written memory that is mostly zeroes is kept
+  in 16 KiB pages.
+- **Smaller kernel tables.** Each memory manager sizes its page reference counts
+  to its own region, not to all of the console's memory.
+- **Smaller GPU queue.** Command lists keep 32 entries in place instead of 512,
+  so the GPU thread's queue takes about 2 MiB instead of about 25 MiB.
+- **No more abort on a 4 GiB vertex stream.** It is clamped and logged, which
+  is what aborted Mario Kart World as it booted in viejunerd's build.
+- **Out-of-range syncpoints are dropped** and logged once, instead of crashing.
+- **Controller callbacks after the applet resource exists.** A motion sample
+  during boot could crash the app.
+- **No global Vulkan pipeline cache.** It hung NS2 games at 98% on every launch
+  after the first in viejunerd's build. Per-game caches are kept.
+- **OoT's movies play.** The game asks for its AV1 decoder with NV12 output,
+  which was refused, and the game stopped on its menu. AV1 now goes through
+  dav1d, built into FFmpeg for the PS5. It decodes several frames at once,
+  where libgav1 fell behind on the 1080p menu movie.
+  `EDEN_NX2_AV1_LIBGAV1=1` keeps libgav1.
+- **The GPU thread wakes on new work.** While channels wait on a semaphore, it
+  used to sleep a fixed 1 ms. It now wakes as soon as work arrives, and checks
+  the semaphores every 0.25 ms.
 
 ### NUP packages ([#28](https://github.com/Portablelle/EdGlantine-PS5/pull/28))
 

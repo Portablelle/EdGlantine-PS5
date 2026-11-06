@@ -1,0 +1,17 @@
+diff --git a/src/core/hle/service/am/service/native_video_decoder.cpp b/src/core/hle/service/am/service/native_video_decoder.cpp
+--- a/src/core/hle/service/am/service/native_video_decoder.cpp
++++ b/src/core/hle/service/am/service/native_video_decoder.cpp
+@@ -846,8 +846,12 @@ private:
+             // The command 200 helper (Kirby Air Riders) sends codec 1, input format 3 and output format 3
+             // (NV12 pools): treated as the AV1 decoder, a previously observed AV1 pairing. This
+             // pairing is inferred, the codec numbering of the real server was not decoded.
++            // Command 201 also asks for AV1 with NV12 pools (output format 3): Ocarina of Time
++            // initializes its movie decoder that way and panics when it is refused. The output is
++            // written by pool layout (NV12 or RGBA), so both formats take the same decoder.
+             const bool is_av1 = kind == NativeVideoKind::Decoder &&
+-                                ((!is_200 && request->codec == 3 && request->output_format == 2) ||
++                                ((!is_200 && request->codec == 3 &&
++                                  (request->output_format == 2 || request->output_format == 3)) ||
+                                  (is_200 && request->codec == 1 && request->output_format == 3)) &&
+                                 request->input_format == 3 && request->output_mode == 1;
+             const bool is_h264 = kind == NativeVideoKind::Decoder &&
