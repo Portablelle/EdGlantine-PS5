@@ -277,6 +277,35 @@ extern "C" void eden_load_step(const char* stage, const char* detail) {
 int main(int argc, char** argv) {
     if (setenv("EDEN_NX2_MME_JIT", "1", 1) != 0 ||
         setenv("EDEN_NX2_SPLIT", "1", 1) != 0) return 2;
+    // Shader debugging switches, read once before the first shader (the core reads these variables
+    // once). Each native shader the translator rejects is written to logs/rejected-shaders/<key>
+    // .source.bin (and .mapped.bin) and the game carries on, so the next blocker can be fixed off
+    // the console. On by default; /data/eden-nx2/dump-rejected-shaders-off.txt turns it off.
+    if (!std::ifstream(std::string{Eden::kDataDir} + "/dump-rejected-shaders-off.txt").good()) {
+        const std::string folder = std::string{Eden::kDataDir} + "/logs/rejected-shaders";
+        setenv("EDEN_NATIVE_SHADER_OVERRIDE_DIR", folder.c_str(), 1);
+        setenv("EDEN_NATIVE_SHADER_NO_PAUSE", "1", 1);
+        std::fprintf(stderr, "EDEN_REJECTED_SHADER_DUMP %s\n", folder.c_str());
+    }
+    // /data/eden-nx2/reject-shaders.txt: native shader keys (as logged by "Lowered native shader at
+    // ...: key=..."), separated by spaces, commas or lines, that are skipped as if unsupported. Skip
+    // one shader per run to find which one causes a visual defect.
+    // /data/eden-nx2/dump-shaders.txt, same format: those shaders still run, and their source, the
+    // mapped bytes and the lowered words are written to logs/rejected-shaders/ (needs the dump on).
+    const auto read_keys = [](const char* file, const char* variable, const char* tag) {
+        std::ifstream keys_file{std::string{Eden::kDataDir} + "/" + file};
+        std::string keys, word;
+        while (keys_file >> word) {
+            for (char& c : word) if (c == ',') c = ' ';
+            keys += word + ",";
+        }
+        if (!keys.empty()) {
+            setenv(variable, keys.c_str(), 1);
+            std::fprintf(stderr, "%s %s\n", tag, keys.c_str());
+        }
+    };
+    read_keys("reject-shaders.txt", "EDEN_NATIVE_REJECT_KEYS", "EDEN_REJECT_SHADER_KEYS");
+    read_keys("dump-shaders.txt", "EDEN_NATIVE_DUMP_KEYS", "EDEN_DUMP_SHADER_KEYS");
     try {
         std::FILE* report = stdout;
         SCOPE_EXIT { if (report != stdout) std::fclose(report); };

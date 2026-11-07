@@ -98,7 +98,7 @@ tried on a console yet.** The split is still off unless you turn it on (see
 
 OoT's menu shows only the first letter of each line, such as "N" and "P".
 The text is laid out by seven compute shaders that the native translator
-rejected, so every one of their dispatches was skipped. Three layers so far:
+rejected, so every one of their dispatches was skipped. Four layers so far:
 
 - **`UIMAD.WIDE` by an immediate** (Ampere opcode `0x8a5`, a divide by 15,
   [#48](https://github.com/Portablelle/EdGlantine-PS5/pull/48)). After it, three of
@@ -107,15 +107,50 @@ rejected, so every one of their dispatches was skipped. Three layers so far:
   stopped at it on 00.067.000. On 00.067.001 all six run, but the top half of
   the menu movie is covered with colourful noise and there is still no text.
   The six probably read data that the seventh shader prepares.
-
 - **High registers next to the extended uniform bank** (layer `99zzzw`). The
   seventh shader uses uniform registers UR16 and up, which take R168-R215, and
   also its own R206. Guest registers in that range are kept aside and copied
   into a free low register group around each instruction, but `IADD3` with an
   immediate had no entry for this, so the shader was rejected ("native register
   shadowing mode"). The layer adds it and the other common integer and float
-  forms. Not yet tried on a console; the shader may still stop at a later
-  instruction.
+  forms. On 00.067.002 the shader got past it and stopped at `IMAD.HI` with an
+  immediate (`0x827`) on R208.
+- **Every form of the common ALU operations** (layer `99zzzx`). Instead of a list
+  of opcodes, the operand form (bits 9-11) now tells which fields are registers,
+  for IADD3, LOP3, SHF, LEA, PRMT, IMAD, IMAD.WIDE, IMAD.HI, FFMA, FADD, FMUL,
+  SEL, FSEL, FMNMX, IMNMX, ISETP, FSETP, MOV, IABS, I2FP, F2I and LDG. With the
+  shader dumped on 00.067.003, the whole program (2934 instructions) now lowers
+  off the console. Not yet tried on a console.
+
+On 00.067.004 no shader is rejected any more: the noise is gone and the movie
+and logo show, but the menu still shows only the first letter of each line, at
+about 15 FPS. That is a different defect, not a rejected shader.
+
+### Debugging tools
+
+- **Rejected shaders are dumped.** Each native shader the translator rejects is
+  written to `/data/eden-nx2/logs/rejected-shaders/<key>.source.bin` (and the
+  bytes mapped after it to `<key>.mapped.bin`), and the game carries on. This is
+  on by default; create `/data/eden-nx2/dump-rejected-shaders-off.txt` to turn it
+  off.
+- **Skip chosen shaders.** `/data/eden-nx2/reject-shaders.txt` lists native
+  shader keys, separated by spaces, commas or lines. Those shaders are skipped as
+  if unsupported. The log names each lowered shader's key ("Lowered native shader
+  at ...: key=..."). Skip one per run to find which shader causes a visual defect.
+- **Dump chosen shaders.** `/data/eden-nx2/dump-shaders.txt` takes keys in the same
+  format. Those shaders still run, and their source, the mapped bytes from their
+  program base (header included) and the lowered Maxwell words are written once to
+  `/data/eden-nx2/logs/rejected-shaders/`, to study a shader that lowers but draws
+  wrongly.
+- **Collect a run in one command.**
+  `python3 eden/tools/ps5-collect.py --host <PS5 address>` downloads the logs, the
+  dumped shaders and the newest screenshot (converted to JPEG when `imagecodecs`
+  and Pillow are installed). It writes `report.json` and `report.txt`, which list
+  the version, the rejected and lowered native shaders with their keys, the last
+  performance lines and the most frequent warnings. Add `--scan <ssh host>:<patched
+  source tree>` to run every dumped shader through the translator on that host
+  (`eden/tools/native-shader-scan/scan.cpp`), which lists everything that still
+  blocks it.
 
 ### Lichii mods, movie timing and loader fixes
 

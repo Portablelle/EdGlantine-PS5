@@ -1,0 +1,92 @@
+OoT's menu text: shadow every form of the common ALU operations next to the extended uniform
+bank, not only the forms 99zzzw listed. The operand form (bits 9-11) places the register operands,
+so IMAD.HI with an immediate (0x827), where the last menu-text compute shader stopped on 00.067.002,
+and the other immediate, constant and uniform forms are covered, as are IABS, I2FP, F2I, LDG with
+register address words (0x381) and IMAD with a uniform addend (form 7), which the same shader
+(dumped on 00.067.003) also uses on high registers. Bumps the translator salt.
+
+--- a/src/shader_recompiler/frontend/ampere/register_pressure.h
++++ b/src/shader_recompiler/frontend/ampere/register_pressure.h
+@@ -80,9 +80,9 @@
+         const u32 width = input.Bits(73, 3), count = width == 6 ? 4 : width == 5 ? 2 : 1;
+         operand(opcode == 0x387 ? 32 : 16, count); operand(24); break;
+     }
+-    case 0x981: case 0x986: {
++    case 0x381: case 0x981: case 0x986: { // LDG (register or uniform address words), STG
+         const u32 width = input.Bits(73, 3), count = width == 6 ? 4 : width == 5 ? 2 : 1;
+-        operand(opcode == 0x981 ? 16 : 32, count);
++        operand(opcode == 0x986 ? 32 : 16, count);
+         operand(24, input.Bits(72, 1) ? 2 : 1); break;
+     }
+     case 0x9a8: // ATOMG: result in Rd, data operand at bit 32.
+@@ -96,9 +96,57 @@
+         operand(16, channels > 1 ? 2 : 1); operand(24, input.Bits(61, 3) == 5 ? 3 : 2);
+         operand(32, 4); operand(64, 2); break;
+     }
+-    default:
+-        result.valid = false; return result;
++    default: {
++        // Any other form of a known integer or float ALU operation: the low nine bits name the
++        // operation and bits 9-11 the operand form, which places the register operands. Form 1 is
++        // register B (32) and C (64); forms 2-3 put an immediate or constant in C, so B moves to 64;
++        // forms 4-6 put an immediate, constant or uniform register in B, and C stays at 64. A
++        // two-source operation has no C, so only form 1 names a register in B. OoT's last menu-text
++        // compute shader reached IMAD.HI R1, R208, 0x38e38e39 (0x827), which no case above listed, then
++        // IABS, I2FP, F2I, LDG and IMAD with a uniform addend (form 7) on registers from R168 up.
++        enum class Shape { None, Move, Compare, Two, Three, Wide, High };
++        const u32 base = opcode & 0x1ff, form = opcode >> 9;
++        Shape shape = Shape::None;
++        switch (base) {
++        case 0x002: case 0x013: case 0x045: case 0x105:                  // MOV, IABS, I2FP, F2I
++            shape = Shape::Move; break;
++        case 0x00b: case 0x00c: shape = Shape::Compare; break;           // FSETP, ISETP
++        case 0x007: case 0x008: case 0x009: case 0x017:                  // SEL, FSEL, FMNMX, IMNMX
++        case 0x020: case 0x021: shape = Shape::Two; break;               // FMUL, FADD
++        case 0x010: case 0x011: case 0x012: case 0x016: case 0x019:      // IADD3, LEA, LOP3, PRMT, SHF
++        case 0x023: case 0x024: shape = Shape::Three; break;             // FFMA, IMAD
++        case 0x025: shape = Shape::Wide; break;                          // IMAD.WIDE
++        case 0x027: shape = Shape::High; break;                          // IMAD.HI (64-bit addend)
++        default: break;
++        }
++        // Form 7 (B a register at 64, C a uniform register) is only placed for three-source operations.
++        if (shape == Shape::None || form == 0 || (form == 7 && shape != Shape::Three)) {
++            result.valid = false; return result;
++        }
++        const bool register_b = form == 1;
++        const bool register_c_only = form >= 4 && form <= 6;  // B is not a GPR, C is at 64
++        switch (shape) {
++        case Shape::Move:
++            operand(16); if (register_b) operand(32); break;
++        case Shape::Compare:
++            operand(24); if (register_b) operand(32); break;
++        case Shape::Two:
++            operand(16); operand(24); if (register_b) operand(32); break;
++        case Shape::Three:
++            operand(16); operand(24); if (register_b) operand(32); operand(64); break;
++        case Shape::Wide:
++        case Shape::High: {
++            operand(16, shape == Shape::Wide ? 2 : 1); operand(24);
++            if (register_b) { operand(32); operand(64, 2); }
++            else if (register_c_only) operand(64, 2);
++            else operand(64);  // forms 2-3: B at 64, the addend is the immediate or constant
++            break;
++        }
++        case Shape::None: break;
++        }
++        break;
+     }
++    }
+     std::array<bool, 256> used{};
+     std::array<bool, 64> groups{};
+     for (const auto [bit, count] : operands) {
+--- a/src/shader_recompiler/frontend/ampere/native.h
++++ b/src/shader_recompiler/frontend/ampere/native.h
+@@ -43,7 +43,7 @@
+ 
+ // Salt mixed into the pipeline cache identity of native-translated programs. Bump it whenever the
+ // native translation changes so cached results of an older translator are never reused.
+-inline constexpr u64 NATIVE_TRANSLATOR_SALT = 0x4f554e4345a0000aULL;
++inline constexpr u64 NATIVE_TRANSLATOR_SALT = 0x4f554e4345a0000bULL;
+ 
+ // Maxwell Location offset of native instruction `index` (same mapping the lowering uses).
+ [[nodiscard]] constexpr u32 LocationOf(u32 index) {
