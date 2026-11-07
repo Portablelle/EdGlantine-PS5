@@ -134,11 +134,14 @@ The draw trace (`trace-draws.txt`, below) found it on 00.067.007 to 00.067.009:
   per-draw constants are right; the line's texture holds only the first letter.
 - The glyphs are drawn into it by `3ef85adc7e8c8e3c`, one instance per glyph. Macro
   `0x1e6` asks for, say, 14 instances from base instance 1, as a `draw.begin` with
-  `InstanceId::First` followed by `Subsequent` pairs. Eden draws the first pair at once
-  (base instance 1: the first letter, which shows), then the batch in `DrawDeferred`
-  after the macro has reset the base instance register, so the batch drew 14 instances
-  from base instance 0: the glyphs of the start of the buffer, not the line's.
-- Layer `99zzzz2` keeps the bases of the batch's first draw for the batch.
+  `InstanceId::First` followed by `Subsequent` pairs. Eden draws the first pair at once,
+  then the batch in `DrawDeferred` after the macro has reset the base instance register,
+  so the batch is drawn from base instance 0. Keeping the first draw's bases for the
+  batch (tried on 00.067.010) gave the batches the requested base, but the text still
+  showed one letter, so that is not the whole cause; the change was not kept.
+- Still open: every instance of a batch seems to draw the same glyph. The next step is to
+  dump `3ef85adc7e8c8e3c` (`dump-shaders.txt`) and see how it derives the glyph from the
+  instance (instance id attribute, or the base vertex and instance at `c[0][0x640]`).
 - The 11 native compute shaders lowered at boot are not the text: they are lowered
   about 70 seconds before the menu and run 14 fixed-size dispatches per frame from the
   movie on.
