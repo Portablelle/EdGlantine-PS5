@@ -126,7 +126,7 @@ On 00.067.004 no shader is rejected any more: the noise is gone and the movie
 and logo show, but the menu still shows only the first letter of each line, at
 about 15 FPS. That is a different defect, not a rejected shader.
 
-The draw trace (`trace-draws.txt`, below) found it on 00.067.007 to 00.067.009:
+The draw trace (`trace-draws.txt`, below) narrowed it down on 00.067.007 to 00.067.010:
 
 - The shader that shows each line (`db48e0136d8b96d8`) draws one quad of the whole
   line's size (for example 1212x130) from a fixed 12-vertex mesh that the GPU does not
