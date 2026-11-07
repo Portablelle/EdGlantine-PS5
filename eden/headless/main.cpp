@@ -306,6 +306,10 @@ int main(int argc, char** argv) {
     };
     read_keys("reject-shaders.txt", "EDEN_NATIVE_REJECT_KEYS", "EDEN_REJECT_SHADER_KEYS");
     read_keys("dump-shaders.txt", "EDEN_NATIVE_DUMP_KEYS", "EDEN_DUMP_SHADER_KEYS");
+    // /data/eden-nx2/trace-draws.txt, same format: for a few frames, every draw that uses one of those
+    // shaders logs an NX2_DRAW_TRACE line (counts, topology, indirect arguments, macro parameters,
+    // vertex and index buffers and whether the GPU wrote them).
+    read_keys("trace-draws.txt", "EDEN_NX2_TRACE_DRAW_KEYS", "EDEN_TRACE_DRAW_KEYS");
     try {
         std::FILE* report = stdout;
         SCOPE_EXIT { if (report != stdout) std::fclose(report); };

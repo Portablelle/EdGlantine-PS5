@@ -126,6 +126,26 @@ On 00.067.004 no shader is rejected any more: the noise is gone and the movie
 and logo show, but the menu still shows only the first letter of each line, at
 about 15 FPS. That is a different defect, not a rejected shader.
 
+The draw trace (`trace-draws.txt`, below) narrowed it down on 00.067.007 to 00.067.010:
+
+- The shader that shows each line (`db48e0136d8b96d8`) draws one quad of the whole
+  line's size (for example 1212x130) from a fixed 12-vertex mesh that the GPU does not
+  write, with UVs over its whole texture. The draw, its vertex and index buffers and its
+  per-draw constants are right; the line's texture holds only the first letter.
+- The glyphs are drawn into it by `3ef85adc7e8c8e3c`, one instance per glyph. Macro
+  `0x1e6` asks for, say, 14 instances from base instance 1, as a `draw.begin` with
+  `InstanceId::First` followed by `Subsequent` pairs. Eden draws the first pair at once,
+  then the batch in `DrawDeferred` after the macro has reset the base instance register,
+  so the batch is drawn from base instance 0. Keeping the first draw's bases for the
+  batch (tried on 00.067.010) gave the batches the requested base, but the text still
+  showed one letter, so that is not the whole cause; the change was not kept.
+- Still open: every instance of a batch seems to draw the same glyph. The next step is to
+  dump `3ef85adc7e8c8e3c` (`dump-shaders.txt`) and see how it derives the glyph from the
+  instance (instance id attribute, or the base vertex and instance at `c[0][0x640]`).
+- The 11 native compute shaders lowered at boot are not the text: they are lowered
+  about 70 seconds before the menu and run 14 fixed-size dispatches per frame from the
+  movie on.
+
 ### Debugging tools
 
 - **Rejected shaders are dumped.** Each native shader the translator rejects is
@@ -142,6 +162,18 @@ about 15 FPS. That is a different defect, not a rejected shader.
   program base (header included) and the lowered Maxwell words are written once to
   `/data/eden-nx2/logs/rejected-shaders/`, to study a shader that lowers but draws
   wrongly.
+- **Trace the draws of chosen shaders.** `/data/eden-nx2/trace-draws.txt` takes keys in
+  the same format. For eight frames (the first two with a traced draw, then one every 120),
+  each draw whose vertex or pixel shader has one of those keys logs an `NX2_DRAW_TRACE`
+  line: the draw kind (direct, indirect, from a macro, instance batch), counts, firsts,
+  base vertex and instance, topology, the host draw parameters, indirect arguments, the
+  macro's parameters and where they were read from, the vertex attributes, each vertex
+  stream and the index buffer with their GPU/CPU modified state and first words, and
+  constant buffer 0 of the vertex and pixel stages with the 0xc0-byte block it points to
+  at 0x170 (`EDEN_NX2_TRACE_DRAW_POINTERS` takes other offsets). The first 256 dispatches
+  of traced compute shaders log an `NX2_DISPATCH_TRACE` line (grid, block, indirect
+  arguments, constant buffers). `ps5-collect.py` writes the lines to `draw-trace.txt` and
+  a summary per frame to the report. Delete the file to turn the trace off.
 - **Collect a run in one command.**
   `python3 eden/tools/ps5-collect.py --host <PS5 address>` downloads the logs, the
   dumped shaders and the newest screenshot (converted to JPEG when `imagecodecs`
