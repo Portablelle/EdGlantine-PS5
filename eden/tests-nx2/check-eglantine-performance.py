@@ -91,6 +91,7 @@ template<class P>struct TextureCache {
  u64 ReclaimableImageBytes(const Image&){return 10;}
  bool IsDownloadable(const Image&i){return i.downloadable;}
  void UntrackImage(Image&,ImageId){}
+ void MarkStale(const Image&){}void ClearStaleImage(const Image&){}  // the collector's stale pages (99zzzz3)
  void UnregisterImage(ImageId i){total_used_memory-=10;}
  void DeleteImage(ImageId i,bool){delete_order.push_back(i);slot_images[i].deleted=true;lru_cache.Free(slot_images[i].lru);}
  void Add(unsigned i,u64 tick,unsigned flags=CostlyLoad,bool downloadable=false){

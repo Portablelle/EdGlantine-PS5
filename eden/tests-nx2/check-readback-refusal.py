@@ -170,6 +170,8 @@ struct TextureCache {
     Gpu gpu;
     Gpu* gpu_memory = &gpu;
     int swizzle_data_buffer = 0;
+    int stale_clears = 0;
+    void ClearStaleImage(const Image&) { ++stale_clears; }  // 99zzzz3: a write-back clears stale pages
     void CommitAsyncFlushes();
     void DownloadMemory(boost::container::small_vector<ImageId, 16> images);
 };
@@ -234,7 +236,7 @@ int main() {
     cache.runtime.free_bytes = 128_MiB;
     cache.runtime.largest = 182_MiB;
     cache.DownloadMemory({small, target});
-    assert(downloads == 1 && swizzles == 1);
+    assert(downloads == 1 && swizzles == 1 && cache.stale_clears == 1);
     assert(!True(cache.slot_images[small].flags & ImageFlagBits::GpuModified));
     assert(True(cache.slot_images[target].flags & ImageFlagBits::GpuModified));
     assert(!cache.slot_images[target].info.forced_flushed);

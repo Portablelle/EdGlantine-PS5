@@ -77,6 +77,7 @@ template<class P>struct TextureCache{
  template<class F>void ForEachImageInRegion(u64,size_t,F f){for(auto& [id,image]:slot_images.values)f(id,image);}
  bool MarkSparseWrite(ImageId,Image&,DAddr,size_t){return false;}bool MarkPartialWrite(ImageBase&,DAddr,size_t){return false;}
  void UntrackImage(Image& image,ImageId){image.flags&=~ImageFlagBits::Tracked;}
+ void ClearStale(DAddr,size_t){}  // WriteMemory clears the stale pages first (99zzzz3)
 };
 '''
 for sig in ['void TextureCache<P>::QueueAsyncDecode(', 'void TextureCache<P>::TickAsyncDecode(',
