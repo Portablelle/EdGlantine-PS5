@@ -1,7 +1,7 @@
 Port the performance changes from zortos293/Eglantine@f8f29b576 (PR #71): use the
 ordered non-overlapping CFG block set for visited lookups, walk both siblings for order,
 and let the first worker or scheduler waiter claim a pipeline build. Graphics configuration
-is selected before the build frees its shader modules. Keep the existing completion and
+is selected before the build can be observed as finished. Keep the existing completion and
 failed-pipeline paths. Skip rasterizer download/write operations for host pointers outside
 physical backing, logging only the first 16. Adapted over the effective memory/coherence
 layers; ApplyOpOnPointer for physical pointers is unchanged. No frame capture, timing trace,
@@ -125,7 +125,7 @@ diff --git a/src/core/memory.cpp b/src/core/memory.cpp
 diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
 --- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
 +++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
-@@ -142,11 +142,22 @@
+@@ -142,11 +142,32 @@
              shader_notify->MarkShaderComplete();
          }
      }};
@@ -146,12 +146,22 @@ diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_
 +    if (build_claimed.exchange(true)) {
 +        return;
 +    }
-+    build_task();
++    try {
++        build_task();
++    } catch (...) {
++        {
++            std::scoped_lock lock{build_mutex};
++            is_built = true;
++            build_condvar.notify_one();
++        }
++        build_task = nullptr;
++        throw;
++    }
 +    build_task = nullptr;
  }
  
  bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
-@@ -274,6 +285,7 @@
+@@ -274,6 +295,7 @@
      if (!is_built.load(std::memory_order::relaxed)) {
          // Wait for the pipeline to be built
          scheduler.Record([this](vk::CommandBuffer) {
@@ -192,11 +202,11 @@ diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.h b/src/video_co
 diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
 --- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
 +++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
-@@ -349,12 +349,24 @@
+@@ -349,12 +349,34 @@
              shader_notify->MarkShaderComplete();
          }
      }};
-+    // Before the build: it frees the modules this looks at.
++    // ConfigureFunc must be set before the build can be observed as finished.
 +    configure_func = ConfigureFunc(spv_modules, stage_infos);
 +    build_task = std::move(func);
      if (worker_thread) {
@@ -216,12 +226,22 @@ diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video
 +    if (build_claimed.exchange(true)) {
 +        return;
 +    }
-+    build_task();
++    try {
++        build_task();
++    } catch (...) {
++        {
++            std::scoped_lock lock{build_mutex};
++            is_built = true;
++            build_condvar.notify_one();
++        }
++        build_task = nullptr;
++        throw;
++    }
 +    build_task = nullptr;
  }
  
  void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
-@@ -1006,6 +1018,7 @@
+@@ -1006,6 +1028,7 @@
      if (!is_built.load(std::memory_order::relaxed)) {
          // Wait for the pipeline to be built
          scheduler.Record([this](vk::CommandBuffer) {

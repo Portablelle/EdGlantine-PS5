@@ -53,6 +53,7 @@ code = r'''
 #include <iterator>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -180,6 +181,29 @@ template<class Pipeline> void TestPipeline() {
         check(p.builds == 1, "late worker built pipeline twice");
     }
     { Pipeline p; p.Start(nullptr); check(p.is_built && p.builds == 1, "synchronous build"); }
+    // Both direct and scheduler claims must publish completion even if the task throws.
+    for (int via_wait = 0; via_wait < 2; ++via_wait) {
+        Pipeline p; Worker worker;
+        p.before_build = [] { throw std::runtime_error("non-vk build failure"); };
+        p.Start(&worker);
+        bool caught = false;
+        try {
+            if (via_wait) p.Wait(scheduler); else p.RunBuild();
+        } catch (const std::runtime_error&) {
+            caught = true;
+        }
+        check(caught, "non-vk build exception must propagate");
+        check(p.is_built && p.builds == 1, "throwing build must publish completion");
+        if constexpr (requires { p.build_task; }) {
+            check(!p.build_task, "throwing build must clear its task");
+        }
+        p.RunBuild();
+        p.Wait(scheduler);
+        // Main has no claim path: allow its queued task to drain without an uncaught throw.
+        p.before_build = nullptr;
+        worker.Drain();
+        check(p.builds == 1, "throwing build must not be retried");
+    }
     for (int i = 0; i < 100; ++i) {
         Pipeline p; Worker worker; p.Start(&worker);
         std::barrier gate(3);
