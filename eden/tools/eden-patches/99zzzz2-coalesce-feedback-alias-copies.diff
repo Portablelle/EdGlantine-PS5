@@ -1,0 +1,251 @@
+Coalesce feedback alias copies: a draw that samples an image whose only newer alias is one of its
+own bound colour targets copies that target once per guest texture barrier and render target set,
+not before every draw. Donkey Kong Bananza (Ingot Isle neon gate) binds one G-buffer target as a
+2112x1179 colour target and samples the same memory as a 2095x1179 texture, so SynchronizeAliases
+copied the whole target before every draw that sampled it (UpdateRenderTargets marks the target
+modified at each draw, so the alias is always newer). The idea is from
+heydemoura/EglantinePS5@5c3d5e9 (its feedback-copy part only); it is adapted to this core, not
+copied: the alias walk cache, the overlap epoch and the vertex buffer scan are left out (99zu has
+its own), and this core's render_targets_serial is only current once UpdateRenderTargets ran, which
+is after the sampled views are prepared, so a draw coalesces only while Dirty::RenderTargets is
+clear.
+A skipped copy leaves the image's modification tick older than the target's, so it stays dirty: the
+next barrier (fragment_barrier, invalidate_texture_data_cache, tiled_cache_barrier), render target
+set change, compute read or read that is not a feedback read copies it. The remembered copy is
+void, and the next sample copies again, when anything else wrote the image since (its tick moved:
+another alias copied into it, a GPU write), when RefreshContents uploads the image (it forgets the
+copy before any upload path), while the image is decoding or unswizzling in the background, and when
+the source is deleted (its aliases forget it, so a reused id never matches). Not coalesced: compute,
+a target that is unbound, format NONE or reached through another rt_control mapping, rescaled
+images, and any sample with a second newer alias (those copies would overwrite what was
+remembered), or a draw that changes the render target set. 99zw's shadow copies are untouched.
+EDEN_NX2_FEEDBACK_COPIES=exact (or 0) copies before every draw; 0 also keeps 99zw's loop.
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -27,6 +27,7 @@
+ #include "video_core/memory_manager.h"
+ #include "video_core/nx2_profile.h"
+ #include "video_core/rasterizer_interface.h"
++#include "video_core/texture_barrier_epoch.h"
+ #include "video_core/textures/texture.h"
+ #if defined(ARCHITECTURE_x86_64) && !defined(EDEN_NX2_PS5_PROTO)
+ #include "video_core/macro_turing_jit.h"
+@@ -466,11 +467,14 @@
+         upload_state.ProcessData(argument, is_last_call);
+         return;
+     case MAXWELL3D_REG_INDEX(fragment_barrier):
++        VideoCommon::NoteTextureBarrier();
+         return rasterizer->FragmentBarrier();
+     case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
++        VideoCommon::NoteTextureBarrier();
+         rasterizer->InvalidateGPUCache();
+         return rasterizer->WaitForIdle();
+     case MAXWELL3D_REG_INDEX(tiled_cache_barrier):
++        VideoCommon::NoteTextureBarrier();
+         return rasterizer->TiledCacheBarrier();
+     default:
+         draw_manager.ProcessMethodCall(*this, method, argument);
+diff --git a/src/video_core/texture_barrier_epoch.h b/src/video_core/texture_barrier_epoch.h
+new file mode 100644
+--- /dev/null
++++ b/src/video_core/texture_barrier_epoch.h
+@@ -0,0 +1,21 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <atomic>
++
++#include "common/common_types.h"
++
++namespace VideoCommon {
++
++/// Counts the guest's texture barriers (Maxwell3D fragment_barrier, invalidate_texture_data_cache
++/// and tiled_cache_barrier). Texture reads are ordered after earlier colour writes only across
++/// one; TextureCache::SynchronizeAliases uses it to bound feedback copies.
++inline std::atomic<u64> texture_barrier_epoch{};
++
++inline void NoteTextureBarrier() {
++    texture_barrier_epoch.fetch_add(1, std::memory_order_relaxed);
++}
++
++} // namespace VideoCommon
+diff --git a/src/video_core/texture_cache/image_base.h b/src/video_core/texture_cache/image_base.h
+--- a/src/video_core/texture_cache/image_base.h
++++ b/src/video_core/texture_cache/image_base.h
+@@ -124,6 +124,14 @@
+     // Zero means this image has not used the CPU async decoder (e.g. async unswizzle).
+     u64 async_decode_generation = 0;
+     u64 modification_tick = 0;
++    /// Feedback copy coalescing (TextureCache::SynchronizeAliases): the bound colour target this
++    /// image was last copied from, the guest texture barrier count and render target set then, and
++    /// this image's own modification tick right after that copy (it differs once anything else
++    /// wrote the image).
++    ImageId feedback_source{};
++    u64 feedback_barrier_epoch = 0;
++    u64 feedback_rt_serial = 0;
++    u64 feedback_tick = 0;
+     size_t lru_index = SIZE_MAX;
+ 
+     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -17,6 +17,7 @@
+ #include <vector>
+ #include <optional>
+ #include <bit>
++#include <string_view>
+ #include "common/container/unordered_map.h"
+ #include <boost/container/small_vector.hpp>
+ 
+@@ -36,6 +37,7 @@
+ #include "video_core/texture_cache/util.h"
+ #include "video_core/nx2_profile.h"
+ #include "video_core/gpu_written_pages.h"
++#include "video_core/texture_barrier_epoch.h"
+ #include "video_core/textures/decoders.h"
+ 
+ namespace VideoCommon {
+@@ -516,6 +518,7 @@
+ template <class P>
+ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist) {
+     const bool capture = !compute && gpu_memory->UsesNativeTiling() && BeginNativeTextureCapture();
++    feedback_sampling = !compute;
+     bool has_blacklisted = false;
+     do {
+         has_deleted_images = false;
+@@ -541,6 +544,7 @@
+             }
+         }
+     } while (has_deleted_images || (blacklist && has_blacklisted));
++    feedback_sampling = false;
+     if (!compute) {
+         ReplaceColorFeedbackViews(views);
+     }
+@@ -1647,6 +1651,8 @@
+         return;
+     }
+     InvalidateAsyncDecode(image);
++    // The upload below overwrites what a feedback copy put here: the next sample copies again.
++    image.feedback_source = ImageId{};
+     if (refresh_counts.size() < 4096 || refresh_counts.contains(image.gpu_addr)) {
+         auto& refresh = refresh_counts[image.gpu_addr];
+         ++refresh.refreshes;
+@@ -3696,6 +3702,9 @@
+ 
+     for (const AliasedImage& alias : image.aliased_images) {
+         ImageBase& other_image = slot_images[alias.id];
++        if (other_image.feedback_source == image_id) {
++            other_image.feedback_source = ImageId{};
++        }
+         [[maybe_unused]] const size_t num_removed_aliases =
+             std::erase_if(other_image.aliased_images, [image_id](const AliasedImage& other_alias) {
+                 return other_alias.id == image_id;
+@@ -3792,11 +3801,82 @@
+ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
+     boost::container::small_vector<const AliasedImage*, 8> aliased_images;
+     Image& image = slot_images[image_id];
++    // A draw that samples an image whose only newer alias is one of its own bound colour targets
++    // (a feedback read: the target's memory viewed at another size or format) copies that target at
++    // most once per guest texture barrier and render target set. Without a barrier the hardware
++    // does not order a draw's texture reads after earlier colour writes either, and the copy was a
++    // full-screen one before every draw of Donkey Kong Bananza's G-buffer at Ingot Isle. A skipped
++    // copy leaves the image older than the target, so a barrier, a render target change, compute or
++    // a read that is not a feedback read copies it. Anything else that wrote the image since the
++    // remembered copy (another alias, a GPU write, an upload: RefreshContents forgets the copy)
++    // makes the next sample copy again. EDEN_NX2_FEEDBACK_COPIES=exact (or 0) copies before every
++    // draw.
++    static const bool coalesce_feedback = [] {
++        const char* value = std::getenv("EDEN_NX2_FEEDBACK_COPIES");
++        return value == nullptr || (value[0] != '0' && std::string_view{value} != "exact");
++    }();
++    const AliasedImage* deferred = nullptr;
++    const AliasedImage* recorded = nullptr;
++    // UpdateRenderTargets has not yet run for this draw: only a clean RenderTargets flag means
++    // render_targets and render_targets_serial are the draw's.
++    if (coalesce_feedback && feedback_sampling && maxwell3d != nullptr &&
++        !maxwell3d->dirty.flags[Dirty::RenderTargets]) {
++        const AliasedImage* newest = nullptr;
++        size_t newer_count = 0;
++        for (const AliasedImage& aliased : image.aliased_images) {
++            if (slot_images[aliased.id].modification_tick > image.modification_tick) {
++                newest = &aliased;
++                ++newer_count;
++            }
++        }
++        // color_buffer_ids[i] is the view of regs.rt[i] (FindColorBuffer); rt_control.Map(index)
++        // names the slot the draw's output `index` writes.
++        const auto is_bound_color_target = [this](ImageId id) {
++            const auto& regs = maxwell3d->regs;
++            const u32 count = regs.rt_control.count;
++            for (u32 index = 0; index < count && index < NUM_RT; ++index) {
++                const u32 rt_index = regs.rt_control.Map(index);
++                if (rt_index >= NUM_RT) {
++                    continue;
++                }
++                const ImageViewId view_id = render_targets.color_buffer_ids[rt_index];
++                if (view_id && regs.rt[rt_index].format != Tegra::RenderTargetFormat::NONE &&
++                    slot_image_views[view_id].image_id == id) {
++                    return true;
++                }
++            }
++            return false;
++        };
++        // With any other newer alias this sample copies as before: those copies would overwrite
++        // what was remembered. The remembered copy is also void once the image was written by
++        // anything else (its tick moved) or is being decoded or unswizzled in the background.
++        if (newer_count == 1 && is_bound_color_target(newest->id) &&
++            False(image.flags & (ImageFlagBits::Rescaled | ImageFlagBits::IsDecoding)) &&
++            False(slot_images[newest->id].flags & ImageFlagBits::Rescaled)) {
++            const u64 barrier_epoch =
++                VideoCommon::texture_barrier_epoch.load(std::memory_order_relaxed);
++            if (image.feedback_source == newest->id && image.feedback_barrier_epoch == barrier_epoch &&
++                image.feedback_rt_serial == render_targets_serial &&
++                image.feedback_tick == image.modification_tick) {
++                deferred = newest;
++            } else {
++                image.feedback_source = newest->id;
++                image.feedback_barrier_epoch = barrier_epoch;
++                image.feedback_rt_serial = render_targets_serial;
++                recorded = newest;
++            }
++        } else if (newer_count != 0) {
++            image.feedback_source = ImageId{};
++        }
++    }
+     bool any_rescaled = True(image.flags & ImageFlagBits::Rescaled);
+     bool any_modified = True(image.flags & ImageFlagBits::GpuModified);
+     u64 most_recent_tick = image.modification_tick;
+     for (const AliasedImage& aliased : image.aliased_images) {
+         ImageBase& aliased_image = slot_images[aliased.id];
++        if (&aliased == deferred) {
++            continue;
++        }
+         if (image.modification_tick < aliased_image.modification_tick) {
+             most_recent_tick = (std::max)(most_recent_tick, aliased_image.modification_tick);
+             aliased_images.push_back(&aliased);
+@@ -3816,6 +3896,9 @@
+         }
+     }
+     image.modification_tick = most_recent_tick;
++    if (recorded != nullptr) {
++        image.feedback_tick = most_recent_tick;
++    }
+     if (any_modified) {
+         image.flags |= ImageFlagBits::GpuModified;
+         VideoCommon::GpuWrittenPages::Mark(image.cpu_addr, image.cpu_addr_end - image.cpu_addr);
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -600,6 +600,8 @@
+     Common::ScratchBuffer<u8> unswizzle_data_buffer;
+ 
+     u64 modification_tick = 0;
++    /// Graphics texture views are being prepared (feedback copy coalescing).
++    bool feedback_sampling = false;
+     // Occupancy is only an eviction-order heuristic; IDs/eligibility remain live.
+     u64 block_fill_tick = ~0ULL;
+     std::unordered_map<u64, u64> block_image_bytes;
