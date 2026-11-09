@@ -45,6 +45,7 @@ template<class T> struct Table : std::array<T,32> {
  void CommitRegion(size_t,size_t) {} T& GetUnchecked(size_t n){return this->at(n);}
  T& GetAndFault(size_t n){return this->at(n);}
 };
+inline std::atomic<u64> device_translation_generation{1};  // device_memory_manager.inc: unique across instances
 template<class Traits> struct DeviceMemoryManager {
  struct Entry {u64 cpu_backing_address=0;u32 continuity_tracker=0,compressed_physical_ptr=0;};
  Table<Entry> tracked_entries;
