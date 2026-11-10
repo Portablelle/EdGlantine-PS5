@@ -42,6 +42,11 @@ assert 'retired_buffers' in body and 'CurrentTick()' in body and 'IsFree(' in bo
 assert 'num_indices / 2' in body and 'max)(num_indices_' in body, 'growth must be at least 1.5x'
 assert 'std::vector<std::pair<u64, vk::Buffer>> retired_buffers' in text
 
+# prepare-vulkan-port.py counts the Wait/Finish sites of vk_buffer_cache.cpp: removing the one in
+# UpdateBuffer leaves 2 (scheduler.Wait(tick) and a later Finish).
+prepare = (root / 'tools/prepare-vulkan-port.py').read_text()
+assert "('vk_buffer_cache', 7, 2)" in prepare, 'wait-site anchor count for vk_buffer_cache must be 2'
+
 if source_only:
     print('quad-index-grow-no-finish source checks passed')
     sys.exit(0)
