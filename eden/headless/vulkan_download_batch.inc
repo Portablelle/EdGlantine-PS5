@@ -14,6 +14,7 @@
                 const auto copies = FixSmallVectorADL(FullDownloadCopies(image.info));
                 SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span,
                              swizzle_data_buffer);
+                ClearStaleImage(image); // guest memory holds the image's data now (99zzzz3)
             }
             pending.clear();
             batch_bytes = 0;

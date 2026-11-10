@@ -27,6 +27,7 @@ python3 tests-nx2/check-converted-upload-chunks.py
 python3 tests-nx2/check-graphics-usage-reserve.py
 python3 tests-nx2/check-vram-reclaim.py
 python3 tests-nx2/check-feedback-alias-copies.py
+python3 tests-nx2/check-stale-texture-uploads.py
 python3 tests-nx2/check-faster-shader-translation.py
 python3 tests-nx2/check-readback-refusal.py
 python3 tests-nx2/check-memory-breakdown.py
