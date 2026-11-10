@@ -31,6 +31,7 @@ python3 tests-nx2/check-stale-texture-uploads.py
 python3 tests-nx2/check-faster-shader-translation.py
 python3 tests-nx2/check-native-hmma-lowering.py
 python3 tests-nx2/check-inline-page-writes.py
+python3 tests-nx2/check-mapped-upload-barrier.py
 python3 tests-nx2/check-readback-refusal.py
 python3 tests-nx2/check-memory-breakdown.py
 python3 tests-nx2/check-native-spill-lut.py

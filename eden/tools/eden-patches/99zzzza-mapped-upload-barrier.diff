@@ -1,0 +1,21 @@
+Do not flag a buffer upload for the post-copy barrier when the backend uploads through memory maps.
+Residual of Djihads80/Eglantine f500990 (#361); its log half is layer 99w. With
+USE_MEMORY_MAPS_FOR_UPLOADS (Vulkan) MappedUploadMemory goes through runtime.CopyBuffer(..., true,
+can_reorder): the non-reordered copy records its own transfer->shader barrier, and a reordered copy
+lands in the upload command buffer, which SubmitExecution ends with a transfer-write barrier and
+submits before the main one. SynchronizeBufferPages still set any_buffer_uploaded, so the next
+graphics/compute bind recorded a redundant PostCopyBarrier that ended the render pass. The flag is now
+set only for ImmediateUploadMemory (OpenGL, no barrier of its own), which keeps its barrier.
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -2299,7 +2299,9 @@
+     }
+     const std::span<BufferCopy> copies_span(upload_copies.data(), upload_copies.size());
+     UploadMemory(buffer, total_size_bytes, largest_copy, copies_span);
+-    any_buffer_uploaded = true;
++    if constexpr (!USE_MEMORY_MAPS_FOR_UPLOADS) {
++        any_buffer_uploaded = true;
++    }
+     return false;
+ }
+ 
