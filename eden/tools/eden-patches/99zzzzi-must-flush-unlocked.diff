@@ -1,0 +1,62 @@
+MustFlushRegion: answer the buffer cache part without its lock for never-GPU-written pages.
+Port of zortos293/Eglantine 2b70fc5 (#413). The split's front asks MustFlushRegion before each macro
+DMA read and waited on buffer_cache.mutex, which the back holds through each draw (upstream measured
+8% of the OoT front waiting; not measured on this port). BufferCache::IsRegionGpuModified answers from
+gpu_modified_ranges, and both places that add to it (MarkWrittenBuffer, DMACopy's mirrored ranges)
+call memory_tracker.MarkRegionAsGpuModified -> GpuWrittenPages::Mark over a covering range BEFORE the
+add; marks never clear. DMACopy used to mark after the add, which left a window where an unsynchronized
+caller (GPU::InvalidateRegion with preserve_gpu_writes) saw no mark, skipped the lock and then let
+the invalidation drop the just-added GPU range: it now marks first (Subtract/Add order unchanged).
+So on Switch 2 (g_nx2_ampere) a range with no marked page (GpuWrittenPages::Any false, full bitmap
+incl. image marks) has no buffer-GPU-modified range yet and skips the lock; once a page is marked the
+lock is taken and waits for the add. Wraps and ranges past the 36-bit bitmap answer true and take it.
+Non-Ampere, QueryCache and TextureCache checks are unchanged.
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -404,9 +404,13 @@
+         QueueFenceDownload(new_base_address, size);
+     };
+     gpu_modified_ranges.ForEachInRange(*cpu_src_address, amount, mirror);
++    const bool has_new_downloads = tmp_intervals.size() != 0;
++    if (has_new_downloads) {
++        // Mark before the ranges are added: MustFlushRegion skips this lock for unmarked pages.
++        memory_tracker.MarkRegionAsGpuModified(*cpu_dest_address, amount);
++    }
+     // This subtraction in this order is important for overlapping copies.
+     gpu_modified_ranges.Subtract(*cpu_dest_address, amount);
+-    const bool has_new_downloads = tmp_intervals.size() != 0;
+     for (const auto& pair : tmp_intervals) {
+         gpu_modified_ranges.Add(pair.first, pair.second);
+     }
+@@ -415,7 +419,6 @@
+     dest_buffer.MarkUsage(copy.dst_offset, copy.size);
+     runtime.CopyBuffer(dest_buffer, src_buffer, copies, true);
+     if (has_new_downloads) {
+-        memory_tracker.MarkRegionAsGpuModified(*cpu_dest_address, amount);
+         const bool should_sync = Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
+         if (should_sync) {
+             runtime.Finish();
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -66,6 +66,7 @@
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ #include "video_core/nx2_profile.h"
+ #include "video_core/gpu_written_pages.h"
++#include "video_core/nx2.h"
+ 
+ namespace Vulkan {
+ 
+@@ -1582,7 +1583,12 @@
+ }
+ 
+ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+-    if ((True(which & VideoCommon::CacheType::BufferCache))) {
++    // The split's front asks this before each macro DMA read while the back holds the buffer
++    // cache's lock through each draw. Every range the buffer cache records as GPU-modified also
++    // marks its pages GPU-written under that lock (marks never clear), so unmarked pages skip it.
++    if (True(which & VideoCommon::CacheType::BufferCache) &&
++        (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
++         VideoCommon::GpuWrittenPages::Any(addr, size))) {
+         std::scoped_lock lock{buffer_cache.mutex};
+         if (buffer_cache.IsRegionGpuModified(addr, size)) {
+             return true;
