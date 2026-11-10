@@ -1,0 +1,106 @@
+Skip same-value draw.end in an instance loop and vertex_buffer.first/count on the split front.
+Port of zortos293/Eglantine 7e2a9fe (split-front part; UsageTracker is already here). The front still
+sent writes the back ignores: draw.end while the draw manager is in DrawMode::Instance (DrawEnd
+draws nothing), and vertex_buffer.first/count with an unchanged value (they flush no deferred draw
+and are only read by the draw manager). FrontState tracks the instance loop from draw.begin's
+instance id (First leaves, Subsequent enters) and clears it on inline index methods; the multi-word
+path tracks every word, like the back's per-word DrawBegin, and uses the replayed value. Only with
+skip_same and an unchanged shadow; index_buffer.first/count are never skipped (they mark the index
+buffer dirty). The non-split CallMethod path is unchanged. Upstream's FPS figure is not measured here.
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -939,6 +939,8 @@
+     /// then can it have a deferred instanced draw to issue at the end of a macro.
+     bool draw_pending{true};
+     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
++    /// The back's draw manager is in an instance loop (DrawMode::Instance): draw.end does nothing.
++    bool instance_loop{};
+ };
+ 
+ namespace {
+@@ -1047,6 +1049,12 @@
+         fs.control_writes[fs.control_count++ % fs.control_writes.size()] = {
+             argument, static_cast<u32>(fs.control), from_macro ? 2U : 1U};
+     }
++    if (execution_mask[method] && FrontSkipsLoopWrite(fs, method, value, shadow_kept)) {
++        if (Profile::Enabled()) [[unlikely]] {
++            Profile::Add(Profile::Counter::SameValueWrites, 1);
++        }
++        return;
++    }
+     if (!execution_mask[method]) {
+         // Nothing would change on the back: CallMethod and ConsumeSinkImpl skip same-value state
+         // writes, and the shadow RAM (tracked by default) holds the value already.
+@@ -1145,6 +1153,7 @@
+                 method == MAXWELL3D_REG_INDEX(inline_index_2x16.even) ||
+                 method == MAXWELL3D_REG_INDEX(inline_index_4x8.index0)) &&
+                fs.control != Regs::ShadowRamControl::Replay) {
++        FrontTrackInstanceLoop(fs, method, 0);
+         if (amount != 0) {
+             const u32 last = base_start[amount - 1];
+             if (tracked()) {
+@@ -1169,6 +1178,7 @@
+                 value = fs.shadow[method];
+             }
+             fs.regs[method] = value;
++            FrontTrackInstanceLoop(fs, method, value); // DrawBegin runs for every word
+             if (!execution_mask[method]) {
+                 continue;
+             }
+@@ -1206,6 +1216,45 @@
+     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
+ }
+ 
++void Maxwell3D::FrontTrackInstanceLoop(FrontState& fs, u32 method, u32 value) {
++    switch (method) {
++    case MAXWELL3D_REG_INDEX(draw.begin):
++        // Instance id, bits 27:26: First leaves an instance loop, Subsequent enters one.
++        if (((value >> 26) & 3) == 0) {
++            fs.instance_loop = false;
++        } else if (((value >> 26) & 3) == 1) {
++            fs.instance_loop = true;
++        }
++        break;
++    case MAXWELL3D_REG_INDEX(draw_inline_index):
++    case MAXWELL3D_REG_INDEX(inline_index_2x16.even):
++    case MAXWELL3D_REG_INDEX(inline_index_4x8.index0):
++        fs.instance_loop = false; // DrawMode::InlineIndex: draw.end draws
++        break;
++    default:
++        break;
++    }
++}
++
++bool Maxwell3D::FrontSkipsLoopWrite(FrontState& fs, u32 method, u32 value, bool shadow_kept) {
++    FrontTrackInstanceLoop(fs, method, value);
++    switch (method) {
++    case MAXWELL3D_REG_INDEX(draw.end):
++    case MAXWELL3D_REG_INDEX(vertex_buffer.first):
++    case MAXWELL3D_REG_INDEX(vertex_buffer.count):
++        break;
++    default:
++        return false;
++    }
++    if (!fs.skip_same || !shadow_kept || fs.regs[method] != value) {
++        return false;
++    }
++    // DrawEnd draws nothing in an instance loop, and vertex_buffer.first/count flush no deferred
++    // draw and are only read by the draw manager. index_buffer writes also mark the index buffer
++    // dirty, so they are always sent.
++    return method != MAXWELL3D_REG_INDEX(draw.end) || fs.instance_loop;
++}
++
+ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
+                               FrontState& fs) {
+ #if defined(ARCHITECTURE_x86_64) && !defined(EDEN_NX2_PS5_PROTO)
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3376,6 +3376,8 @@
+     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                     bool is_last_call, bool from_macro);
+     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
++    void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);
++    bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
+     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 count);
+     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
+     void FinishFrontMacro(Core::System& system);
