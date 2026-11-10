@@ -23,6 +23,7 @@ python3 tests-nx2/check-vulkan-port-anchors.py
 python3 tests-nx2/check-generated-sources-built.py
 python3 tests-nx2/check-staging-idle-trim.py
 python3 tests-nx2/check-astc-per-layer-decode.py
+python3 tests-nx2/check-cheaper-astc-uploads.py
 python3 tests-nx2/check-converted-upload-chunks.py
 python3 tests-nx2/check-batched-vulkan-submissions.py
 python3 tests-nx2/check-graphics-usage-reserve.py
