@@ -15,6 +15,12 @@ whole-copy search, the upload, the scaling and every copy) and util.cpp's Copies
    or the memory manager keep the upload, pages written only by images do not (this core's
    GpuWrittenPages gets a second bitmap for it); non-Switch 2 titles, Sparse, Unbacked, Remapped
    images and images with dirty layers keep it;
+ - UB-150 (layer 99zzzz7): a join whose non-alias, GPU-modified, 1-sample overlaps together write every
+   level and layer (each its own layer or mip; MarkSubresourcesWrittenWhole accumulates) also skips the
+   upload; one layer missing, a partial extent or offset, another or a compressed format, Rescaled,
+   TrimmedLevels, Sparse or Unbacked images, CPU-only or multisampled overlaps, an overlap TryFindBase
+   cannot place, and a rescaled or multisampled join keep it. Negative control: a tree with 99zzzz3
+   but not 99zzzz7 uploads in the multi-image cases (and MarkSubresourcesWrittenWhole is absent);
  - a join whose alias copy writes every mip, layer and texel of a fully backed 1x image of the same
    uncompressed format makes neither the upload nor the alias copies before that copy (the images
    end with the same contents); partial copies of any kind, scaling, compressed formats, Rescaled,
@@ -105,6 +111,10 @@ if stale_marker in refresh_text:
 else:
     stale_block = ''   # main: every refresh uploads
 
+mark_whole = function(util, 'void MarkSubresourcesWrittenWhole(', required=False)
+if not mark_whole:
+    mark_whole = ('void MarkSubresourcesWrittenWhole(const ImageBase&, const ImageBase&, '
+                  'std::span<const ImageCopy>, std::span<u8>) {}\n')   # 99zzzz3 and main: no accumulation
 whole_copy = function(util, 'bool CopiesWriteWholeImage(', required=False)
 if not whole_copy:
     whole_copy = ('bool CopiesWriteWholeImage(const ImageBase&, const ImageBase&, '
@@ -171,6 +181,7 @@ struct ImageInfo {
     SubresourceExtent resources{};
     u32 num_samples = 1;
     u64 guest_size = 0;   // bytes SwizzleImage writes back
+    std::vector<ImageCopy> shrink;   // test hook: what MakeShrinkImageCopies returns for this overlap
 };
 struct AliasedImage { std::vector<ImageCopy> copies; ImageId id; };
 struct JoinCopy { bool is_alias; ImageId id; };
@@ -189,16 +200,17 @@ struct ImageBase {
     bool registered = false;
     std::map<std::pair<s32, s32>, int> cells;   // (level, layer) -> content token
     bool IsSafeGpuCopy() const noexcept { return safe_copy; }
-    std::optional<SubresourceBase> TryFindBase(GPUVAddr) const noexcept { return SubresourceBase{}; }
+    bool has_base = true;
+    std::optional<SubresourceBase> TryFindBase(GPUVAddr) const noexcept { return has_base ? std::optional<SubresourceBase>(SubresourceBase{}) : std::nullopt; }
     template <class M, class C> void DownloadMemory(M&, const C&) {}
 };
 using Image = ImageBase;
 ''' + function(util, 'constexpr u32 AdjustMipSize(u32 size, u32 level) {') \
     + function(util, 'constexpr Extent3D AdjustMipSize(Extent3D size, s32 level) {') \
-    + function(util, 'Extent3D MipSize(Extent3D size, u32 level) {') + whole_copy + r'''
+    + function(util, 'Extent3D MipSize(Extent3D size, u32 level) {') + mark_whole + whole_copy + r'''
 template <class T> T FixSmallVectorADL(T value) { return value; }
 inline std::vector<int> FullDownloadCopies(const ImageInfo&) { return {0}; }
-inline std::vector<ImageCopy> MakeShrinkImageCopies(const ImageInfo&, const ImageInfo&, SubresourceBase, u32, u32) { return {ImageCopy{}}; }
+inline std::vector<ImageCopy> MakeShrinkImageCopies(const ImageInfo&, const ImageInfo& overlap, SubresourceBase, u32, u32) { return overlap.shrink.empty() ? std::vector<ImageCopy>{ImageCopy{}} : overlap.shrink; }
 inline void InvalidateAsyncDecode(ImageBase&) noexcept {}
 
 struct MockGpuMemory {
@@ -680,6 +692,39 @@ struct Join {
         c.join_copies_to_do.push_back(JoinCopy{true, ImageId{index}});
         return index;
     }
+    // One layer of one level, written whole (or short of a texel column when !full).
+    ImageCopy layer_copy(s32 level, s32 layer, bool full = true) const {
+        ImageCopy copy = level_copy(level, full);
+        copy.src_subresource = {level, 0, 1};
+        copy.dst_subresource = {level, layer, 1};
+        return copy;
+    }
+    // A GPU-modified, non-alias overlap whose shrink copies are `shrink`; returns its slot index.
+    u32 overlap(u64 tick, std::vector<ImageCopy> shrink, ImageFlagBits flags = ImageFlagBits::None, bool base = true) {
+        Image o;
+        const u32 index = u32(c.slot_images.v.size());
+        o.gpu_addr = 0x100 + index;
+        o.info = new_info;
+        o.info.shrink = std::move(shrink);
+        o.flags = ImageFlagBits::GpuModified | ImageFlagBits::Tracked | flags;
+        o.registered = true;
+        o.cpu_addr = 0x200000 + index * 0x1000;
+        o.cpu_addr_end = o.cpu_addr + 0x1000;
+        o.guest_size_bytes = 0x1000;
+        o.modification_tick = tick;
+        o.has_base = base;
+        c.slot_images.v.push_back(o);
+        c.join_copies_to_do.push_back(JoinCopy{false, ImageId{index}});
+        return index;
+    }
+    // Every layer of every level as its own overlap, except the (level, layer) pairs in `skip`.
+    void per_layer_overlaps(std::vector<std::pair<s32, s32>> skip = {}) {
+        u64 tick = 1;
+        for (s32 level = 0; level < new_info.resources.levels; ++level)
+            for (s32 layer = 0; layer < new_info.resources.layers; ++layer)
+                if (std::find(skip.begin(), skip.end(), std::pair<s32, s32>{level, layer}) == skip.end())
+                    overlap(tick++, {layer_copy(level, layer)});
+    }
     void run() {
         c.ops.clear();
         c.JoinTail(image(), ImageId{0}, new_info, rescale, clear);
@@ -876,6 +921,154 @@ static void whole_copy_helper() {
     check(CopiesWriteWholeImage(dst, src, bigger), "a copy larger than the image is still whole");
 }
 
+static void multi_image_copies() {
+    {   // Several GPU-modified images each write one layer (and level): together whole, so no upload.
+        Join j;
+        j.per_layer_overlaps();
+        j.run();
+        expect(j.c.uploads, 0, "layer overlaps covering the image: uploads");
+        check(has(j.c.ops, "shrink 257") && has(j.c.ops, "shrink 262"), "every overlap is still copied");
+        check(False(j.image().flags & ImageFlagBits::CpuModified), "layer overlaps: the image is not CpuModified");
+        check(True(j.image().flags & ImageFlagBits::Tracked), "layer overlaps: the image is tracked");
+        check(True(j.image().flags & ImageFlagBits::GpuModified), "layer overlaps: the image is GpuModified");
+        check(has(j.c.ops, "transition") && !has(j.c.ops, "upload"), "layer overlaps: transitioned, not uploaded");
+    }
+    {   // The same split across mips of one layer set: two overlaps, each a whole level over all layers.
+        Join j;
+        j.overlap(1, {j.level_copy(0, true)});
+        j.overlap(2, {j.level_copy(1, true)});
+        j.run();
+        expect(j.c.uploads, 0, "one overlap a mip: uploads");
+    }
+    {   // One layer missing: the upload stays.
+        Join j;
+        j.per_layer_overlaps({{1, 2}});
+        j.run();
+        expect(j.c.uploads, 1, "one layer missing: uploads");
+        Join k;
+        k.per_layer_overlaps({{0, 1}});
+        k.run();
+        expect(k.c.uploads, 1, "another layer missing: uploads");
+    }
+    {   // Partial extent, offset, other format, compressed: no mark.
+        Join j;
+        j.per_layer_overlaps({{1, 0}});
+        j.overlap(9, {j.layer_copy(1, 0, false)});
+        j.run();
+        expect(j.c.uploads, 1, "a partial extent: uploads");
+        Join o;
+        o.per_layer_overlaps({{1, 0}});
+        ImageCopy moved = o.layer_copy(1, 0);
+        moved.dst_offset = {1, 0, 0};
+        o.overlap(9, {moved});
+        o.run();
+        expect(o.c.uploads, 1, "a copy at an offset: uploads");
+        Join f;
+        f.per_layer_overlaps();
+        f.c.slot_images.v[3].info.format = PixelFormat::R32_FLOAT;
+        f.run();
+        expect(f.c.uploads, 1, "one overlap of another format: uploads");
+        Join b;
+        b.new_info.format = PixelFormat::BC1_RGBA_UNORM;
+        b.image().info.format = PixelFormat::BC1_RGBA_UNORM;
+        b.per_layer_overlaps();
+        b.run();
+        expect(b.c.uploads, 1, "a compressed format: uploads");
+    }
+    {   // Source and destination flags: Rescaled, TrimmedLevels, Unbacked, Sparse.
+        for (const ImageFlagBits flag : {ImageFlagBits::Rescaled, ImageFlagBits::TrimmedLevels, ImageFlagBits::Unbacked, ImageFlagBits::Sparse}) {
+            Join s;
+            s.per_layer_overlaps();
+            s.c.slot_images.v[2].flags |= flag;
+            s.run();
+            expect(s.c.uploads, 1, "a rescaled, trimmed, unbacked or sparse overlap: uploads");
+            Join d;
+            d.image().flags |= flag;
+            d.per_layer_overlaps();
+            d.run();
+            expect(d.c.uploads, 1, "a rescaled, trimmed, unbacked or sparse new image: uploads");
+        }
+    }
+    {   // Overlaps that do not count: not GPU-modified, multisampled, no base, other type; a rescaled join.
+        Join a;
+        a.per_layer_overlaps();
+        a.c.slot_images.v[2].flags &= ~ImageFlagBits::GpuModified;
+        a.run();
+        expect(a.c.uploads, 1, "a CPU-only overlap does not count: uploads");
+        Join m;
+        m.per_layer_overlaps();
+        m.c.slot_images.v[2].info.num_samples = 4;
+        m.run();
+        expect(m.c.uploads, 1, "a multisampled overlap does not count: uploads");
+        Join b;
+        b.per_layer_overlaps();
+        b.c.slot_images.v[2].has_base = false;
+        b.run();
+        expect(b.c.uploads, 1, "an overlap without a base is skipped, not crashed on: uploads");
+        Join t;
+        t.per_layer_overlaps();
+        t.c.slot_images.v[2].info.type = ImageType::e3D;
+        t.run();
+        expect(t.c.uploads, 1, "a 3D overlap does not count: uploads");
+        Join r;
+        r.rescale = true;
+        r.per_layer_overlaps();
+        r.run();
+        expect(r.c.uploads, 1, "a rescaled join: uploads");
+        Join n;
+        n.new_info.num_samples = 4;
+        n.image().info.num_samples = 4;
+        n.per_layer_overlaps();
+        n.run();
+        expect(n.c.uploads, 1, "a multisampled join: uploads");
+    }
+    {   // An alias copy that is whole keeps its own path; a clear keeps its own handling.
+        Join j;
+        j.per_layer_overlaps({{1, 2}});
+        j.alias(20, j.whole());
+        j.run();
+        expect(j.c.uploads, 0, "whole alias copy with partial overlaps: uploads");
+        Join k;
+        k.clear = true;
+        k.per_layer_overlaps();
+        k.run();
+        expect(k.c.uploads, 0, "a clear: uploads");
+        check(has(k.c.ops, "transition"), "a clear: transitioned");
+    }
+    {   // Overlaps and a partial alias copy together cover the image: the alias still copies, no upload.
+        Join j;
+        j.per_layer_overlaps({{0, 0}});
+        j.alias(20, {j.layer_copy(0, 0)});
+        j.run();
+        expect(j.c.uploads, 1, "a partial alias copy is not an overlap's mark: uploads");
+    }
+}
+
+static void mark_helper() {
+    Join j(1, 3, 5, 4);
+    const ImageBase& dst = j.image();
+    Join src_join(1, 3, 5, 4);
+    src_join.alias(1, {});
+    const ImageBase& src = src_join.c.slot_images.v[1];
+    std::vector<u8> written(3);
+    MarkSubresourcesWrittenWhole(dst, src, std::vector<ImageCopy>{j.layer_copy(0, 0)}, written);
+    MarkSubresourcesWrittenWhole(dst, src, std::vector<ImageCopy>{j.layer_copy(0, 2)}, written);
+    check(written == std::vector<u8>{1, 0, 1}, "marks add up over several calls");
+    Join other(1, 3, 5, 4);
+    other.alias(1, {});
+    other.c.slot_images.v[1].info.format = PixelFormat::R32_FLOAT;
+    MarkSubresourcesWrittenWhole(dst, other.c.slot_images.v[1], std::vector<ImageCopy>{j.layer_copy(0, 1)}, written);
+    check(written == std::vector<u8>{1, 0, 1}, "another format sets nothing");
+    MarkSubresourcesWrittenWhole(dst, src, std::vector<ImageCopy>{j.layer_copy(0, 1, false)}, written);
+    check(written == std::vector<u8>{1, 0, 1}, "a partial extent sets nothing");
+    MarkSubresourcesWrittenWhole(dst, src, std::vector<ImageCopy>{j.layer_copy(0, 1)}, written);
+    check(written == std::vector<u8>{1, 1, 1}, "the missing layer completes it");
+    check(CopiesWriteWholeImage(dst, src, std::vector<ImageCopy>{j.layer_copy(0, 0), j.layer_copy(0, 1), j.layer_copy(0, 2)}),
+          "CopiesWriteWholeImage: layer copies of one source add up");
+    check(!CopiesWriteWholeImage(dst, src, std::vector<ImageCopy>{j.layer_copy(0, 0), j.layer_copy(0, 2)}),
+          "CopiesWriteWholeImage: a layer missing");
+}
+
 int main() {
     gpu_written_pages();
     stale_marking();
@@ -883,6 +1076,8 @@ int main() {
     stale_clearing();
     join_copies();
     whole_copy_helper();
+    mark_helper();
+    multi_image_copies();
     std::puts(failures ? "Stale texture uploads FAILED" : "Stale texture uploads: PASS");
     return failures ? 1 : 0;
 }
@@ -909,6 +1104,8 @@ if not source_only:
 require(have_stale_pages, 'stale_pages.h is missing')
 require(have_non_image, 'GpuWrittenPages has no MarkImage / AnyNonImage')
 require('CopiesWriteWholeImage(' in util, 'util.cpp has no CopiesWriteWholeImage')
+require('MarkSubresourcesWrittenWhole(' in util and 'MarkSubresourcesWrittenWhole(' in (src / 'video_core/texture_cache/util.h').read_text(),
+        'UB-150: util has no MarkSubresourcesWrittenWhole')
 require('CopiesWriteWholeImage(' in (src / 'video_core/texture_cache/util.h').read_text(), 'util.h does not declare it')
 
 collector = function(cache, 'void TextureCache<P>::RunGarbageCollector() {')
@@ -977,6 +1174,14 @@ if 'const auto alias_copy' in join:
             'the upload precedes the alias bookkeeping it depends on')
     require(in_order(join, 'std::ranges::sort(join_copies_to_do', 'const auto alias_copy'), 'the copies are not sorted first')
     require('!can_rescale && index-- > 0' in join, 'the whole-copy search is not 1x only')
+if 'MarkSubresourcesWrittenWhole(' in join:
+    require(in_order(join, 'CopiesWriteWholeImage(new_image', 'MarkSubresourcesWrittenWhole(new_image', 'if (overwritten_by_clear()) {'),
+            'UB-150: the accumulation follows the alias search and precedes the upload')
+    require('!can_rescale && !copied_whole && new_info.num_samples == 1' in join, 'UB-150: the accumulation is not 1x only')
+    accumulation = join[join.index('!can_rescale && !copied_whole'):]
+    accumulation = accumulation[:accumulation.index('copied_whole = std::ranges::all_of')]
+    require('.value()' not in accumulation and 'if (!base)' in accumulation, 'UB-150: the accumulation does not skip an overlap without a base')
+require('MarkSubresourcesWrittenWhole(' in join, 'UB-150: JoinImages does not accumulate copies from several images')
 require('runtime.FlushDeferredClear();' in function(cache, 'void TextureCache<P>::CopyImage('), '99zw\'s deferred clear flush is gone')
 require('Settings::values.gpu_unswizzle_enabled' in refresh, 'RefreshContents changed beyond the stale skip')
 print('Source checks ' + ('FAILED' if failed else 'PASS'))
