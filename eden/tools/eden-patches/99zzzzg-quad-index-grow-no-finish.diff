@@ -1,0 +1,41 @@
+Quad index buffer: grow without scheduler.Finish(), by at least 1.5x.
+Port of zortos293/Eglantine 0a619ea (#414, from Hydro74000/Edlws 034668a). QuadIndexBuffer::UpdateBuffer
+called scheduler.Finish() and set num_indices to the exact request. The old buffer is now moved into
+retired_buffers with scheduler.CurrentTick() and dropped by a later UpdateBuffer once IsFree(tick);
+commands already recorded may still use it. num_indices = max(request, old + old / 2), so a creeping
+draw count does not reallocate every time. Upstream saw a ~150 ms stall here mid-load; not measured on
+this port. Other Finish call sites are untouched.
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+@@ -168,13 +168,21 @@
+     virtual ~QuadIndexBuffer() = default;
+ 
+     void UpdateBuffer(u32 num_indices_) {
++        while (!retired_buffers.empty() && scheduler.IsFree(retired_buffers.front().first)) {
++            retired_buffers.erase(retired_buffers.begin());
++        }
+         if (num_indices_ <= num_indices) {
+             return;
+         }
+ 
+-        scheduler.Finish();
++        // Commands recorded so far may still use the old buffer: it stays until the GPU is past
++        // them. Waiting for the GPU here stalled the thread ~150 ms in the middle of a load.
++        if (buffer) {
++            retired_buffers.emplace_back(scheduler.CurrentTick(), std::move(buffer));
++        }
+ 
+-        num_indices = num_indices_;
++        // Grown by at least half, so that a draw count creeping up doesn't redo this every time.
++        num_indices = (std::max)(num_indices_, num_indices + num_indices / 2);
+         index_type = IndexTypeFromNumElements(device, num_indices);
+ 
+         const u32 num_quads = GetQuadsNum(num_indices);
+@@ -265,6 +273,7 @@
+     StagingBufferPool& staging_pool;
+ 
+     vk::Buffer buffer{};
++    std::vector<std::pair<u64, vk::Buffer>> retired_buffers; ///< GPU tick that frees each one
+     MemoryCommit memory_commit{};
+     VkIndexType index_type{};
+     u32 num_indices = 0;
