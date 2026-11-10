@@ -1,0 +1,36 @@
+Pending-channel waits: 50 us polls after the 500 us yield window, 1 ms after 2 s.
+Residual of zortos293/Eglantine acb9c18 (#446). Main already yields for the first 500 us since the
+last progress and then waits with state.queue.PopWaitFor(next, 250 us), which a new command wakes
+early. The wait is now 50 us (Ocarina of Time waits here ~330 times a second and its present waits
+for the work behind the semaphore; upstream desktop saw ~17 ms a frame fall to ~1 ms), and a channel
+still waiting 2 s after its last progress (menus, loading) polls every 1 ms so it does not spin at
+50 us forever. PopWaitFor is kept, not a sleep_for. No prctl/timer slack: this build targets
+PS5/FreeBSD. Timer granularity there is not measured.
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -83,15 +83,20 @@
+                     // The CPU usually releases the semaphore soon after: poll for half a
+                     // millisecond before sleeping, or every wait also waits out a host sleep.
+                     Profile::Scope scope{Profile::Zone::PendingSleep};
+-                    if (std::chrono::steady_clock::now() - last_progress <
+-                        std::chrono::microseconds{500}) {
++                    const auto waited = std::chrono::steady_clock::now() - last_progress;
++                    if (waited < std::chrono::microseconds{500}) {
+                         std::this_thread::yield();
+                         continue;
+                     }
+                     // Then sleep until the CPU submits more work, polling the semaphores every
+-                    // quarter millisecond (a release is a plain guest memory write that wakes
+-                    // nothing). A fixed 1 ms sleep let new submissions wait out the rest of it.
+-                    if (!state.queue.PopWaitFor(next, std::chrono::microseconds{250})) {
++                    // 50 us (a release is a plain guest memory write that wakes nothing; Ocarina
++                    // of Time waits here ~330 times a second and its present waits for the work
++                    // behind them). A channel still waiting after 2 s (menus, loading) goes back
++                    // to 1 ms. A fixed sleep let new submissions wait out the rest of it.
++                    const auto poll = waited < std::chrono::seconds{2}
++                                          ? std::chrono::microseconds{50}
++                                          : std::chrono::microseconds{1000};
++                    if (!state.queue.PopWaitFor(next, poll)) {
+                         continue;
+                     }
+                 }
