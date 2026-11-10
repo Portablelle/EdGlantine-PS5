@@ -36,6 +36,7 @@ python3 tests-nx2/check-suspended-channel-poll.py
 python3 tests-nx2/check-skip-empty-draws.py
 python3 tests-nx2/check-inline-page-writes.py
 python3 tests-nx2/check-quad-index-grow-no-finish.py
+python3 tests-nx2/check-must-flush-unlocked.py
 python3 tests-nx2/check-mapped-upload-barrier.py
 python3 tests-nx2/check-bound-compute-storage-writes.py
 python3 tests-nx2/check-readback-refusal.py
