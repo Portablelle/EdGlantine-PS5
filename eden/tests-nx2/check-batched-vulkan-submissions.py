@@ -3,7 +3,8 @@
 Compiles the production GpuSplit (gpu_split.cpp/.h from SOURCE_DIR, desktop and
 EDEN_NX2_PS5_PROTO builds, split-observer-stubs for its dependencies) with production
 Scheduler::Flush / DeferFlush / FlushDeferred / WaitSubmitted, InnerFence::Queue / Wait,
-RasterizerVulkan::FlushCommands and its SetSubmitHook statement, FenceManager::SubmitDeferredWork,
+RasterizerVulkan::FlushCommands / FlushQueryResults and its SetSubmitHook statement,
+FenceManager::SubmitDeferredWork,
 the WaitPendingFences statements between SignalFence and the wait, Maxwell3D::FrontDmaRead and the
 Maxwell3D / KeplerCompute handback (first statement of ConsumeSinkImpl / CallMethod /
 CallMultiMethod, ReleaseFront) into a recording fixture. SubmitExecution aborts if two threads are
@@ -16,6 +17,8 @@ submitted. On the real back thread it checks:
 - InnerFence::Wait on another thread does not return before its tick is submitted while the back
   runs a 2.5 s entry (55274de: no 2 s give-up), and never submits itself;
 - WaitPendingFences on the back does not deadlock behind its own deferred flush (79f284e part);
+- a pending host query read uses the real FlushQueryResults wait and sees the report before
+  returning, without a buffer download submitting the deferred work for it;
 - FrontDmaRead's buffer/query flush runs on the back, not the front (9960298);
 - an engine method off the back hands the macros and shadow RAM back, before ConsumeSinkImpl
   applies sunk writes, and not on the back (d1de145);
@@ -94,6 +97,7 @@ defer = function(scheduler_cpp, 'bool Scheduler::DeferFlush()', optional=True)
 flush_deferred = function(scheduler_cpp, 'void Scheduler::FlushDeferred()', optional=True)
 wait_submitted = function(scheduler_cpp, 'bool Scheduler::WaitSubmitted(', optional=True)
 flush_commands = function(raster_cpp, 'void RasterizerVulkan::FlushCommands()')
+flush_query_results = function(raster_cpp, 'void RasterizerVulkan::FlushQueryResults(')
 pending = function(fence_h, 'void WaitPendingFences(')
 after_signal = pending.split('SignalFence(std::move(func));', 1)[1].split(
     'std::unique_lock lk(wait_mutex);', 1)[0]
@@ -124,6 +128,9 @@ def source_checks():
     assert 'if (!scheduler.DeferFlush()) {\n        scheduler.Flush();' in flush_commands
     assert '!VideoCommon::GpuSplit::OnBackThread()' in fence_wait and 'WaitSubmitted' in fence_wait
     assert 'SubmitDeferredWork();' in after_signal
+    assert flush_query_results.index('fence_manager.SignalFence([] {});') < \
+        flush_query_results.index('scheduler.FlushDeferred();') < \
+        flush_query_results.index('std::unique_lock lock{state->mutex};')
     assert 'virtual void SubmitDeferredWork() {}' in fence_h
     assert 'scheduler.FlushDeferred();' in submit_deferred
     assert 'FlushDeferred(); }, &scheduler);' in hook_install
@@ -161,6 +168,11 @@ def source_checks():
     # 9479d8f has no target here: Step never drains before an entry (99zzzt1/t2 reads stay).
     assert '.Drain()' not in function(dma_cpp, 'bool DmaPusher::Step()')
     assert 'EDEN_NX2_FETCH_DRAIN' not in dma_cpp
+    # PS5's generated GPU shutdown and destructors call the native front's Stop directly.
+    native = (root / 'headless/native_gpu_thread.inc').read_text()
+    stop = function(native, 'void ThreadManager::Stop()')
+    assert stop.index('pthread_join(thread, nullptr)') < \
+        stop.index('VideoCommon::GpuSplit::Get().Stop();')
     # Wiring.
     run = (root / 'tests-nx2/run.sh').read_text().splitlines()
     at = run.index('python3 tests-nx2/check-converted-upload-chunks.py')
@@ -183,13 +195,16 @@ fixture = r'''
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -200,9 +215,10 @@ fixture = r'''
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_profile.h"
 using s64 = int64_t;
+using DAddr = u64;
 using VkSemaphore = u64;
-#define CHECK(cond, message) do { if (!(cond)) { \
-    std::fprintf(stderr, "UB-042 FAIL: %s (%s)\n", message, #cond); std::exit(1); } } while (0)
+[[noreturn]] void Fail(const char* message);
+#define CHECK(cond, message) do { if (!(cond)) Fail(message " (" #cond ")"); } while (0)
 using Clock = std::chrono::steady_clock;
 
 namespace VideoCommon::Nx2Profile {
@@ -220,6 +236,14 @@ std::mutex g_mutex;
 std::map<u64, bool> g_on_back; // tick -> submitted on the back
 std::atomic<int> g_in_submit{};
 std::atomic<unsigned> g_submits{};
+
+[[noreturn]] void Fail(const char* message) {
+    std::fprintf(stderr, "UB-042 FAIL: %s\n", message);
+    // Back-entry failures propagate through CheckFailure to main, which stops and joins.
+    if (std::this_thread::get_id() == g_back_id) throw std::runtime_error(message);
+    VideoCommon::GpuSplit::Get().Stop();
+    std::exit(1);
+}
 
 struct MasterSemaphore {
     std::atomic<u64> current_tick{1}, gpu_tick{0};
@@ -278,11 +302,44 @@ struct InnerFence {
     void Queue();
     void Wait();
 };
+struct QueryCacheModel {
+    std::atomic<bool> pending{};
+    std::atomic<u32> guest_report{};
+    bool SemiFlushRegion(DAddr, u64) { return pending.load(); }
+};
+struct RasterizerVulkan;
+struct QueryFenceManager {
+    Scheduler& scheduler;
+    QueryCacheModel& query_cache;
+    RasterizerVulkan& rasterizer;
+    std::function<void()> operation;
+    std::thread worker;
+    bool deferred_before_wait{};
+    void SyncOperation(std::function<void()> op) { operation = std::move(op); }
+    void SignalFence(std::function<void()> func);
+};
 struct RasterizerVulkan {
     Scheduler& scheduler;
     u32 draw_counter{};
+    QueryCacheModel query_cache;
+    QueryFenceManager fence_manager{scheduler, query_cache, *this};
     void FlushCommands();
+    void FlushQueryResults(DAddr addr, u64 size);
 };
+void QueryFenceManager::SignalFence(std::function<void()> func) {
+    // A nonstub fence with host query results: queue and flush through production methods.
+    InnerFence fence{scheduler};
+    fence.Queue();
+    rasterizer.FlushCommands();
+    deferred_before_wait = !scheduler.IsSubmitted(fence.wait_tick);
+    func(); // Fast accuracy runs the fence's immediate callback here.
+    worker = std::thread([this, fence, op = std::move(operation)]() mutable {
+        fence.Wait();
+        query_cache.guest_report = 42; // PopAsyncFlushes precedes SyncOperation callbacks.
+        query_cache.pending = false;
+        op();
+    });
+}
 struct FenceManager {
     Scheduler& scheduler;
     void SubmitDeferredWork();
@@ -371,6 +428,7 @@ struct Context {
     bool entry_pending{};
     bool deadlock_free{};
     bool back_kept_front{};
+    u32 query_read{};
     std::atomic<bool> fencing_go{}, fencing_done{}, entry_ran{};
 };
 Context* g;
@@ -383,7 +441,7 @@ void ArmFront(MaxwellModel& m) {
     m.front_macros = true;
 }
 
-int main(int argc, char** argv) {
+int Run(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "batched";
     setenv("EDEN_NX2_SPLIT", "1", 1);
     Settings::high = false;
@@ -514,6 +572,23 @@ int main(int argc, char** argv) {
     waiter.join();
     CHECK(context.deadlock_free, "WaitPendingFences on the back blocked behind its own deferred flush");
 
+    // Query-only macro DMA read: no buffer download can submit work on this path.
+    split.Defer([] {
+        g->scheduler.Flush();
+        g->raster.query_cache.pending = true;
+        g->raster.query_cache.guest_report = 0;
+        g->raster.draw_counter = 1;
+        g->raster.FlushQueryResults(0x100, sizeof(u32));
+        // Capture while still inside the entry: a later idle-hook submission is too late.
+        g->query_read = g->raster.query_cache.guest_report.load();
+    });
+    split.Drain();
+    context.raster.fence_manager.worker.join();
+    CHECK(context.raster.fence_manager.deferred_before_wait,
+          "the query test did not exercise a deferred host query fence");
+    CHECK(context.query_read == 42,
+          "FlushQueryResults returned stale data before submitting its deferred query fence");
+
     // FrontDmaRead: the buffer and query flushes run on the back.
     DmaReadModel dma;
     dma.native_data_ram.resize(16);
@@ -580,12 +655,19 @@ int main(int argc, char** argv) {
               compute.native_macro == &macro && (compute.native_parameters == std::vector<u32>{1, 2}),
           "a compute method off the back kept the macros on the stopped split's front");
     std::puts("UB042_BATCHED_OK");
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    try { return Run(argc, argv); }
+    catch (const std::exception& error) { Fail(error.what()); }
 }
 '''
 
 production = [
     define(flush, 'u64 Scheduler::Flush(', 'u64 Scheduler::Flush('),
     defer, flush_deferred, wait_submitted, fence_queue, fence_wait, flush_commands,
+    flush_query_results,
     submit_deferred or 'void FenceManager::SubmitDeferredWork() {}',
     'void FenceManager::AfterSignalFence() {' + after_signal + '}',
     define(front_dma, 'Maxwell3D::', 'DmaReadModel::'),

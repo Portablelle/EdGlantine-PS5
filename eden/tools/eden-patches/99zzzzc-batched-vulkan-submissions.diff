@@ -12,9 +12,9 @@ stops. back_quiet is cleared before entries run and set after the hook: Drain wa
 front never uses the scheduler while the back submits. The fencing thread no longer submits a
 deferred tick: WaitSubmitted asks the back and waits without a time limit while it runs (a long
 shader translation is not a reason to release downloads early); only a stopped back returns false.
-WaitPendingFences submits deferred work first on the back (else it waits for the fencing thread,
-which waits for that submission). Maxwell3D::FrontDmaRead flushes through Synchronize on the back
-instead of on the front after a drain. An engine method off the back with front_macros set (the
+WaitPendingFences and FlushQueryResults submit deferred work before waiting for the fencing
+thread (which can itself wait for that submission). Maxwell3D::FrontDmaRead flushes through
+Synchronize on the back instead of on the front after a drain. An engine method off the back with front_macros set (the
 split stopped) hands executing macro, parameters, shadow RAM and binds back to the engine, before
 ConsumeSinkImpl applies sunk writes. Not taken: 313463c list-copy batching (no Nx2CopyListPages
 here), 9479d8f (no drain before every entry on this tree; 99zzzt1/t2 front reads unchanged),
@@ -471,7 +471,17 @@ only from engines on the owner thread).
      staging_pool.reclaim = nullptr;
      scheduler.WaitWorker();
      scheduler.Finish();
-@@ -1889,7 +1892,11 @@ void RasterizerVulkan::FlushCommands() {
+@@ -1834,6 +1837,9 @@ void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
+         state->cv.notify_all();
+     });
+     fence_manager.SignalFence([] {});
++    // This thread owns deferred submissions; the fencing thread needs them before it can
++    // write the query results and run the callback we are about to wait for.
++    scheduler.FlushDeferred();
+     std::unique_lock lock{state->mutex};
+     if (!state->cv.wait_for(lock, std::chrono::milliseconds{200},
+                             [&state] { return state->written; })) {
+@@ -1889,7 +1895,11 @@ void RasterizerVulkan::FlushCommands() {
          return;
      }
      draw_counter = 0;
