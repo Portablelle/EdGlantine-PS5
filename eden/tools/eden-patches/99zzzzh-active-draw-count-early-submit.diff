@@ -69,7 +69,7 @@ with a bounded EDEN_NX2_FLUSH_DRAWS override; dispatch cadence remains unchanged
 +    // FPS gain. Keep the check cadence separate from this submission threshold.
 +    static const u32 native_flush_draws = [] {
 +        constexpr u32 fallback = 512;
-+        static_assert(fallback % (CHECK_MASK + 1) == 0);
++        static_assert(fallback % 32 == 0 && fallback % 4 == 0);
 +        const char* value = std::getenv("EDEN_NX2_FLUSH_DRAWS");
 +        if (value == nullptr || value[0] < '0' || value[0] > '9') {
 +            return fallback;

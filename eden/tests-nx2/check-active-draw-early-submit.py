@@ -136,7 +136,7 @@ def source_checks():
     assert '#include "video_core/nx2.h"' in rast_text
     for part in ['std::getenv("EDEN_NX2_FLUSH_DRAWS")', "value[0] < '0'", "value[0] > '9'",
                  'std::strtoul(value, &end, 10)', "*end != '\\0' || parsed == 0",
-                 'static_assert(fallback % (CHECK_MASK + 1) == 0)',
+                 'static_assert(fallback % 32 == 0 && fallback % 4 == 0)',
                  '16 desktop dispatch intervals', "upstream's 128", '[32, 1048576]']:
         assert part in flush, part
     lines = (root / 'tests-nx2/run.sh').read_text().splitlines()
