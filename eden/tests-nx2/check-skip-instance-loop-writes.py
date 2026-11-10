@@ -49,15 +49,15 @@ def body(src, signature):
             return src[start:i]
 
 
-def extract(name):
-    sig = f'Maxwell3D::{name}('
+def extract(ret, name):
+    sig = f'{ret} Maxwell3D::{name}('
     if sig not in text:
         return None
-    return body(text, sig).replace('Maxwell3D::', '', 1)
+    return body(text, sig).replace('Maxwell3D::', '', 1)  # keeps the production return type
 
 
-track = extract('FrontTrackInstanceLoop')
-skips = extract('FrontSkipsLoopWrite')
+track = extract('void', 'FrontTrackInstanceLoop')
+skips = extract('bool', 'FrontSkipsLoopWrite')
 have = track is not None and skips is not None
 
 # Call-site placement in the production text (the harness models these).
@@ -77,7 +77,8 @@ if have:
     assert loop.index('fs.regs[method] = value;') < track_at < loop.index('if (!execution_mask[method])'), \
         'every word must be tracked with the resolved value before the mask check'
     # The non-split CallMethod path must not be filtered.
-    assert 'FrontSkipsLoopWrite' not in text.replace(skips, '').replace(write, '')
+    raw = body(text, 'bool Maxwell3D::FrontSkipsLoopWrite(')
+    assert text.replace(raw, '').replace(write, '').count('FrontSkipsLoopWrite') == 0
 
 if source_only:
     if not have:
@@ -221,8 +222,9 @@ int main() {
 '''
 out = root / 'build/nx2-tests'
 out.mkdir(parents=True, exist_ok=True)
-src = out / 'skip-instance-loop-writes.cpp'
+tag = 'prod' if have else 'main'  # the negative control must not overwrite the positive harness
+src = out / f'skip-instance-loop-writes-{tag}.cpp'
 src.write_text(harness)
-exe = out / 'skip-instance-loop-writes'
+exe = out / f'skip-instance-loop-writes-{tag}'
 subprocess.run(['clang++-18', '-std=c++20', '-O1', '-g', '-fsanitize=address,undefined', str(src), '-o', str(exe)], check=True)
 sys.exit(subprocess.run([str(exe)]).returncode)
