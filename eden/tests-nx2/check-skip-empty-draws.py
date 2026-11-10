@@ -84,6 +84,7 @@ struct Maxwell3D {
     struct Regs { struct { u32 count; } index_buffer; };
     struct DrawState {
         int topology = 0;
+        u32 draw_element_count = 0; // UB-013 records the active count before this guard.
         struct { u32 count = 0; } index_buffer;
         struct { u32 count = 0; } vertex_buffer;
     };

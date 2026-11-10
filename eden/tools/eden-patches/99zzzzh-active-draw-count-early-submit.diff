@@ -1,0 +1,91 @@
+UB-013: active draw count and separate Ampere early submission policy.
+Adapted from Djihads80/Eglantine 226162edf525f13bb0c1fa5c4788e510c474989d.
+Unknown indirect counts do not force synchronous pipelines. Ampere defaults to 512 draws,
+with a bounded EDEN_NX2_FLUSH_DRAWS override; dispatch cadence remains unchanged.
+--- a/src/video_core/engines/draw_manager.cpp
++++ b/src/video_core/engines/draw_manager.cpp
+@@ -282,6 +282,8 @@
+ }
+
+ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed, u32 instance_count) {
++    draw_state.draw_element_count =
++        draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
+     LOG_TRACE(HW_GPU, "called, topology={}, count={}", draw_state.topology, draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count);
+     UpdateTopology(maxwell3d);
+     if (maxwell3d.ShouldExecute()) {
+@@ -336,6 +338,7 @@
+ }
+
+ void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
++    draw_state.draw_element_count = 0;
+     LOG_TRACE(HW_GPU, "called, topology={}, is_indexed={}, includes_count={}, buffer_size={}, max_draw_count={}", draw_state.topology, indirect_state.is_indexed, indirect_state.include_count, indirect_state.buffer_size, indirect_state.max_draw_counts);
+     UpdateTopology(maxwell3d);
+     if (maxwell3d.ShouldExecute()) {
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3055,6 +3055,7 @@
+             Maxwell3D::Regs::PrimitiveTopology topology{};
+             DrawMode draw_mode{};
+             bool draw_indexed{};
++            u32 draw_element_count{}; // Zero means unknown (indirect), not a small quad.
+             u32 base_index{};
+             Maxwell3D::Regs::VertexBuffer vertex_buffer;
+             Maxwell3D::Regs::IndexBuffer index_buffer;
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -862,7 +862,7 @@
+     // Usually these shaders are only used once for building textures so we can assume they
+     // can't be built async
+     const auto& draw_state = maxwell3d->draw_manager.draw_state;
+-    if (draw_state.index_buffer.count <= 6 || draw_state.vertex_buffer.count <= 6) {
++    if (draw_state.draw_element_count != 0 && draw_state.draw_element_count <= 6) {
+         return pipeline;
+     }
+     // The draw is dropped until the pipeline exists. Native draws are dropped on purpose here, so the
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -64,6 +64,7 @@
+ #include "video_core/texture_cache/texture_cache_base.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
++#include "video_core/nx2.h"
+ #include "video_core/nx2_profile.h"
+ #include "video_core/gpu_written_pages.h"
+
+@@ -2049,10 +2050,32 @@
+ #endif // __ANDROID__
+
+     static_assert(DRAWS_TO_DISPATCH % (CHECK_MASK + 1) == 0);
+-    if ((++draw_counter & CHECK_MASK) != CHECK_MASK) {
+-        return;
+-    }
+-    if (draw_counter < DRAWS_TO_DISPATCH) {
++    if ((++draw_counter & CHECK_MASK) != 0) {
++        return;
++    }
++    // Submit earlier on Ampere so the host GPU can work while native recording continues.
++    // 512 draws = 16 desktop dispatch intervals: 8x sooner than 4096, but 4x the batching
++    // of upstream's 128 to limit submission overhead. This is a tuning default, not a measured
++    // FPS gain. Keep the check cadence separate from this submission threshold.
++    static const u32 native_flush_draws = [] {
++        constexpr u32 fallback = 512;
++        static_assert(fallback % (CHECK_MASK + 1) == 0);
++        const char* value = std::getenv("EDEN_NX2_FLUSH_DRAWS");
++        if (value == nullptr || value[0] < '0' || value[0] > '9') {
++            return fallback;
++        }
++        char* end = nullptr;
++        const unsigned long parsed = std::strtoul(value, &end, 10);
++        if (*end != '\0' || parsed == 0) {
++            return fallback;
++        }
++        // Clamp to [32, 1048576] draws; nonmultiples submit at the next cadence check.
++        return static_cast<u32>(std::clamp(parsed, 32UL, 1'048'576UL));
++    }();
++    const u32 flush_draws = Tegra::g_nx2_ampere.load(std::memory_order_relaxed)
++                               ? native_flush_draws
++                               : DRAWS_TO_DISPATCH;
++    if (draw_counter < flush_draws) {
+         scheduler.DispatchWork();
+         return;
+     }
