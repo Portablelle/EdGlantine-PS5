@@ -26,6 +26,7 @@ python3 tests-nx2/check-astc-per-layer-decode.py
 python3 tests-nx2/check-cheaper-astc-uploads.py
 python3 tests-nx2/check-converted-upload-chunks.py
 python3 tests-nx2/check-batched-vulkan-submissions.py
+python3 tests-nx2/check-skip-instance-loop-writes.py
 python3 tests-nx2/check-graphics-usage-reserve.py
 python3 tests-nx2/check-vram-reclaim.py
 python3 tests-nx2/check-feedback-alias-copies.py
