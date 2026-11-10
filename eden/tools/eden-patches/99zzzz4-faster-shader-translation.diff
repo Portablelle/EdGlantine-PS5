@@ -1,0 +1,281 @@
+Port the performance changes from zortos293/Eglantine@f8f29b576 (PR #71): use the
+ordered non-overlapping CFG block set for visited lookups, walk both siblings for order,
+and let the first worker or scheduler waiter claim a pipeline build. Graphics configuration
+is selected before the build can be observed as finished. Keep the existing completion and
+failed-pipeline paths. Skip rasterizer download/write operations for host pointers outside
+physical backing, logging only the first 16. Adapted over the effective memory/coherence
+layers; ApplyOpOnPointer for physical pointers is unchanged. No frame capture, timing trace,
+or unconditional slow-build logging is included.
+diff --git a/src/shader_recompiler/frontend/maxwell/control_flow.cpp b/src/shader_recompiler/frontend/maxwell/control_flow.cpp
+--- a/src/shader_recompiler/frontend/maxwell/control_flow.cpp
++++ b/src/shader_recompiler/frontend/maxwell/control_flow.cpp
+@@ -261,12 +261,13 @@
+ bool CFG::InspectVisitedBlocks(FunctionId function_id, const Label& label) {
+     const Location pc{label.address};
+     Function& function{functions[function_id]};
+-    const auto it{
+-        std::ranges::find_if(function.blocks, [pc](auto& block) { return block.Contains(pc); })};
+-    if (it == function.blocks.end()) {
++    // Blocks never overlap, so only the last one starting at or before pc can contain it.
++    auto it{function.blocks.upper_bound(pc, Compare{})};
++    if (it == function.blocks.begin() || !std::prev(it)->Contains(pc)) {
+         // Address has not been visited
+         return false;
+     }
++    --it;
+     Block* const visited_block{&*it};
+     if (visited_block->begin == pc) {
+         throw LogicError("Dangling block");
+diff --git a/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp b/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp
+--- a/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp
++++ b/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp
+@@ -299,13 +299,26 @@
+ }
+ 
+ bool AreOrdered(Node left_sibling, Node right_sibling) noexcept {
++    if (left_sibling == right_sibling) {
++        return false;
++    }
++    // Walk forward from both siblings at once: whichever meets the other or the end first
++    // decides, so the cost is the shorter walk instead of everything after right_sibling.
+     const Node end{right_sibling->up->children.end()};
+-    for (auto it = right_sibling; it != end; ++it) {
+-        if (it == left_sibling) {
++    for (Node left = left_sibling, right = right_sibling;;) {
++        if (++right == left_sibling) {
+             return false;
+         }
+-    }
+-    return true;
++        if (right == end) {
++            return true;
++        }
++        if (++left == right_sibling) {
++            return true;
++        }
++        if (left == end) {
++            return false;
++        }
++    }
+ }
+ 
+ bool NeedsLift(Node goto_stmt, Node label_stmt) noexcept {
+diff --git a/src/core/device_memory_manager.h b/src/core/device_memory_manager.h
+--- a/src/core/device_memory_manager.h
++++ b/src/core/device_memory_manager.h
+@@ -92,6 +92,11 @@
+         for (u32 value : buffer) {
+             operation((DAddr(value) << page_bits) + subbits);
+         }
++    }
++
++    /// Whether p points into the emulated physical memory, the only memory with device addresses.
++    bool IsPhysicalPointer(const u8* p) const {
++        return (GetRawPhysicalAddr(p) >> page_bits) < compressed_device_addr.size();
+     }
+ 
+     template <typename Func>
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -792,11 +792,32 @@
+         HandleRasterizerDownload(v_address, size);
+     }
+ 
++    /// A rasterizer-cached page whose host pointer is outside the emulated physical memory has no
++    /// device address to flush or invalidate (its lookup used to read far out of bounds).
++    void ReportForeignPointer(VAddr v_address, const u8* p) const {
++        static std::atomic<u32> reported{};
++        if (reported.fetch_add(1, std::memory_order_relaxed) >= 16) {
++            return;
++        }
++        const auto raw =
++            current_page_table->entries[(v_address & 0xffffffffffffULL) >> YUZU_PAGEBITS].Raw();
++        LOG_ERROR(HW_Memory,
++                  "Rasterizer access at {:#x}: host pointer {} is outside the emulated physical "
++                  "memory at {} (page type {}, block {})",
++                  v_address, fmt::ptr(p),
++                  fmt::ptr(system.DeviceMemory().buffer.BackingBasePointer()),
++                  static_cast<u32>(raw.type), static_cast<u32>(raw.block));
++    }
++
+     void HandleRasterizerDownload(VAddr v_address, size_t size) {
+         const auto* p = GetPointerImpl(
+             v_address, []() {}, []() {});
+         if (!gpu_device_memory) [[unlikely]] {
+             gpu_device_memory = &system.Host1x().MemoryManager();
++        }
++        if (!gpu_device_memory->IsPhysicalPointer(p)) [[unlikely]] {
++            ReportForeignPointer(v_address, p);
++            return;
+         }
+         const size_t core = system.GetCurrentHostThreadID();
+         auto& current_area = rasterizer_read_areas[core];
+@@ -818,6 +839,10 @@
+                                      sys_core); // any other calls threads go to syscore.
+         if (!gpu_device_memory) [[unlikely]] {
+             gpu_device_memory = &system.Host1x().MemoryManager();
++        }
++        if (!gpu_device_memory->IsPhysicalPointer(p)) [[unlikely]] {
++            ReportForeignPointer(v_address, p);
++            return;
+         }
+         // Guard on sys_core;
+         if (core == sys_core) [[unlikely]] {
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -142,11 +142,32 @@
+             shader_notify->MarkShaderComplete();
+         }
+     }};
++    build_task = std::move(func);
+     if (thread_worker) {
+-        thread_worker->QueueWork(std::move(func));
++        thread_worker->QueueWork([this] { RunBuild(); });
+     } else {
+-        func();
+-    }
++        RunBuild();
++    }
++}
++
++void ComputePipeline::RunBuild() {
++    // A draw or dispatch that needs the pipeline builds it on the scheduler thread instead of
++    // waiting for the worker queue, which can hold hundreds of builds, to reach it.
++    if (build_claimed.exchange(true)) {
++        return;
++    }
++    try {
++        build_task();
++    } catch (...) {
++        {
++            std::scoped_lock lock{build_mutex};
++            is_built = true;
++            build_condvar.notify_one();
++        }
++        build_task = nullptr;
++        throw;
++    }
++    build_task = nullptr;
+ }
+ 
+ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+@@ -274,6 +295,7 @@
+     if (!is_built.load(std::memory_order::relaxed)) {
+         // Wait for the pipeline to be built
+         scheduler.Record([this](vk::CommandBuffer) {
++            RunBuild();
+             std::unique_lock lock{build_mutex};
+             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+         });
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.h b/src/video_core/renderer_vulkan/vk_compute_pipeline.h
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.h
+@@ -8,6 +8,7 @@
+ 
+ #include <atomic>
+ #include <condition_variable>
++#include <functional>
+ #include <mutex>
+ 
+ #include "common/common_types.h"
+@@ -57,6 +58,9 @@
+     }
+ 
+ private:
++    /// Builds the pipeline once, on whichever thread gets here first.
++    void RunBuild();
++
+     const Device& device;
+     vk::PipelineCache& pipeline_cache;
+     GuestDescriptorQueue& guest_descriptor_queue;
+@@ -77,6 +81,8 @@
+     vk::DescriptorUpdateTemplate descriptor_update_template;
+     vk::Pipeline pipeline;
+ 
++    std::function<void()> build_task;
++    std::atomic_bool build_claimed{false};
+     std::condition_variable build_condvar;
+     std::mutex build_mutex;
+     std::atomic_bool is_built{false};
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -349,12 +349,34 @@
+             shader_notify->MarkShaderComplete();
+         }
+     }};
++    // ConfigureFunc must be set before the build can be observed as finished.
++    configure_func = ConfigureFunc(spv_modules, stage_infos);
++    build_task = std::move(func);
+     if (worker_thread) {
+-        worker_thread->QueueWork(std::move(func));
++        worker_thread->QueueWork([this] { RunBuild(); });
+     } else {
+-        func();
+-    }
+-    configure_func = ConfigureFunc(spv_modules, stage_infos);
++        RunBuild();
++    }
++}
++
++void GraphicsPipeline::RunBuild() {
++    // A draw or dispatch that needs the pipeline builds it on the scheduler thread instead of
++    // waiting for the worker queue, which can hold hundreds of builds, to reach it.
++    if (build_claimed.exchange(true)) {
++        return;
++    }
++    try {
++        build_task();
++    } catch (...) {
++        {
++            std::scoped_lock lock{build_mutex};
++            is_built = true;
++            build_condvar.notify_one();
++        }
++        build_task = nullptr;
++        throw;
++    }
++    build_task = nullptr;
+ }
+ 
+ void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {
+@@ -1006,6 +1028,7 @@
+     if (!is_built.load(std::memory_order::relaxed)) {
+         // Wait for the pipeline to be built
+         scheduler.Record([this](vk::CommandBuffer) {
++            RunBuild();
+             std::unique_lock lock{build_mutex};
+             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+         });
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -10,6 +10,7 @@
+ #include <array>
+ #include <atomic>
+ #include <condition_variable>
++#include <functional>
+ #include <mutex>
+ #include <type_traits>
+ #include <vector>
+@@ -134,6 +135,9 @@
+     }
+ 
+ private:
++    /// Builds the pipeline once, on whichever thread gets here first.
++    void RunBuild();
++
+     template <typename Spec>
+     bool ConfigureImpl(bool is_indexed);
+ 
+@@ -182,6 +186,8 @@
+     u32 last_descriptor_buffer_chunk{};
+     u64 last_descriptor_buffer_generation{};
+ 
++    std::function<void()> build_task;
++    std::atomic_bool build_claimed{false};
+     std::condition_variable build_condvar;
+     std::mutex build_mutex;
+     std::atomic_bool is_built{false};
