@@ -201,7 +201,11 @@ struct ImageBase {
     std::map<std::pair<s32, s32>, int> cells;   // (level, layer) -> content token
     bool IsSafeGpuCopy() const noexcept { return safe_copy; }
     bool has_base = true;
-    std::optional<SubresourceBase> TryFindBase(GPUVAddr) const noexcept { return has_base ? std::optional<SubresourceBase>(SubresourceBase{}) : std::nullopt; }
+    std::vector<GPUVAddr> no_base_for;   // test hook: addresses of overlaps this image cannot place (set by Join::run)
+    std::optional<SubresourceBase> TryFindBase(GPUVAddr addr) const noexcept {
+        if (!has_base || std::find(no_base_for.begin(), no_base_for.end(), addr) != no_base_for.end()) return std::nullopt;
+        return SubresourceBase{};
+    }
     template <class M, class C> void DownloadMemory(M&, const C&) {}
 };
 using Image = ImageBase;
@@ -727,6 +731,9 @@ struct Join {
     }
     void run() {
         c.ops.clear();
+        // TryFindBase is asked of the new image: tell it which overlaps have no base.
+        image().no_base_for.clear();
+        for (const Image& o : c.slot_images.v) if (&o != &image() && !o.has_base) image().no_base_for.push_back(o.gpu_addr);
         c.JoinTail(image(), ImageId{0}, new_info, rescale, clear);
     }
     int cell(s32 level, s32 layer) { return image().cells[{level, layer}]; }
