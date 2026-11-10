@@ -10,13 +10,13 @@ the lock. Wraps and ranges past the 36-bit bitmap answer true and take it. Non-A
 TextureCache checks are unchanged.
 --- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
 +++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
-@@ -64,6 +64,7 @@
- #include "video_core/texture_cache/texture_cache_base.h"
- #include "video_core/vulkan_common/vulkan_device.h"
+@@ -66,6 +66,7 @@
  #include "video_core/vulkan_common/vulkan_wrapper.h"
-+#include "video_core/nx2.h"
  #include "video_core/nx2_profile.h"
  #include "video_core/gpu_written_pages.h"
++#include "video_core/nx2.h"
+ 
+ namespace Vulkan {
  
 @@ -1582,7 +1583,12 @@
  }
