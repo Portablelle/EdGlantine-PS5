@@ -48,7 +48,7 @@ measured on another PS5, not on this build.
  INST(I2I_cbuf,     "I2I (cbuf)",     "0100 1100 1110 0---")
 --- /dev/null
 +++ b/src/shader_recompiler/frontend/maxwell/translate/impl/hmma_native.cpp
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,92 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -65,7 +65,8 @@ measured on another PS5, not on this build.
 +//
 +// Lane t needs A[g][0..K) and A[g+8][0..K), held by lanes 4g..4g+3, and B[0..K)[2q], B[0..K)[2q+1],
 +// held by lanes 8q..8q+3 and 8q+4..8q+7: one shuffle per source register and lane, 32 for K = 16.
-+// Upstream's original expansion used 96 shuffles; this tree already simplifies SHFL dispatch.
++// The software expansion has the same 32/16 SHFL count for K = 16/8. This path replaces
++// its long Maxwell instruction sequence and R240-R254 temporaries with one pseudo-instruction.
 +// Products are accumulated in f32 and rounded to f16 after every 8 k, in the same order as before.
 +void TranslatorVisitor::HMMA_NATIVE(u64 insn) {
 +    union {
@@ -90,8 +91,9 @@ measured on another PS5, not on this build.
 +    const auto unpack = [&](const IR::U32& packed, u32 half) {
 +        return IR::F32{ir.CompositeExtract(ir.UnpackHalf2x16(packed), half)};
 +    };
++    constexpr IR::FpControl fp_control{.fmz_mode = IR::FmzMode::None};
 +    const auto round_half = [&](const IR::F32& value) {
-+        return IR::F32{ir.FPConvert(32, ir.FPConvert(16, value))};
++        return IR::F32{ir.FPConvert(32, ir.FPConvert(16, value, fp_control), fp_control)};
 +    };
 +
 +    IR::F32 acc[2][2];
@@ -119,7 +121,8 @@ measured on another PS5, not on this build.
 +                    const IR::F32 a_value{unpack(a_values[row], half)};
 +                    for (u32 col = 0; col < 2; ++col) {
 +                        acc[row][col] =
-+                            IR::F32{ir.FPFma(a_value, unpack(b_values[col], half), acc[row][col])};
++                            IR::F32{ir.FPFma(a_value, unpack(b_values[col], half), acc[row][col],
++                                            fp_control)};
 +                    }
 +                }
 +            }

@@ -79,6 +79,8 @@ float unpack(u32 x, u32 h) { return float(std::bit_cast<_Float16>(u16(x >> (h*16
 // HMMA is duplicated here: those formulas execute in the production translator.
 namespace Shader::IR {
 enum class Reg : u64 {};
+enum class FmzMode { DontCare, None };
+struct FpControl { FmzMode fmz_mode{FmzMode::DontCare}; };
 struct U32 { std::array<u32,32> v{}; };
 struct F32 { std::array<float,32> v{}; };
 struct Pair { F32 v[2]; };
@@ -105,12 +107,14 @@ struct IREmitter {
     }
     F32 CompositeExtract(Pair a,u32 h) { return a.v[h]; }
     Pair CompositeConstruct(F32 a,F32 b) { return {{a,b}}; }
-    F32 FPConvert(u32 bits,F32 a) {
+    F32 FPConvert(u32 bits,F32 a,FpControl control={}) {
+        check(control.fmz_mode==FmzMode::None,"FPConvert must vote denorm preserve");
         if(bits==16) { ++rounds; for(auto& x:a.v) x=half_round(x); }
         else check(bits==32,"FPConvert width");
         return a;
     }
-    F32 FPFma(F32 a,F32 b,F32 c) {
+    F32 FPFma(F32 a,F32 b,F32 c,FpControl control={}) {
+        check(control.fmz_mode==FmzMode::None,"FPFma must vote denorm preserve");
         ++fmas; for(int i=0;i<32;++i) c.v[i]=std::fma(a.v[i],b.v[i],c.v[i]); return c;
     }
     U32 PackHalf2x16(Pair a) {
