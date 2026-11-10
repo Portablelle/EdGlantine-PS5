@@ -17,8 +17,9 @@ those ranges like BufferCache::IsRegionGpuModified. Checked:
 Source checks (the mark-path audit the lock-free answer relies on): MarkRegionAsGpuModified calls
 GpuWrittenPages::Mark before setting Type::GPU, and is the only place that sets it; IsRegionGpuModified
 reads only gpu_modified_ranges; the only two adds to gpu_modified_ranges (MarkWrittenBuffer and
-CopyBuffer's mirrored ranges) are covered by MarkRegionAsGpuModified in the same function; the skip
-uses Any (not AnyNonImage) and is gated on g_nx2_ampere.
+DMACopy's mirrored ranges) are preceded by a covering MarkRegionAsGpuModified (mark before add, so a
+lock-free reader that sees no mark cannot miss a range already added); the skip uses Any (not
+AnyNonImage) and is gated on g_nx2_ampere.
 Negative control: on main (no layer 99zzzzi) MustFlushRegion locks the buffer cache for an Ampere
 never-written page, so the compiled harness fails on behavior; --source-only fails on the gate.
 The compiled harness is Linux/dedie-only (needs g++).
@@ -83,13 +84,19 @@ assert mark_at < written.index('Nx2AddRangeOnce(gpu_modified_ranges, device_addr
     'MarkWrittenBuffer must mark the pages before adding the range'
 copy_add = cache.index('gpu_modified_ranges.Add(pair.first, pair.second);')
 copy_fn = cache[cache.rindex('\ntemplate <class P>', 0, copy_add):cache.index('\n}\n', copy_add)]
+assert 'bool BufferCache<P>::DMACopy(' in copy_fn
 assert 'const DAddr new_base_address = *cpu_dest_address + diff;' in copy_fn
-assert 'gpu_modified_ranges.ForEachInRange(*cpu_src_address, amount, mirror);' in copy_fn
-assert 'const bool has_new_downloads = tmp_intervals.size() != 0;' in copy_fn
-tail = cache[copy_add:cache.index('\n}\n', copy_add)]
-assert re.search(r'if \(has_new_downloads\) \{\s*memory_tracker\.MarkRegionAsGpuModified\('
-                 r'\*cpu_dest_address, amount\);', tail), 'mirrored ranges must be marked'
-assert 'return' not in tail[:tail.index('MarkRegionAsGpuModified')], 'no exit between add and mark'
+mirrored = copy_fn.index('gpu_modified_ranges.ForEachInRange(*cpu_src_address, amount, mirror);')
+copy_mark = re.search(r'const bool has_new_downloads = tmp_intervals\.size\(\) != 0;\s*'
+                      r'if \(has_new_downloads\) \{(\s*//[^\n]*)*\s*'
+                      r'memory_tracker\.MarkRegionAsGpuModified\(\*cpu_dest_address, amount\);',
+                      copy_fn[mirrored:])
+assert copy_mark, 'DMACopy must mark the destination right after collecting the mirrored ranges'
+copy_mark_end = mirrored + copy_mark.end()
+copy_subtract = copy_fn.index('gpu_modified_ranges.Subtract(*cpu_dest_address, amount);')
+assert copy_mark_end < copy_subtract < copy_fn.index('gpu_modified_ranges.Add(pair.first, pair.second);'), \
+    'DMACopy must mark before adding the mirrored ranges (Subtract then Add order kept)'
+assert copy_fn.count('MarkRegionAsGpuModified(') == 1
 
 # Bitmap rules the skip leans on.
 assert 'inline constexpr u64 PageBits = 12;' in pages_h
