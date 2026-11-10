@@ -142,6 +142,9 @@ private:
 #define pthread_create create
 #define pthread_join join
 #include "native_gpu_thread.inc"
+static int gpu_split_stops;
+VideoCommon::GpuSplit VideoCommon::GpuSplit::instance;
+void VideoCommon::GpuSplit::Stop() { ++gpu_split_stops; }
 int main(int argc, char**) {
     VideoCore::RendererBase renderer;
     Core::Frontend::GraphicsContext context;
@@ -169,7 +172,9 @@ int main(int argc, char**) {
         manager.queue.EmplaceWait(42);
         manager.StartThread(renderer, context, scheduler);
         manager.ready.acquire();
+        const int stops_before = gpu_split_stops;
         manager.Stop();
+        assert(gpu_split_stops > stops_before);
         manager.Stop();
         assert(manager.finished && joins == i && attributes_live == 0);
     }
