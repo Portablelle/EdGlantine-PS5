@@ -1,0 +1,23 @@
+Skip draws of no vertices, indices or instances before rasterizer->Draw.
+Port of heydemoura/EglantinePS5 39d36b1 (their layer 0019), minus the Bananza terrain macro hook
+that is not on this tree. Main only returned early for count/instance 0 on the native_turing path;
+every other path still prepared (pipeline, buffers, textures, descriptors) and issued the empty draw.
+UpdateTopology still runs first, and the caller-set dirty flags (IndexBuffer) are not cleared, so
+the next real draw rebuilds its state. ProcessDrawIndirect is unchanged. Upstream saw ~3% of
+Bananza draws empty at Ingot Isle; not measured on this port.
+--- a/src/video_core/engines/draw_manager.cpp
++++ b/src/video_core/engines/draw_manager.cpp
+@@ -324,6 +324,13 @@
+                 }
+             }
+         }
++        // A draw of no vertices, indices or instances writes nothing, but preparing it (pipeline,
++        // buffers, textures, descriptors) costs as much as any other. Topology was updated above;
++        // caller-set dirty flags (index buffer) stay set for the next real draw.
++        if (!instance_count ||
++            !(draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count)) {
++            return;
++        }
+         maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
+     }
+ }
