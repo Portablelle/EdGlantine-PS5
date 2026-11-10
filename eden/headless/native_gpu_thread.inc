@@ -5,6 +5,7 @@
 #include <system_error>
 #include "diagnostics.h"
 #include "gpu_failure.h"
+#include "video_core/gpu_split.h"
 
 namespace VideoCommon::GPUThread {
 void ThreadManager::StartThread(VideoCore::RendererBase& renderer,
@@ -58,5 +59,7 @@ void ThreadManager::Stop() {
         if (pthread_join(thread, nullptr)) std::terminate();
         thread_joinable = false;
     }
+    // Generated GPU shutdown and destructors call Stop directly, before renderer teardown.
+    VideoCommon::GpuSplit::Get().Stop();
 }
 } // namespace VideoCommon::GPUThread

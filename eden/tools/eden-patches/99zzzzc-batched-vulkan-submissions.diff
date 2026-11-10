@@ -1,0 +1,630 @@
+Batch Vulkan submissions on the split GPU thread's back, with their correctness companions.
+Adapted from Djihads80/Eglantine 660e5f0 + 313463c (DeferFlush, WaitSubmitted), 55274de (no 2 s
+give-up), df92fc6 (back_quiet half), zortos293/Eglantine 9960298 (front flush runs on the back),
+d1de145 (macros back to the engines when the split stops) and the narrow
+FlushDeferred-before-WaitPendingFences part of zortos 79f284e.
+On the back, a fence (InnerFence::Queue) or RasterizerVulkan::FlushCommands submits only if the last
+submission is older than EDEN_NX2_FENCE_FLUSH_US (default 500 us; 0 or less submits every time, as
+before); otherwise Scheduler::DeferFlush marks it pending. The back submits pending work from its
+submit hook (GpuSplit::SetSubmitHook, upstream's idle hook; our existing bool idle_hook is left
+alone) after a batch, before it sleeps, between entries when asked (RequestSubmitHook), and when it
+stops. back_quiet is cleared before entries run and set after the hook: Drain waits for it, so the
+front never uses the scheduler while the back submits. The fencing thread no longer submits a
+deferred tick: WaitSubmitted asks the back and waits without a time limit while it runs (a long
+shader translation is not a reason to release downloads early); only a stopped back returns false.
+WaitPendingFences and FlushQueryResults submit deferred work before waiting for the fencing
+thread (which can itself wait for that submission). Maxwell3D::FrontDmaRead flushes through
+Synchronize on the back instead of on the front after a drain. An engine method off the back with front_macros set (the
+split stopped) hands executing macro, parameters, shadow RAM and binds back to the engine, before
+ConsumeSinkImpl applies sunk writes. Not taken: 313463c list-copy batching (no Nx2CopyListPages
+here), 9479d8f (no drain before every entry on this tree; 99zzzt1/t2 front reads unchanged),
+df92fc6's WriteMemory gate (WriteMemory never downloads here; 99zzzz9's inline record is reached
+only from engines on the owner thread).
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -460,6 +460,9 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
+ }
+
+ void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
++    if (front_macros && !VideoCommon::GpuSplit::OnBackThread()) {
++        ReleaseFront();
++    }
+     if (native_mode) {
+         // Most of the compute class's register writes (QMD fields replayed by its macros for
+         // each of thousands of dispatches a second) only store the value: ~4% of title 1's GPU
+@@ -999,6 +1002,18 @@ void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument) {
+     }
+ }
+
++// As Maxwell3D::ReleaseFront: the split stopped, the engine runs its macros again.
++void KeplerCompute::ReleaseFront() {
++    native_executing_macro = front->executing_macro;
++    native_parameters = std::move(front->parameters);
++    native_compute_uploaded = front->compute_uploaded;
++    native_bind_pointer = front->bind_pointer;
++    native_macro = front->macro;
++    front.reset();
++    front_macros = false;
++    LOG_INFO(HW_GPU, "GPU thread split stopped: compute macros back on the engine");
++}
++
+ MacroEngine& KeplerCompute::FrontMacroEngine(FrontState& fs) {
+     if (native_context) {
+         return fs.compute_uploaded ? native_context->compute_engine : native_context->engine;
+--- a/src/video_core/engines/kepler_compute.h
++++ b/src/video_core/engines/kepler_compute.h
+@@ -263,6 +263,7 @@ public:
+ private:
+     struct FrontState;
+     FrontState& Front(VideoCommon::GpuSplit& split);
++    void ReleaseFront();
+     void FrontApply(FrontState& state, u32 method, u32 argument);
+     MacroEngine& FrontMacroEngine(FrontState& state);
+     std::span<u32> FrontMacroPositions(FrontState& state);
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -344,6 +344,10 @@ u32 Maxwell3D::ProcessShadowRam(u32 method, u32 argument) {
+ }
+
+ void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
++    // Before the sunk writes reach the shadow RAM: the handback must not overwrite them.
++    if (front_macros && !VideoCommon::GpuSplit::OnBackThread()) {
++        ReleaseFront();
++    }
+     const auto control = shadow_state.shadow_ram_control;
+     // Sunk methods are state writes only (not in execution_mask): skip unchanged values, as
+     // CallMethod does.
+@@ -507,6 +511,9 @@ void Maxwell3D::TraceFirstMethodWrite(u32 method, u32 argument) {
+ }
+
+ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
++    if (front_macros && !VideoCommon::GpuSplit::OnBackThread()) {
++        ReleaseFront();
++    }
+     // It is an error to write to a register other than the current macro's ARG register before
+     // it has finished execution.
+     if (executing_macro != 0 && method != executing_macro + 1) {
+@@ -580,6 +587,9 @@ void Maxwell3D::DumpRecentWrites(u32 method) {
+ }
+
+ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) {
++    if (front_macros && !VideoCommon::GpuSplit::OnBackThread()) {
++        ReleaseFront();
++    }
+     RecordWrite(method, amount ? base_start[0] : 0, amount, methods_pending);
+     // Methods after 0xE00 are special, they're actually triggers for some microcode that was
+     // uploaded to the GPU during initialization.
+@@ -1004,6 +1014,19 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
+     return *front;
+ }
+
++// With the split on, engine methods run on its back only: one here on another thread means the
++// split stopped (GPU accuracy changed mid-game). Hand the macros back: the front's copy goes
++// stale from now on, and a restart copies the registers again (Front). (d1de145)
++void Maxwell3D::ReleaseFront() {
++    executing_macro = front->executing_macro;
++    macro_params = std::move(front->parameters);
++    std::memcpy(shadow_state.reg_array.data(), front->shadow.data(), sizeof(front->shadow));
++    shadow_state.shadow_ram_control = front->control;
++    front.reset();
++    front_macros = false;
++    LOG_INFO(HW_GPU, "GPU thread split stopped: 3D macros back on the engine");
++}
++
+ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                            u32 argument, bool is_last_call, bool from_macro) {
+     namespace Profile = VideoCommon::Nx2Profile;
+@@ -1236,9 +1259,6 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
+
+ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                              u32 count) {
+-    // The words may be written by methods still queued for the back (indirect draw arguments
+-    // from a culling dispatch), and the caches that may hold newer ones belong to it.
+-    split.Drain();
+     const GPUVAddr source = (GPUVAddr{fs.regs[0x154] & 0x1ffffff} << 32) | fs.regs[0x155];
+     const u32 ram = fs.regs[0x156];
+     const u32 words = std::min<u32>(count, 0x1000);
+@@ -1246,12 +1266,18 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+     if (VideoCommon::Nx2Profile::Enabled()) {
+         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
+     }
+-    if (memory_manager.IsMemoryDirty(source, read_bytes,
+-                        VideoCommon::CacheType::BufferCache | VideoCommon::CacheType::QueryCache)) {
+-        // Reports still waiting for host results are waited for (Lichii #215).
+-        VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source, read_bytes);
+-        memory_manager.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+-    }
++    // The words may be written by methods still queued for the back (indirect draw arguments
++    // from a culling dispatch), and the caches that may hold newer ones belong to it: flush
++    // them there and wait. A drained back still submits deferred work from its submit hook, so
++    // the front never records the download into the scheduler itself (9960298).
++    split.Synchronize([this, source, read_bytes] {
++        if (memory_manager.IsMemoryDirty(source, read_bytes,
++                            VideoCommon::CacheType::BufferCache | VideoCommon::CacheType::QueryCache)) {
++            // Reports still waiting for host results are waited for (Lichii #215).
++            VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source, read_bytes);
++            memory_manager.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
++        }
++    });
+     for (u32 i = 0; i < words; ++i) {
+         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+         if (method == 0x158) {
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3372,6 +3372,7 @@ private:
+     // the front owns the macro code and bindings (the back thread then leaves them alone).
+     struct FrontState;
+     FrontState& Front(Core::System& system, VideoCommon::GpuSplit& split);
++    void ReleaseFront();
+     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                     bool is_last_call, bool from_macro);
+     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+--- a/src/video_core/fence_manager.h
++++ b/src/video_core/fence_manager.h
+@@ -144,6 +144,10 @@ public:
+                 wait_cv.notify_all();
+             });
+             SignalFence(std::move(func));
++            // The fence's commands can be held back by a deferred flush that only this thread
++            // (the split's back) submits, and the fencing thread waits for that submission:
++            // waiting here without submitting would deadlock (zortos 79f284e, this part only).
++            SubmitDeferredWork();
+             std::unique_lock lk(wait_mutex);
+             wait_cv.wait(
+                 lk, [&wait_finished] { return wait_finished.load(std::memory_order_relaxed); });
+@@ -179,6 +183,8 @@ protected:
+     virtual bool IsFenceSignaled(TFence& fence) const = 0;
+     /// Waits until a fence has been signalled by the host GPU.
+     virtual void WaitFence(TFence& fence) = 0;
++    /// Submits work whose submission the backend deferred (called before blocking on a fence).
++    virtual void SubmitDeferredWork() {}
+
+     VideoCore::RasterizerInterface& rasterizer;
+     Tegra::GPU& gpu;
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -147,6 +147,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
+     front_after_context = after_method_context = nullptr;
+     publish_every = PublishEvery;
+     failed.store(false); back_ready.store(false); failure = nullptr;
++    back_quiet.store(true); hook_requested.store(false);
+ #ifdef EDEN_NX2_PS5_PROTO
+     trace_position.store(0); trace_head.store(0); trace_target.store(0);
+     trace_stage.store(0); trace_reports.store(0);
+@@ -190,6 +191,26 @@ void GpuSplit::BackEntry(std::stop_token token) noexcept {
+         g_back_busy.store(false, std::memory_order_release);
+         NotifyProgress(); NotifyWork();
+     }
++    // A waiter for a deferred submission (Scheduler::WaitSubmitted) then submits it itself.
++    back_running.store(false, std::memory_order_release);
++    NotifyProgress();
++}
++
++void GpuSplit::RequestSubmitHook() {
++    hook_requested.store(true, std::memory_order_seq_cst);
++    NotifyWork();
++}
++
++void GpuSplit::QuietBack() {
++    hook_requested.store(false, std::memory_order_seq_cst);
++    if (back_quiet.load(std::memory_order_relaxed)) {
++        return;
++    }
++    if (submit_hook != nullptr) {
++        submit_hook(submit_context);
++    }
++    back_quiet.store(true, std::memory_order_release);
++    NotifyProgress();
+ }
+
+ void GpuSplit::NotifyWork() {
+@@ -499,21 +520,30 @@ void GpuSplit::Drain() {
+     TraceFront(20, write_position);
+     CheckFailure();
+     consumed_cache = consumed.load(std::memory_order_acquire);
+-    if (consumed_cache == write_position) {
++    if (consumed_cache == write_position && BackQuiet()) {
+         return;
+     }
+     const auto started = std::chrono::steady_clock::now();
+     ++SplitPerformance::drains;
+     Publish();
+     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
++    // Everything consumed is not enough: the back submits deferred work (Scheduler::DeferFlush)
++    // from its submit hook afterwards, and the caller may use the scheduler once this returns.
++    bool hook_asked = false;
+     for (u32 spins = 0;; ++spins) {
+         CheckFailure();
+         consumed_cache = consumed.load(std::memory_order_acquire);
+         if (consumed_cache == write_position) {
+-            publish_every = 8;
+-            SplitPerformance::wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+-                std::chrono::steady_clock::now() - started).count(), std::memory_order_relaxed);
+-            return;
++            if (BackQuiet()) {
++                publish_every = 8;
++                SplitPerformance::wait_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                    std::chrono::steady_clock::now() - started).count(), std::memory_order_relaxed);
++                return;
++            }
++            if (!hook_asked) {
++                RequestSubmitHook();
++                hook_asked = true;
++            }
+         }
+ #ifdef EDEN_NX2_PS5_PROTO
+         if (spins < 128) { Pause(); }
+@@ -521,7 +551,7 @@ void GpuSplit::Drain() {
+             std::unique_lock lock{progress_mutex};
+             if (!progress_cv.wait_for(lock, std::chrono::seconds(1), [this] {
+                 return failed.load(std::memory_order_acquire) ||
+-                    consumed.load(std::memory_order_acquire) == write_position;
++                    (consumed.load(std::memory_order_acquire) == write_position && BackQuiet());
+             })) TraceStall("front_drain", write_position);
+         }
+ #else
+@@ -640,6 +670,8 @@ size_t GpuSplit::Execute(const u64* entry) {
+ void GpuSplit::BackLoop(std::stop_token stop_token) {
+     Common::SetCurrentThreadName("GPUBack");
+     std::fprintf(stderr, "NX2_SPLIT_BACK named\n");
++    on_back_thread = true;
++    back_running.store(true, std::memory_order_release);
+     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
+     Common::SetCurrentThreadToPerformanceCores();
+     system->RegisterHostThread();
+@@ -659,6 +691,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+             trace_stage.store(1, std::memory_order_relaxed); // loading/idle service
+ #endif
+             if (idle_hook && idle_hook(idle_context)) {
++                QuietBack();
+ #ifdef EDEN_NX2_PS5_PROTO
+                 std::unique_lock lock{work_mutex};
+                 work_cv.wait_for(lock, std::chrono::milliseconds(1), [&] {
+@@ -671,10 +704,17 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+             }
+             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
+             // The front usually sends more within microseconds: spin briefly before sleeping.
+-            for (u32 spins = 0; spins < 8192 && available == read_position; ++spins) {
++            for (u32 spins = 0; spins < 8192 && available == read_position &&
++                                !hook_requested.load(std::memory_order_relaxed);
++                 ++spins) {
+                 Pause();
+                 available = published.load(std::memory_order_acquire);
+             }
++            if (available == read_position) {
++                // Deferred submissions go out before the back waits (Scheduler::DeferFlush).
++                QuietBack();
++                available = published.load(std::memory_order_acquire);
++            }
+             if (available == read_position) {
+                 // Publish bumps `wake` when it sees back_waiting: read it before the last look
+                 // at `published`, so a publish in between ends the wait at once.
+@@ -685,13 +725,16 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+                     trace_stage.store(2, std::memory_order_relaxed); // no published work
+                     if (!work_cv.wait_for(lock, std::chrono::seconds(1), [&] {
+                         return stop_token.stop_requested() ||
++                            hook_requested.load(std::memory_order_acquire) ||
+                             published.load(std::memory_order_acquire) != read_position;
+                     })) TraceStall("back_idle", read_position);
+                 }
+ #else
+                 const u32 seen = wake.load(std::memory_order_seq_cst);
+                 available = published.load(std::memory_order_seq_cst);
+-                if (available == read_position && !stop_token.stop_requested()) {
++                // A request made after the hook ran (RequestSubmitHook) runs it before sleeping.
++                if (available == read_position && !stop_token.stop_requested() &&
++                    !hook_requested.load(std::memory_order_seq_cst)) {
+                     wake.wait(seen, std::memory_order_seq_cst);
+                 }
+ #endif
+@@ -702,6 +745,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+         if (read_position == 0) std::fprintf(stderr, "NX2_SPLIT_BACK first_batch_words=%llu\n", static_cast<unsigned long long>(available));
+         const auto started = std::chrono::steady_clock::now();
+         u64 last_store = read_position;
++        // Before any entry runs, so a front that sees these entries consumed also sees this.
++        back_quiet.store(false, std::memory_order_seq_cst);
+         g_back_busy.store(true, std::memory_order_release);
+         while (read_position != available) {
+             const size_t index = read_position & RingMask;
+@@ -724,6 +769,12 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+             const size_t size = Execute(&ring[index]);
+             if (trace) std::fprintf(stderr, "NX2_SPLIT_ENTRY end=%u words=%zu\n", startup_entries++, size);
+             read_position += size != 0 ? size : RingWords - index;
++            if (hook_requested.load(std::memory_order_relaxed)) [[unlikely]] {
++                hook_requested.store(false, std::memory_order_seq_cst);
++                if (submit_hook != nullptr) {
++                    submit_hook(submit_context);
++                }
++            }
+             // Hand ring space back now and then while working through a long batch.
+             if (read_position - last_store >= 4096 && read_position != available) {
+                 StoreConsumed(read_position);
+@@ -738,6 +789,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+         trace_stage.store(4, std::memory_order_relaxed); // batch retired
+ #endif
+     }
++    // Stopping: nothing deferred may be left for a thread that no longer runs.
++    QuietBack();
+ }
+
+ } // namespace VideoCommon
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -110,6 +110,24 @@ public:
+         idle_context = context;
+     }
+     void CheckFailure() const;
++
++    /// Whether the calling thread is the split's back.
++    [[nodiscard]] static bool OnBackThread() {
++        return on_back_thread;
++    }
++    /// Any thread: whether the back thread runs (false before it starts and once it stopped).
++    [[nodiscard]] bool BackRunning() const {
++        return back_running.load(std::memory_order_acquire);
++    }
++    /// Called on the back after it ran entries, before it waits for more, and between entries
++    /// when another thread asks (RequestSubmitHook): the rasterizer submits work it deferred
++    /// (Vulkan Scheduler::DeferFlush). Set while the back is not running.
++    void SetSubmitHook(void (*hook)(void*), void* context) {
++        submit_hook = hook;
++        submit_context = context;
++    }
++    /// Any thread: has the back call the submit hook soon, between entries or at once if idle.
++    void RequestSubmitHook();
+     // Front only: return a cache-owned result after all preceding method writes.
+     template <typename Func> void Synchronize(const Func& func) {
+         if (Active()) { ++SplitPerformance::sync_reads; Defer(func); Drain(); } else { func(); }
+@@ -255,6 +273,14 @@ private:
+     void StartBackThread();
+     void BackEntry(std::stop_token stop_token) noexcept;
+     void BackLoop(std::stop_token stop_token);
++    /// Back: submits deferred work (the submit hook) once after a batch and marks it quiet.
++    void QuietBack();
++    /// Whether the back is done with the Vulkan scheduler until it gets more work: set after its
++    /// submit hook ran, cleared before it executes entries.
++    [[nodiscard]] bool BackQuiet() const {
++        return back_quiet.load(std::memory_order_acquire) ||
++               !back_running.load(std::memory_order_acquire);
++    }
+     size_t Execute(const u64* entry);
+
+     bool (*idle_hook)(void*){};
+@@ -280,6 +306,12 @@ private:
+     void* after_method_context{};
+
+     static GpuSplit instance;
++    static inline thread_local bool on_back_thread{};
++    void (*submit_hook)(void*){};
++    void* submit_context{};
++    alignas(64) std::atomic<bool> hook_requested{};
++    std::atomic<bool> back_running{};
++    std::atomic<bool> back_quiet{true};
+
+     alignas(64) std::atomic<u64> published{};
+     alignas(64) std::atomic<u64> consumed{};
+--- a/src/video_core/renderer_vulkan/vk_fence_manager.cpp
++++ b/src/video_core/renderer_vulkan/vk_fence_manager.cpp
+@@ -23,7 +23,9 @@ void InnerFence::Queue() {
+     }
+     // Get the current tick so we can wait for it
+     wait_tick = scheduler.CurrentTick();
+-    scheduler.Flush();
++    if (!scheduler.DeferFlush()) {
++        scheduler.Flush();
++    }
+ }
+
+ bool InnerFence::IsSignaled() const {
+@@ -37,6 +39,14 @@ void InnerFence::Wait() {
+     if (is_stubbed) {
+         return;
+     }
++    // A deferred flush (Scheduler::DeferFlush) may not be submitted yet. Only the split's back
++    // may submit; other threads (the fencing thread) ask it to and wait. If the back has
++    // stopped, it submitted what it deferred, and Wait below submits anything else.
++    if (!scheduler.IsSubmitted(wait_tick) && !VideoCommon::GpuSplit::OnBackThread() &&
++        VideoCommon::GpuSplit::Get().BackRunning() && scheduler.WaitSubmitted(wait_tick)) {
++        scheduler.GetMasterSemaphore().Wait(wait_tick);
++        return;
++    }
+     scheduler.Wait(wait_tick);
+ }
+
+@@ -62,4 +72,10 @@ void FenceManager::WaitFence(Fence& fence) {
+     fence->Wait();
+ }
+
++void FenceManager::SubmitDeferredWork() {
++    if (VideoCommon::GpuSplit::OnBackThread()) {
++        scheduler.FlushDeferred();
++    }
++}
++
+ } // namespace Vulkan
+--- a/src/video_core/renderer_vulkan/vk_fence_manager.h
++++ b/src/video_core/renderer_vulkan/vk_fence_manager.h
+@@ -62,6 +62,7 @@ protected:
+     void QueueFence(Fence& fence) override;
+     bool IsFenceSignaled(Fence& fence) const override;
+     void WaitFence(Fence& fence) override;
++    void SubmitDeferredWork() override;
+
+ private:
+     Scheduler& scheduler;
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -260,6 +260,8 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
+       wfi_event(device.GetLogical().CreateEvent()) {
+     native_capture_session = std::make_unique<NativeDrawCaptureSession>();
+     scheduler.SetQueryCache(query_cache);
++    VideoCommon::GpuSplit::Get().SetSubmitHook(
++        [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); }, &scheduler);
+     // try_lock: the thread that was refused holds the texture cache lock when it was refused in
+     // texture cache work (the lock is recursive), and otherwise may hold another cache's lock
+     // that a thread holding this one waits for. Not taken, nothing is reclaimed.
+@@ -270,6 +272,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
+ }
+
+ RasterizerVulkan::~RasterizerVulkan() {
++    VideoCommon::GpuSplit::Get().SetSubmitHook(nullptr, nullptr);
+     staging_pool.reclaim = nullptr;
+     scheduler.WaitWorker();
+     scheduler.Finish();
+@@ -1834,6 +1837,9 @@ void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
+         state->cv.notify_all();
+     });
+     fence_manager.SignalFence([] {});
++    // This thread owns deferred submissions; the fencing thread needs them before it can
++    // write the query results and run the callback we are about to wait for.
++    scheduler.FlushDeferred();
+     std::unique_lock lock{state->mutex};
+     if (!state->cv.wait_for(lock, std::chrono::milliseconds{200},
+                             [&state] { return state->written; })) {
+@@ -1889,7 +1895,11 @@ void RasterizerVulkan::FlushCommands() {
+         return;
+     }
+     draw_counter = 0;
+-    scheduler.Flush();
++    // SignalFence comes here right after queueing a fence with downloads or queries, which
++    // would undo that fence's own deferral at once: batched like the fences (313463c).
++    if (!scheduler.DeferFlush()) {
++        scheduler.Flush();
++    }
+ }
+
+ void RasterizerVulkan::TickFrame() {
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -6,6 +6,8 @@
+ // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+
++#include <chrono>
++#include <cstdlib>
+ #include <memory>
+ #include <mutex>
+ #include <thread>
+@@ -15,6 +17,7 @@
+
+ #include "video_core/renderer_vulkan/vk_query_cache.h"
+
++#include "common/logging.h"
+ #include "common/settings.h"
+ #include "common/thread.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
+@@ -63,9 +66,63 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
+     // When flushing, we only send data to the worker thread; no waiting is necessary.
+     const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore);
+     AllocateNewContext();
++    last_flush = std::chrono::steady_clock::now();
++    flush_pending = false;
+     return signal_value;
+ }
+
++bool Scheduler::DeferFlush() {
++    // Switch 2 titles make a fence per compute release, thousands a second, each a queue
++    // submission that kept the Vulkan worker busy submitting (Djihads80/Eglantine 660e5f0,
++    // 313463c; their counts are desktop measurements).
++    static const s64 interval_us = [] {
++        const char* value = std::getenv("EDEN_NX2_FENCE_FLUSH_US");
++        return value == nullptr ? s64{500} : static_cast<s64>(std::atoll(value));
++    }();
++    if (interval_us <= 0 || !VideoCommon::GpuSplit::OnBackThread() ||
++        std::chrono::steady_clock::now() - last_flush >= std::chrono::microseconds{interval_us}) {
++        return false;
++    }
++    flush_pending = true;
++    return true;
++}
++
++void Scheduler::FlushDeferred() {
++    if (flush_pending) {
++        Flush();
++    }
++}
++
++bool Scheduler::WaitSubmitted(u64 tick) {
++    if (IsSubmitted(tick)) {
++        return true;
++    }
++    auto& split = VideoCommon::GpuSplit::Get();
++    split.RequestSubmitHook();
++    // No time limit: the back can spend seconds on one entry (a large shader's translation),
++    // and a fence reported as submitted before it is would release its downloads too early.
++    const auto start = std::chrono::steady_clock::now();
++    auto next_log = start + std::chrono::seconds{2};
++    for (u32 spins = 0; !IsSubmitted(tick); ++spins) {
++        if (!split.BackRunning()) {
++            return IsSubmitted(tick);
++        }
++        if (const auto now = std::chrono::steady_clock::now(); now >= next_log) {
++            next_log = now + std::chrono::seconds{2};
++            LOG_WARNING(Render_Vulkan, "Waited {} s for the GPU thread to submit tick {}",
++                        std::chrono::duration_cast<std::chrono::seconds>(now - start).count(),
++                        tick);
++            split.RequestSubmitHook();
++        }
++        if (spins < 64) {
++            std::this_thread::yield();
++        } else {
++            std::this_thread::sleep_for(std::chrono::microseconds{50});
++        }
++    }
++    return true;
++}
++
+ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
+ #ifdef EDEN_NX2_PS5_PROTO
+     VideoCommon::NativeWaitProfile::Scope wait_profile{VideoCommon::NativeWaitProfile::Kind::SchedulerFinish, __builtin_return_address(0)};
+@@ -76,6 +133,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore)
+     // When finishing, we need to wait for the submission to have executed on the device.
+     const u64 presubmit_tick = CurrentTick();
+     SubmitExecution(signal_semaphore, wait_semaphore);
++    flush_pending = false;
+     Wait(presubmit_tick);
+     AllocateNewContext();
+ }
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -9,6 +9,7 @@
+ #include "video_core/native_snapshot_batch.h"
+ #endif
+
++#include <chrono>
+ #include <condition_variable>
+ #include <cstddef>
+ #include <functional>
+@@ -53,6 +54,22 @@ public:
+     /// Sends the current execution context to the GPU and waits for it to complete.
+     void Finish(VkSemaphore signal_semaphore = {}, VkSemaphore wait_semaphore = {});
+
++    /// On the split's back, a fence or FlushCommands submits only if the last submission is older
++    /// than a window (EDEN_NX2_FENCE_FLUSH_US, default 500 us, 0 submits at once); otherwise it
++    /// goes with the next one. The back submits deferred work before it waits for more and when
++    /// another thread asks (WaitSubmitted). True when the flush was deferred.
++    bool DeferFlush();
++    /// Submits deferred work (the split's back, from its submit hook).
++    void FlushDeferred();
++    /// Threads other than the split's back: waits until tick is submitted, asking the back to
++    /// submit deferred work (logged every 2 s while it waits). False only when the back thread
++    /// is not running, so nothing will submit it: the caller then submits it itself.
++    bool WaitSubmitted(u64 tick);
++    /// Whether everything up to tick has been handed to the worker for submission.
++    [[nodiscard]] bool IsSubmitted(u64 tick) const noexcept {
++        return tick < master_semaphore->CurrentTick();
++    }
++
+     /// Waits for the worker thread to finish executing everything. After this function returns it's
+     /// safe to touch worker resources.
+     void WaitWorker();
+@@ -222,6 +239,9 @@ public:
+     std::mutex submit_mutex;
+
+ private:
++    std::chrono::steady_clock::time_point last_flush{};
++    bool flush_pending{};
++
+     class Command {
+     public:
+         virtual ~Command() = default;
