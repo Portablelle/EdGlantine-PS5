@@ -13,7 +13,7 @@
 +
 +template <class P>
 +void BufferCache<P>::WriteMemoryAfterWrite(DAddr device_addr, u64 size) {
-+    // Only the GPU command path in WriteBlockImpl may inline, after copying the guest bytes.
++    // WriteBlockImpl permits this only on instances with inline_page_writes_enabled set.
 +    constexpr u64 address_space = u64{1} << 36;
 +    if (size != 0 && size <= DEVICE_PAGESIZE && device_addr != 0 &&
 +        device_addr < address_space && size <= address_space - device_addr) {
@@ -50,7 +50,7 @@
 
      void CachedWriteMemory(DAddr device_addr, u64 size);
 +
-+    /// GPU-thread WriteBlockImpl only, after guest memory has been copied (hold mutex).
++    /// Flag-enabled MemoryManager instances only, after the guest copy (hold mutex).
 +    void WriteMemoryAfterWrite(DAddr device_addr, u64 size);
 +
 +    /// Cancel pending downloads before guest bytes are overwritten (hold mutex).
@@ -82,6 +82,28 @@
 
      Common::SlotVector<Buffer> slot_buffers;
  #ifdef YUZU_LEGACY
+--- a/src/video_core/memory_manager.h
++++ b/src/video_core/memory_manager.h
+@@ -221,16 +221,19 @@
+
+     const u64 big_page_bits;
+     u64 big_page_size;
+     u64 big_page_mask;
+     u64 big_page_table_mask;
+
+     VideoCore::RasterizerInterface* rasterizer = nullptr;
+
++    // Enabled only by the GPU address-space constructor; Host1x/CDMA keeps main's write path.
++    bool inline_page_writes_enabled = false;
++
+     enum class EntryType : u64 {
+         Free = 0,
+         Reserved = 1,
+         Mapped = 2,
+     };
+
+     std::vector<u64> entries;
+     std::vector<u64> big_entries;
 --- a/src/video_core/memory_manager.cpp
 +++ b/src/video_core/memory_manager.cpp
 @@ -2,31 +2,33 @@
@@ -118,7 +140,28 @@
 
  bool MemoryManager::IsShuttingDown() const {
      return system.IsShuttingDown();
-@@ -456,35 +458,52 @@
+@@ -59,17 +61,19 @@
+     big_page_table_dev.ResizeAndClear(big_page_table_size);
+     big_entries.resize(big_page_table_size / 32, 0);
+     big_page_continuous.resize(big_page_table_size / continuous_bits, 0);
+     entries.resize(page_table_size / 32, 0);
+ }
+
+ MemoryManager::MemoryManager(Core::System& system_, u64 address_space_bits_, GPUVAddr split_address_, u64 big_page_bits_, u64 page_bits_)
+     : MemoryManager(system_, system_.Host1x().MemoryManager(), address_space_bits_, split_address_, big_page_bits_, page_bits_)
+-{}
++{
++    inline_page_writes_enabled = true;
++}
+
+ void MemoryManager::SetNativeSyncpointShim(GPUVAddr address) {
+     native_syncpoint_shim.store(address, std::memory_order_release);
+ }
+
+ MemoryManager::~MemoryManager() = default;
+
+ MemoryManager::EntryType MemoryManager::GetEntry(size_t position, bool is_big_page) const {
+@@ -456,35 +460,52 @@
              std::memcpy(dest_buffer, pointer, size);
              return;
          }
@@ -132,7 +175,7 @@
 +        // Match upstream: only a leading '0' disables; every other supplied value enables.
 +        return value == nullptr ? -1 : (value[0] == '0' ? 0 : 1);
 +    }();
-+    const bool inline_writes = !unsafe &&
++    const bool inline_writes = inline_page_writes_enabled && !unsafe &&
 +        (forced >= 0 ? forced == 1 : Tegra::g_nx2_ampere.load(std::memory_order_relaxed));
      auto just_advance = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {
          src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
@@ -188,7 +231,7 @@
 +    virtual void PrepareRegionWrite([[maybe_unused]] DAddr addr, [[maybe_unused]] u64 size,
 +                                    [[maybe_unused]] VideoCommon::CacheType which) {}
 +
-+    /// GPU command WriteBlockImpl only: invalidate after the guest copy, permitting small uploads.
++    /// Flag-enabled MemoryManager instances only: invalidate after the guest copy, permitting uploads.
 +    virtual void InvalidateRegionAfterWrite(DAddr addr, u64 size, VideoCommon::CacheType which) {
 +        InvalidateRegion(addr, size, which);
 +    }

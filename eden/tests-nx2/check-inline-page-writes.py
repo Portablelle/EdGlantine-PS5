@@ -7,6 +7,7 @@ fixture. The page tracker is deliberately page-granular;
 exact GPU intervals and guest/GPU bytes are recorded separately. Coverage is a page table plus
 bounded existing buffers; attempted create/merge is recorded. Direct invalidations never inline,
 large/partial/missing-buffer writes fall back, and inline-off retains main's pre-copy order.
+Host1x/CDMA instances leave the per-MemoryManager flag false and always use main's order.
 Main compiles the same fixture (with default no-op/fallback hooks) and FAILS by behavior:
 a qualifying WriteBlock does not upload the new bytes at the exact write size. No compiler is
 invoked by --source-only: it replays production mapped-lambda event order with a pending fence
@@ -120,6 +121,33 @@ def source_checks():
                 assert guest == 0x33 and uploaded is None
         assert mapped_events(path, False, True) == ['memory.WriteBlockUnsafe']
         assert 'GpuWrittenPages::Mark(dev_addr_base, copy_amount)' in path
+    # Replay Host1x/CDMA with env/Ampere on, using the production policy expression.
+    policy = re.search(r'const bool inline_writes = (.*?);', write_block_impl, re.S).group(1)
+    policy = policy.replace('Tegra::g_nx2_ampere.load(std::memory_order_relaxed)', 'ampere')
+    policy = policy.replace('(forced >= 0 ? forced == 1 : ampere)',
+                            '(forced == 1 if forced >= 0 else ampere)')
+    policy = policy.replace('&&', ' and ').replace('!unsafe', 'not unsafe')
+    policy = ' '.join(policy.split())
+    for instance_enabled in (False, True):
+        for forced, ampere in [(-1, True), (1, True), (1, False), (0, True), (-1, False)]:
+            enabled = eval(policy, {'__builtins__': {}}, {
+                'inline_page_writes_enabled': instance_enabled, 'unsafe': False,
+                'forced': forced, 'ampere': ampere})
+            expected = instance_enabled and (forced == 1 if forced >= 0 else ampere)
+            assert enabled == expected, 'Production inline policy must gate Host1x/CDMA instances'
+            for path in mapped:
+                assert mapped_events(path, enabled) == (
+                    ['PrepareRegionWrite', 'memory.WriteBlockUnsafe', 'InvalidateRegionAfterWrite']
+                    if expected else ['InvalidateRegion', 'memory.WriteBlockUnsafe'])
+    manager_header = (src / 'memory_manager.h').read_text()
+    assert 'bool inline_page_writes_enabled = false;' in manager_header
+    gpu_ctor = function(manager, 'MemoryManager::MemoryManager(Core::System& system_, u64')
+    host_ctor = manager[manager.index('MemoryManager::MemoryManager(Core::System& system_, MaxwellDeviceMemoryManager&'):
+                        manager.index('MemoryManager::MemoryManager(Core::System& system_, u64')]
+    assert 'inline_page_writes_enabled = true;' in gpu_ctor
+    assert 'inline_page_writes_enabled' not in host_ctor
+    assert manager.count('inline_page_writes_enabled = true;') == 1
+    assert 'gmmu_manager{system, memory_manager, 32, 0, 12}' in (src / 'host1x/host1x.cpp').read_text()
     # All other callers, including pre-copy NCE invalidations, retain main's exact body.
     main_body = """void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size) {
         if (IsRegionGpuModified(device_addr, size)) {
@@ -350,7 +378,8 @@ for pre, post, cls in zip(prepare, after_write, ['RasterizerVulkan', 'Rasterizer
                    'VideoCommon::CacheType w) { InvalidateRegion(a, s, w); }')
     fixture += text.replace('{', '{ events.push_back(4);', 1) + '\n'
 fixture += r'''
-void write_block(BufferCache<int>& cache, bool big, bool unsafe = false, u64 addr = 600, u64 size = 4) {
+void write_block(BufferCache<int>& cache, bool big, bool unsafe = false, u64 addr = 600,
+                 u64 size = 4, bool inline_page_writes_enabled = true) {
     auto& memory = cache.device_memory;
     RasterizerVulkan raster{cache}; auto* rasterizer = &raster;
     std::array<u64, 1> page_table{0}, big_page_table_dev{0};
@@ -372,6 +401,16 @@ int main(int argc, char**) {
     Tegra::g_nx2_ampere.store(std::getenv("UB062_NX2")[0] == '1');
     bool enabled = argc == 2;
     for (bool big : {false, true}) {
+        // Host1x/VIC on the CDMA thread shares the rasterizer but leaves the instance flag off.
+        // Even a qualifying write with env/Ampere enabled must never record an inline upload.
+        BufferCache<int> host1x;
+        host1x.pending_downloads.Add(600, 4); host1x.async_downloads.Add(600, 4);
+        write_block(host1x, big, false, 600, 4, false);
+        assert((events == std::vector<int>{1, 2}));
+        assert(host1x.device_memory.guest[600] == 0x33);
+        assert(host1x.slot_buffers[1].uploaded == 0 && host1x.memory_tracker.cpu);
+        assert(host1x.creations == 0 && host1x.gpu_modified_ranges.bits[700]);
+        assert(!host1x.pending_downloads.bits[600] && !host1x.async_downloads.bits[600]);
         // Both adjacent and overlapping GPU bytes use ONLY the post-copy WriteBlock entry.
         for (u64 addr : {128, 600}) {
             BufferCache<int> cache;
