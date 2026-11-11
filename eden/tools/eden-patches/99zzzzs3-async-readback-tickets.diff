@@ -34,7 +34,7 @@ read downloads first. The GPU thread runs nothing else during the wait, so none 
      const bool is_dirty = IsRegionRegistered(device_addr, size);
      if (!is_dirty) {
          return false;
-@@ -286,6 +288,122 @@
+@@ -286,6 +288,125 @@
  }
  
  template <class P>
@@ -105,7 +105,10 @@ read downloads first. The GPU thread runs nothing else during the wait, so none 
 +
 +template <class P>
 +void BufferCache<P>::WaitReadDownload(u64 tick) {
-+    runtime.Wait(tick);
++    // Only DownloadMemoryForRead's ticks reach here, and only runtimes with Wait make them.
++    if constexpr (requires { runtime.Wait(u64{}); }) {
++        runtime.Wait(tick);
++    }
 +}
 +
 +template <class P>
