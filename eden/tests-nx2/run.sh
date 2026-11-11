@@ -44,6 +44,7 @@ python3 tests-nx2/check-mapped-upload-barrier.py
 python3 tests-nx2/check-upload-batch-barriers.py
 python3 tests-nx2/check-bound-compute-storage-writes.py
 python3 tests-nx2/check-readback-refusal.py
+python3 tests-nx2/check-async-readback-tickets.py
 python3 tests-nx2/check-memory-breakdown.py
 python3 tests-nx2/check-native-spill-lut.py
 python3 tests-nx2/check-native.py
