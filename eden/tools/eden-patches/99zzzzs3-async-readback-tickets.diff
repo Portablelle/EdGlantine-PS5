@@ -1,0 +1,310 @@
+FlushRegion: wait for a read's buffer download without holding the buffer cache's lock (UB-153 core).
+Contract extracted from zortos293/Lichii 0b83798 (#1028); the GPU thread still waits, see below.
+DownloadBufferMemory waited in runtime.Finish() under buffer_cache.mutex, so every guest core that
+touched a cached page (OnCPUWrite, GetFlushArea, invalidations) spun for the host GPU round trip of
+each reactive flush. FlushRegion now asks DownloadMemoryForRead (lock held) to record the copies of
+every buffer in the range into one staging buffer and return the tick; ClearDownload drops pending
+fence copies of those bytes as before, but the ranges stay GPU-modified. A throw while recording
+cancels it. WaitReadDownload waits for the tick through BufferCacheRuntime::Wait without the lock
+(no new scheduler Wait/Finish site in vk_buffer_cache.cpp; runtimes without Wait, OpenGL, never get
+a tick and keep DownloadMemory). FinishReadDownload (lock held) writes the copied bytes that are
+still GPU-modified (WriteMemory takes invalidated bytes out) and clears the GPU-modified state as
+the precise PS5 path did. RasterizerVulkan::OnCPUWrite makes a CPU write into the copies wait until
+they land (before the block prepare-vulkan-port.py adapts): core/memory.cpp stores after it returns,
+and an exclusive store may fail, so the write goes after the landing as it did when the download
+held the lock. Other writes go on; while none is pending the check is one atomic load. A download
+recorded between that check and BufferCache::OnCPUWrite is the race main has between OnCPUWrite and
+the store. An exception
+in the wait cancels the read download: nothing written, ranges still GPU-modified. Only one read
+download at a time; another, parameter readbacks (window cache) and non-PS5 builds keep
+DownloadMemory.
+Not ported: the reading guest thread still waits for the GPU thread (RequestSyncOperation), which
+waits for the host GPU itself; upstream lets the GPU thread go on, and that needs every GPU-side
+writer of guest memory (memory manager writes, query results, DMA, fence downloads) to land pending
+read downloads first. The GPU thread runs nothing else during the wait, so none of them can.
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -283,12 +283,133 @@
+     ForEachBufferInRange(device_addr, size, [&](BufferId, Buffer& buffer) {
+         DownloadBufferMemory(buffer, device_addr, size);
+     });
+ }
+ 
+ template <class P>
++u64 BufferCache<P>::DownloadMemoryForRead(DAddr device_addr, u64 size) {
++#ifdef EDEN_NX2_PS5_PROTO
++    if constexpr (USE_MEMORY_MAPS && requires { runtime.CurrentTick(); runtime.Wait(u64{}); }) {
++        // One read download at a time; parameter readbacks keep their window cache.
++        if (!read_download.active && !IsParameterReadback(device_addr, size)) {
++            read_download.active = true;
++            bool recorded = false;
++            SCOPE_EXIT {
++                if (!recorded) {
++                    CancelReadDownload();
++                }
++            };
++            boost::container::small_vector<std::pair<BufferId, BufferCopy>, 4> copies;
++            u64 total_size_bytes = 0;
++            // The ranges DownloadBufferMemory's precise path copies, cleared the same way except
++            // that they stay GPU-modified until FinishReadDownload.
++            ForEachBufferInRange(device_addr, size, [&](BufferId buffer_id, Buffer& buffer) {
++                const DAddr begin = std::max(device_addr, buffer.CpuAddr());
++                const DAddr end = std::min(device_addr + size, buffer.CpuAddr() + buffer.SizeBytes());
++                if (end <= begin) {
++                    return;
++                }
++                read_download.requests.emplace_back(begin, end - begin);
++                memory_tracker.ForEachDownloadRange(
++                    begin, end - begin, false, [&](u64 range_addr, u64 range_size) {
++                        const DAddr range_end = std::min(range_addr + range_size, end);
++                        range_addr = std::max(range_addr, begin);
++                        range_size = range_end - range_addr;
++                        gpu_modified_ranges.ForEachInRange(
++                            range_addr, range_size, [&](DAddr start, DAddr stop) {
++                                copies.push_back({buffer_id, BufferCopy{
++                                                                 .src_offset = start - buffer.CpuAddr(),
++                                                                 .dst_offset = total_size_bytes,
++                                                                 .size = stop - start,
++                                                             }});
++                                total_size_bytes += Common::AlignUp(stop - start, 64);
++                            });
++                        ClearDownload(range_addr, range_size);
++                        read_download.downloaded.emplace_back(range_addr, range_size);
++                    });
++            });
++            if (total_size_bytes == 0) {
++                recorded = true;
++                FinishReadDownload();
++                return 0;
++            }
++            auto staging = runtime.DownloadStagingBuffer(total_size_bytes);
++            read_download.staging = staging.mapped_span.data();
++            for (size_t first = 0; first < copies.size();) {
++                const BufferId buffer_id = copies[first].first;
++                boost::container::small_vector<BufferCopy, 4> buffer_copies;
++                Buffer& buffer = slot_buffers[buffer_id];
++                for (; first < copies.size() && copies[first].first == buffer_id; ++first) {
++                    BufferCopy copy = copies[first].second;
++                    read_download.copies.push_back(
++                        {buffer.CpuAddr() + copy.src_offset, copy.size, copy.dst_offset});
++                    copy.dst_offset += staging.offset;
++                    buffer.MarkUsage(copy.src_offset, copy.size);
++                    buffer_copies.push_back(copy);
++                }
++                runtime.CopyBuffer(staging.buffer, buffer,
++                                   std::span<const BufferCopy>(buffer_copies.data(), buffer_copies.size()),
++                                   true);
++            }
++            recorded = true;
++            return runtime.CurrentTick();
++        }
++    }
++#endif
++    DownloadMemory(device_addr, size);
++    return 0;
++}
++
++template <class P>
++void BufferCache<P>::WaitReadDownload(u64 tick) {
++    // Only DownloadMemoryForRead's ticks reach here, and only runtimes with Wait make them.
++    if constexpr (requires { runtime.Wait(u64{}); }) {
++        runtime.Wait(tick);
++    }
++}
++
++template <class P>
++void BufferCache<P>::FinishReadDownload() {
++    if (!read_download.active) {
++        return;
++    }
++    for (const auto& copy : read_download.copies) {
++        // Bytes that stopped being GPU-modified since the copy was recorded (WriteMemory) hold
++        // newer values. CPU writes into the copies wait for this (RasterizerVulkan::OnCPUWrite).
++        gpu_modified_ranges.ForEachInRange(copy.device_addr, copy.size, [&](DAddr start, DAddr end) {
++            device_memory.WriteBlockUnsafe(
++                start, read_download.staging + copy.staging_offset + (start - copy.device_addr),
++                end - start);
++        });
++    }
++    for (const auto& [range_addr, range_size] : read_download.downloaded) {
++        gpu_modified_ranges.Subtract(range_addr, range_size);
++    }
++    for (const auto& [range_addr, range_size] : read_download.requests) {
++        // As DownloadBufferMemory: page bits stay for GPU bytes outside what was downloaded.
++        const DAddr page_start = Common::AlignDown(range_addr, DEVICE_PAGESIZE);
++        const DAddr page_end = Common::AlignUp(range_addr + range_size, DEVICE_PAGESIZE);
++        memory_tracker.UnmarkRegionAsGpuModified(range_addr, range_size);
++        gpu_modified_ranges.ForEachInRange(page_start, page_end - page_start,
++                                           [&](DAddr start, DAddr end) {
++                                               memory_tracker.MarkRegionAsGpuModified(start, end - start);
++                                           });
++    }
++    CancelReadDownload();
++}
++
++template <class P>
++void BufferCache<P>::CancelReadDownload() {
++    read_download.copies.clear();
++    read_download.downloaded.clear();
++    read_download.requests.clear();
++    read_download.staging = nullptr;
++    read_download.active = false;
++}
++
++template <class P>
+ void BufferCache<P>::SynchronizeStoragePointer(GPUVAddr pointer_address) {
+     if (const auto device_addr = gpu_memory->GpuToCpuAddress(pointer_address);
+         device_addr && IsRegionGpuModified(*device_addr, sizeof(u64))) {
+         DownloadMemory(*device_addr, sizeof(u64));
+     }
+ }
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -264,12 +264,43 @@
+ 
+     /// Speculative adjacent-page probe; a GPU-dirty page is left untouched.
+     bool OnCPUWriteAhead(DAddr device_addr, u64 size);
+ 
+     void DownloadMemory(DAddr device_addr, u64 size);
+ 
++    /// DownloadMemory for a guest read, split around the host GPU wait so that the wait runs
++    /// without the mutex (hold mutex). Records and submits the copies and returns the tick to
++    /// pass to WaitReadDownload, or 0 when nothing is left to wait for. The ranges stay
++    /// GPU-modified until FinishReadDownload writes them to guest memory.
++    [[nodiscard]] u64 DownloadMemoryForRead(DAddr device_addr, u64 size);
++
++    /// Waits for the host GPU to run a read download's copies (without the mutex).
++    void WaitReadDownload(u64 tick);
++
++    /// Writes the read download to guest memory, except the bytes CPU writes reached since it was
++    /// recorded, and clears its GPU-modified state (hold mutex).
++    void FinishReadDownload();
++
++    /// Drops a read download without writing it: its ranges stay GPU-modified (hold mutex).
++    void CancelReadDownload();
++
++    /// Whether a read download is recorded and not landed yet (any thread, without the mutex).
++    [[nodiscard]] bool ReadDownloadPending() const {
++        return read_download.active.load(std::memory_order_acquire);
++    }
++
++    /// Whether a read download waiting for the host GPU copies any of these bytes: a CPU write
++    /// to them must wait until it has landed (hold mutex).
++    [[nodiscard]] bool ReadDownloadOverlaps(DAddr device_addr, u64 size) const {
++        return read_download.active &&
++               std::ranges::any_of(read_download.copies, [&](const auto& copy) {
++                   return device_addr < copy.device_addr + copy.size &&
++                          copy.device_addr < device_addr + size;
++               });
++    }
++
+     /// Makes a storage buffer pointer in guest memory current before it is read: GPU-driven
+     /// dispatches have their pointer arguments written by earlier GPU work, which only the
+     /// cached buffer holds until it is downloaded.
+     void SynchronizeStoragePointer(GPUVAddr pointer_address);
+ 
+     void SynchronizeStoragePointers(std::span<const GPUVAddr> pointer_addresses);
+@@ -680,12 +711,27 @@
+     }
+ #ifdef EDEN_NX2_PS5_PROTO
+     ReadbackRangeSet<DAddr> gpu_modified_ranges;
+ #else
+     Common::RangeSet<DAddr> gpu_modified_ranges;
+ #endif
++
++    /// DownloadMemoryForRead's copies while the host GPU runs them.
++    struct ReadDownload {
++        struct Copy {
++            DAddr device_addr;
++            u64 size;
++            u64 staging_offset;
++        };
++        std::vector<Copy> copies;
++        std::vector<std::pair<DAddr, u64>> downloaded; ///< Leave gpu_modified_ranges when written
++        std::vector<std::pair<DAddr, u64>> requests;   ///< Per buffer, the bytes asked for
++        const u8* staging{};
++        std::atomic<bool> active{}; ///< Written with the mutex held
++    };
++    ReadDownload read_download;
+     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
+ 
+     // Async Buffers
+     DownloadSelectionEpochs download_selection_epochs;
+     std::deque<u64> pending_download_epochs;
+     Common::OverlapRangeSet<DAddr> async_downloads;
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -15,12 +15,13 @@
+ #include <algorithm>
+ #include <array>
+ #include <memory>
+ #include <cstdlib>
+ #include <fstream>
+ #include <filesystem>
++#include <thread>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <tuple>
+ #include <set>
+ #include <fstream>
+ #include <mutex>
+@@ -1572,14 +1573,32 @@
+     }
+     if (True(which & VideoCommon::CacheType::TextureCache)) {
+         std::scoped_lock lock{texture_cache.mutex};
+         texture_cache.DownloadMemory(addr, size);
+     }
+     if ((True(which & VideoCommon::CacheType::BufferCache))) {
+-        std::scoped_lock lock{buffer_cache.mutex};
+-        buffer_cache.DownloadMemory(addr, size);
++        // The host GPU wait runs without the buffer cache's lock: guest writes and invalidations
++        // go on meanwhile, and FinishReadDownload leaves the bytes they wrote.
++        u64 read_tick{};
++        {
++            std::scoped_lock lock{buffer_cache.mutex};
++            read_tick = buffer_cache.DownloadMemoryForRead(addr, size);
++        }
++        if (read_tick != 0) {
++            bool landed = false;
++            SCOPE_EXIT {
++                if (!landed) {
++                    std::scoped_lock lock{buffer_cache.mutex};
++                    buffer_cache.CancelReadDownload();
++                }
++            };
++            buffer_cache.WaitReadDownload(read_tick);
++            std::scoped_lock lock{buffer_cache.mutex};
++            buffer_cache.FinishReadDownload();
++            landed = true;
++        }
+     }
+     if ((True(which & VideoCommon::CacheType::QueryCache))) {
+         query_cache.FlushRegion(addr, size);
+     }
+ }
+ 
+@@ -1744,12 +1763,24 @@
+ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
+ #ifdef EDEN_NX2_PS5_PROTO
+     if (gpu_memory) Core::NativeDmaWriteTrace::Record(&gpu_memory->GetDeviceMemory(), addr,
+         size, nullptr, "CPU cache notification", 0, true);
+ #endif
+     WatchCpuWrite(gpu_memory, "write", addr, size);
++    // The caller stores after this returns, and an exclusive store may fail: a write into a read
++    // download waiting for the host GPU goes after it lands (FlushRegion), as when the download
++    // held the lock.
++    while (buffer_cache.ReadDownloadPending()) {
++        {
++            std::scoped_lock lock{buffer_cache.mutex};
++            if (!buffer_cache.ReadDownloadOverlaps(addr, size)) {
++                break;
++            }
++        }
++        std::this_thread::yield();
++    }
+     DEBUG_ASSERT(addr != 0 || size != 0);
+     {
+         std::scoped_lock lock{buffer_cache.mutex};
+         if (buffer_cache.OnCPUWrite(addr, size)) {
+             return true;
+         }

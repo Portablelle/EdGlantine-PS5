@@ -22,6 +22,7 @@ python3 tests-nx2/check-isolation.py
 python3 tests-nx2/check-vulkan-port-anchors.py
 python3 tests-nx2/check-generated-sources-built.py
 python3 tests-nx2/check-staging-idle-trim.py
+python3 tests-nx2/check-staging-upload-retain.py
 python3 tests-nx2/check-astc-per-layer-decode.py
 python3 tests-nx2/check-cheaper-astc-uploads.py
 python3 tests-nx2/check-converted-upload-chunks.py
@@ -40,8 +41,10 @@ python3 tests-nx2/check-inline-page-writes.py
 python3 tests-nx2/check-quad-index-grow-no-finish.py
 python3 tests-nx2/check-must-flush-unlocked.py
 python3 tests-nx2/check-mapped-upload-barrier.py
+python3 tests-nx2/check-upload-batch-barriers.py
 python3 tests-nx2/check-bound-compute-storage-writes.py
 python3 tests-nx2/check-readback-refusal.py
+python3 tests-nx2/check-async-readback-tickets.py
 python3 tests-nx2/check-gpu-segment-timestamps.py
 python3 tests-nx2/check-memory-breakdown.py
 python3 tests-nx2/check-native-spill-lut.py
