@@ -605,13 +605,17 @@ def offline_radv():
     if (out / 'REVISION').exists():
         return out
     mesa_fork = Path(os.environ.get('PS5_MESA_FORK', root.parent / 'mihawk-mesa-review'))
+    # The checkout may be a bind-mount owned by another user (typical on dedie).
+    git_env = dict(os.environ, GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='safe.directory',
+                   GIT_CONFIG_VALUE_0=str(mesa_fork))
     head = subprocess.run(['git', '-C', str(mesa_fork), 'rev-parse', 'HEAD'], check=True,
-                          capture_output=True, text=True).stdout.strip()
+                          capture_output=True, text=True, env=git_env).stdout.strip()
     assert head == pin, f'{mesa_fork} is at {head}, deps.json pins ps5-mesa {pin}'
     work_dir = Path(tempfile.mkdtemp(prefix='radv-offline-', dir=build))
     mesa = work_dir / 'mesa'
     mesa.mkdir()
-    archive = subprocess.run(['git', '-C', str(mesa_fork), 'archive', pin], check=True, capture_output=True).stdout
+    archive = subprocess.run(['git', '-C', str(mesa_fork), 'archive', pin], check=True,
+                             capture_output=True, env=git_env).stdout
     run(['tar', '-x', '-C', str(mesa)], input=archive)
     vulkan = mesa / 'src/amd/vulkan'
     (vulkan / 'host_gs_compute_stubs.c').write_text(GS_COMPUTE_STUBS)
