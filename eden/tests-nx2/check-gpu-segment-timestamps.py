@@ -28,6 +28,16 @@ blocks = re.findall(r'u64 timestamp = ([^;]+);\n(.*?std::memcpy\(pointer_timesta
 assert len(blocks) == 2, 'expected both CounterReport long-query writes'
 
 
+def publication_write(rhs, tail):
+    text = 'u64 timestamp = ' + rhs + ';\n' + tail
+    # The immediate Payload tail declares its payload value before the timestamp
+    # memcpy. Its payload memcpy lies outside our excerpt; consume that local here
+    # while preserving the extracted production text and strict compiler warnings.
+    if re.search(r'\bu64 value\s*=', tail):
+        text += '\n(void)value;'
+    return text
+
+
 def compile_run(harness):
     assert platform.system() == 'Linux', 'compiled check is Linux/dedie only'
     with tempfile.TemporaryDirectory(prefix='gpu-segment-clock-') as d:
@@ -52,9 +62,10 @@ struct Impl { GPU gpu; } storage;
 int main() {
     auto* impl = &storage;
     u64 out{}; auto* pointer_timestamp = &out;
+    [[maybe_unused]] const std::uint32_t payload = 42;
 '''
     for rhs, tail in blocks:
-        legacy += '{ u64 timestamp = ' + rhs + ';\n' + tail + r'''
+        legacy += '{ ' + publication_write(rhs, tail) + r'''
         if (out != 100005) {
             std::fprintf(stderr, "CounterReport published VALUE %llu, expected 100005\n",
                          static_cast<unsigned long long>(out));
@@ -200,12 +211,13 @@ for i, (rhs, tail) in enumerate(blocks):
     harness += f'void publish_{i}() {{\n' + r'''
     auto c = clock_fixture();
     u64 out{}; auto* pointer_timestamp = &out;
+    [[maybe_unused]] const std::uint32_t payload = 42;
     u64 stamp = 100005;
     Tegra::ReportTimestamp timestamp_ticket = [&](u64, const Tegra::TimestampConvert& convert) {
         return c.ReportTicks(0, false, {stamp, 7}, 109000, 112000, 900000, convert);
     };
     for (const auto expected : {u64{100005}, u64{103010}}) {
-''' + 'u64 timestamp = ' + rhs + ';\n' + tail + r'''
+''' + publication_write(rhs, tail) + r'''
         check(out == expected); stamp = 104010;
     }
 }
