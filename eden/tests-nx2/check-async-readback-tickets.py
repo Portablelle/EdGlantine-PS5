@@ -1,38 +1,48 @@
 """UB-153 (layer 99zzzzs3): a guest read's buffer download waits for the host GPU without the
-buffer cache's lock, and the bytes CPU writes reach meanwhile survive its landing.
+buffer cache's lock; CPU writes into it go after it lands, invalidated bytes are not overwritten.
 
 RasterizerVulkan::FlushRegion (the GPU-thread side of GPU::OnCPURead and every other synchronous
 flush) used to hold buffer_cache.mutex across DownloadMemory -> DownloadBufferMemory ->
 runtime.Finish(): every guest core that touched a cached page (OnCPUWrite, GetFlushArea,
 invalidations) spun for the whole host GPU round trip. Now:
  - under the lock, DownloadMemoryForRead records and submits the copies (one staging buffer for
-   all buffers in the range) and returns the tick; the ranges stay GPU-modified;
+   all buffers in the range) and returns the tick; the ranges stay GPU-modified. A throw while
+   recording cancels it (SCOPE_EXIT), so no read download stays active;
  - without the lock, WaitReadDownload waits for that tick (BufferCacheRuntime::Wait, no new
-   scheduler Wait/Finish site in vk_buffer_cache.cpp);
- - under the lock again, FinishReadDownload writes the copies to guest memory except the bytes
-   a CPU write reached since (OnCPUWrite / OnCPUWriteAhead note them) or that are no longer
-   GPU-modified (WriteMemory), then clears the GPU-modified state as DownloadBufferMemory did;
+   scheduler Wait/Finish site in vk_buffer_cache.cpp; runtimes without Wait never get a tick);
+ - under the lock again, FinishReadDownload writes the copied bytes that are still GPU-modified
+   (WriteMemory takes invalidated bytes out), then clears the GPU-modified state as
+   DownloadBufferMemory did;
+ - RasterizerVulkan::OnCPUWrite yields while a waiting read download copies the written bytes
+   (BufferCache::ReadDownloadOverlaps): core/memory.cpp stores after OnCPUWrite returns and an
+   exclusive store (WriteExclusive) may fail, so the store goes after the landing, as when the
+   download held the lock, and a failed one leaves the GPU's bytes;
  - an exception during the wait (device loss, shutdown) cancels the read download: nothing is
    written, the ranges stay GPU-modified, the staging pointer is dropped.
 
 The compiled harness (dedie: g++/clang++ with ASan/UBSan) extracts the PRODUCTION FlushRegion
 from vk_rasterizer.cpp and the PRODUCTION BufferCache bodies (WriteMemory, OnCPUWrite,
 OnCPUWriteAhead, DownloadMemory, DownloadBufferMemory and, where present, DownloadMemoryForRead,
-WaitReadDownload, FinishReadDownload, CancelReadDownload and the ReadDownload state) from
-buffer_cache.h / buffer_cache_base.h, with EDEN_NX2_PS5_PROTO defined, and runs them against a
-fake runtime whose host GPU wait plays a second guest core:
- - a write through the OnCPUWrite path (handler, then bytes) and a write through the
-   invalidation path (bytes, then WriteMemory) happen during the wait. If the lock is held, the
-   writer blocks until FlushRegion returns, as the real spin lock would;
- - no host GPU wait may run with buffer_cache.mutex held; both writes must survive; every other
-   downloaded byte must equal the GPU's (the synchronous flush's result), across two buffers;
- - GPU-modified ranges and tracker pages afterwards equal DownloadBufferMemory's;
+WaitReadDownload, FinishReadDownload, CancelReadDownload, ReadDownloadOverlaps and the ReadDownload
+state) from buffer_cache.h / buffer_cache_base.h, with EDEN_NX2_PS5_PROTO defined, and runs them
+against a fake runtime. Its copies complete only when Wait/Finish is given their tick or a later
+one, and Wait must be given the tick the copies were recorded at. Its host GPU wait plays a second
+guest core:
+ - a write through the OnCPUWrite path (handler, then bytes), an exclusive write whose
+   compare-and-swap fails (handler, no store) and a write through the invalidation path (bytes,
+   then WriteMemory) happen during the wait. A writer blocks until FlushRegion returns when the
+   lock is held (the spin lock) or when ReadDownloadOverlaps says so (OnCPUWrite's yield loop);
+ - no host GPU wait may run with buffer_cache.mutex held; the stored writes survive; the failed
+   exclusive write's bytes hold the GPU's; every other downloaded byte equals the GPU's (the
+   synchronous flush's result), across two buffers; nothing stays GPU-modified;
  - a wait that throws leaves guest memory untouched and the range GPU-modified; the staging
-   allocation is then recycled (freed) and a second flush must not touch it (ASan).
+   allocation is then recycled (freed) and a second flush must not touch it (ASan);
+ - a CopyBuffer that throws while recording leaves the range GPU-modified, and the next flush
+   still records and waits without the lock (no read download left active).
 Negative control: on main 94ddc02 (no 99zzzzs3) FlushRegion waits in runtime.Finish() with the
-lock held, and the invalidation-path write is overwritten by the late landing: the harness fails
-on behavior. --source-only on main fails the lock-scope analysis (a host GPU wait reachable from a
-call made under buffer_cache.mutex in FlushRegion).
+lock held, the invalidation-path write is overwritten by the late landing and a cancelled range is
+no longer GPU-modified: the harness fails on behavior. --source-only on main fails the lock-scope
+analysis (a host GPU wait reachable from a call made under buffer_cache.mutex in FlushRegion).
 
 Usage: check-async-readback-tickets.py [--source-only] [SOURCE_DIR]   SOURCE_DIR contains src/
 (default: this checkout's prepared build cache).
@@ -138,7 +148,7 @@ def wait_chain(name, seen=()):
 
 
 def source_checks():
-    """The split around the wait, the recording path and the CPU-write notes."""
+    """The split around the wait, the recording path and the CPU writes into the copies."""
     if 'DownloadMemoryForRead' not in [n for n, _ in calls]:
         for name, locked in calls:
             chain = wait_chain(name) if locked else None
@@ -164,20 +174,37 @@ def source_checks():
     assert not HOST_WAIT.search(record_path), 'the recording path must not wait for the host GPU'
     assert 'DownloadMemory(' not in record_path and 'DownloadBufferMemory(' not in record_path
     assert 'return runtime.CurrentTick();' in record_path
+    guard = record_path.index('SCOPE_EXIT {')
+    assert record_path.index('read_download.active = true;') < guard < record_path.index('small_vector'), \
+        'the cancel guard must be installed before anything that can throw'
+    assert 'if (!recorded) {\n                    CancelReadDownload();' in record_path[guard:]
+    assert record_path.index('recorded = true;\n            return runtime.CurrentTick();') > \
+        record_path.index('runtime.CopyBuffer('), 'recorded only once every copy is recorded'
     assert 'gpu_modified_ranges.Subtract' not in record_path, 'ranges must stay GPU-modified until landed'
     assert 'ClearDownload(range_addr, range_size);' in record_path
     assert re.search(r'#ifdef EDEN_NX2_PS5_PROTO\n    if constexpr \(USE_MEMORY_MAPS && requires', record)
     assert definitions['WaitReadDownload'].count('runtime.Wait(tick);') == 1
     finish = definitions['FinishReadDownload']
-    assert finish.index('read_download.cpu_written.ForEachInRange') < finish.index('device_memory.WriteBlockUnsafe')
-    assert finish.index('device_memory.WriteBlockUnsafe') < finish.index('gpu_modified_ranges.Subtract')
-    # WriteMemory needs no note: it takes GPU-modified bytes out of gpu_modified_ranges, and
-    # FinishReadDownload writes only bytes still in it.
-    for name in ('OnCPUWrite', 'OnCPUWriteAhead'):
-        body = definitions[name]
-        assert body.split('{', 1)[1].lstrip().startswith('NoteReadDownloadWrite(device_addr, size);'), \
-            f'{name} must note CPU writes for a waiting read download first'
-    assert cache_base.count('read_download.cpu_written.Add(device_addr, size);') == 1
+    land = finish.index('gpu_modified_ranges.ForEachInRange(copy.device_addr, copy.size')
+    assert land < finish.index('device_memory.WriteBlockUnsafe') < finish.index('gpu_modified_ranges.Subtract'), \
+        'only bytes still GPU-modified land, before their GPU-modified state is cleared'
+    # A CPU write into the copies waits until they land (RasterizerVulkan::OnCPUWrite): the
+    # caller stores after it returns and an exclusive store may fail.
+    on_write = block(rasterizer, rasterizer.index('bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {'))
+    # The wait comes before the block prepare-vulkan-port.py replaces (from DEBUG_ASSERT on), which
+    # stays verbatim, so the PS5 adaptation keeps it.
+    wait = block(on_write, on_write.index('while (buffer_cache.ReadDownloadPending()) {'))
+    assert wait.index('std::scoped_lock lock{buffer_cache.mutex};') < \
+        wait.index('if (!buffer_cache.ReadDownloadOverlaps(addr, size)) {\n                break;') < \
+        wait.index('std::this_thread::yield();'), 'OnCPUWrite must wait for an overlapping read download'
+    assert on_write.index(wait) < on_write.index(
+        '    DEBUG_ASSERT(addr != 0 || size != 0);\n    {\n        std::scoped_lock lock{buffer_cache.mutex};\n'
+        '        if (buffer_cache.OnCPUWrite(addr, size)) {\n            return true;\n        }\n    }\n')
+    assert on_write.count('buffer_cache.OnCPUWrite(') == 1 and '#include <thread>' in rasterizer
+    overlaps = block(cache_base, cache_base.index('[[nodiscard]] bool ReadDownloadOverlaps(DAddr device_addr, u64 size) const {'))
+    assert 'read_download.active &&' in overlaps and 'read_download.copies' in overlaps
+    assert 'return read_download.active.load(std::memory_order_acquire);' in cache_base
+    assert 'NoteReadDownloadWrite' not in cache + cache_base and 'cpu_written' not in cache + cache_base
     # prepare-vulkan-port.py pins two scheduler Wait/Finish sites in vk_buffer_cache.cpp.
     vk_buffer_cache = (vc / 'renderer_vulkan/vk_buffer_cache.cpp').read_text()
     assert len(re.findall(r'(?m)^( +)(scheduler\.(?:Wait|Finish)\([^\n]*\);)$', vk_buffer_cache)) == 2
@@ -203,10 +230,13 @@ state = ''
 if 'struct ReadDownload {' in cache_base:
     state = block(cache_base, cache_base.index('    struct ReadDownload {')) + ';\n'
     state += '    ReadDownload read_download;\n'
-    state += block(cache_base, cache_base.index('    void NoteReadDownloadWrite(')) + '\n'
+    for head in ('    [[nodiscard]] bool ReadDownloadPending(', '    [[nodiscard]] bool ReadDownloadOverlaps('):
+        if (at := cache_base.find(head)) >= 0:
+            state += block(cache_base, at) + '\n'
 
 harness = r'''
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -319,12 +349,13 @@ struct Mutex {
     void unlock() { --depth; }
 };
 struct Staging { int buffer; u64 offset; std::span<u8> mapped_span; };
-struct PendingCopy { Buffer* src; u8* dst; BufferCopy copy; };
+struct PendingCopy { Buffer* src; u8* dst; BufferCopy copy; u64 tick; };
 struct Runtime {
     Mutex* mutex{};
     u64 tick = 1;
-    int locked_waits = 0, waits = 0;
-    bool throw_in_wait = false;
+    int locked_waits = 0, waits = 0, early_waits = 0;
+    u64 last_copy_tick = 0, last_wait_tick = 0;
+    bool throw_in_wait = false, throw_in_copy = false;
     std::vector<std::unique_ptr<std::vector<u8>>> stagings;
     std::vector<PendingCopy> pending;
     std::function<void()> during_wait;
@@ -334,20 +365,28 @@ struct Runtime {
         return Staging{int(stagings.size()), 64, std::span<u8>(stagings.back()->data() + 64, size)};
     }
     void CopyBuffer(int dst, Buffer& src, std::span<const BufferCopy> copies, bool) {
-        for (const auto& c : copies) pending.push_back({&src, stagings[dst - 1]->data(), c});
+        if (throw_in_copy) throw std::bad_alloc();
+        for (const auto& c : copies) pending.push_back({&src, stagings[dst - 1]->data(), c, tick});
+        last_copy_tick = tick;
     }
-    void HostWait() {
+    // Scheduler::Wait: submits the current tick if asked for it, then waits for that tick only.
+    void HostWait(u64 wanted) {
         ++waits;
+        last_wait_tick = wanted;
         if (mutex->depth > 0) ++locked_waits;
-        for (auto& p : pending) std::memcpy(p.dst + p.copy.dst_offset, p.src->gpu.data() + p.copy.src_offset, p.copy.size);
-        pending.clear();
-        ++tick;
+        std::erase_if(pending, [&](const PendingCopy& p) {
+            if (p.tick > wanted) return false;
+            std::memcpy(p.dst + p.copy.dst_offset, p.src->gpu.data() + p.copy.src_offset, p.copy.size);
+            return true;
+        });
+        if (!pending.empty()) ++early_waits; // copies recorded before the wait are still running
+        if (wanted >= tick) ++tick;
         if (during_wait) { auto f = std::move(during_wait); during_wait = nullptr; f(); }
         if (throw_in_wait) throw std::runtime_error("device lost during the wait");
     }
     u64 CurrentTick() { return tick; }
-    void Wait(u64) { HostWait(); }
-    void Finish() { HostWait(); }
+    void Wait(u64 wanted) { HostWait(wanted); }
+    void Finish() { HostWait(tick); }
     void Recycle() { for (auto& s : stagings) { s.reset(); } }
 };
 struct FakeParams { static constexpr bool USE_MEMORY_MAPS = true; };
@@ -405,12 +444,27 @@ static void Setup(Vulkan::RasterizerVulkan& r) {
     c.MarkWritten(base + 0x3f00, 0x200);   // across both buffers
 }
 static bool StillGpuModified(Vulkan::RasterizerVulkan& r, u64 a, u64 s) { return r.buffer_cache.gpu_modified_ranges.Intersects(a, s); }
+// Whether a guest core writing these bytes is held until FlushRegion returns: by the spin lock
+// (held across the wait), or by RasterizerVulkan::OnCPUWrite's yield loop (ReadDownloadPending,
+// then ReadDownloadOverlaps under the lock) before it calls BufferCache::OnCPUWrite.
+template <class Cache>
+static bool WriterWaits(Cache& c, u64 a, u64 s) {
+    if (c.mutex.depth > 0) return true;
+    if constexpr (requires { c.ReadDownloadOverlaps(a, s); }) {
+        if (!c.ReadDownloadPending()) return false;
+        std::scoped_lock lock{c.mutex};
+        return c.ReadDownloadOverlaps(a, s);
+    }
+    return false;
+}
 int main() {
     { // A read download alone: the synchronous flush's bytes and state.
         Vulkan::RasterizerVulkan r; Setup(r); auto& c = r.buffer_cache;
         r.FlushRegion(base, 0x6000, CacheType::BufferCache);
         EXPECT(c.runtime.waits >= 1);
         EXPECT(c.runtime.locked_waits == 0); // main: runtime.Finish() under buffer_cache.mutex
+        EXPECT(c.runtime.early_waits == 0 && c.runtime.pending.empty());
+        EXPECT(c.runtime.last_wait_tick == c.runtime.last_copy_tick); // the tick returned at record
         for (u64 a = base; a < base + 0x6000; ++a) {
             const bool written = (a >= base + 0x100 && a < base + 0x2100) || (a >= base + 0x3f00 && a < base + 0x4100);
             if (c.device_memory.At(a) != (written ? GpuByte(a) : 0x11)) { std::fprintf(stderr, "byte %llx\n", (unsigned long long)a); ++fails; break; }
@@ -434,12 +488,14 @@ int main() {
             // Invalidation path (ThreadManager::InvalidateRegion): the bytes, then WriteMemory.
             c.device_memory.WriteBlockUnsafe(base + 0x1800, y, 8);
             auto invalidate_y = [&] { std::scoped_lock lock{c.mutex}; c.WriteMemory(base + 0x1800, 8); };
-            if (c.mutex.depth > 0) { // the spin lock holds them until FlushRegion releases it
-                after.push_back([=] { on_cpu_write(); write_x(); });
-                after.push_back(invalidate_y);
-            } else {
-                on_cpu_write(); write_x(); invalidate_y();
-            }
+            // WriteExclusive whose compare-and-swap fails: the handler runs, nothing is stored.
+            auto failed_cas = [&] { std::scoped_lock lock{c.mutex}; (void)c.OnCPUWrite(base + 0x300, 4); };
+            if (WriterWaits(c, base + 0x200, 4)) after.push_back([=] { on_cpu_write(); write_x(); });
+            else { on_cpu_write(); write_x(); }
+            if (WriterWaits(c, base + 0x300, 4)) after.push_back(failed_cas);
+            else failed_cas();
+            if (c.mutex.depth > 0) after.push_back(invalidate_y); // the spin lock
+            else invalidate_y();
         };
         r.FlushRegion(base, 0x6000, CacheType::BufferCache);
         for (auto& f : after) f();
@@ -449,6 +505,8 @@ int main() {
         for (u64 i = 0; i < 8; ++i) EXPECT(c.device_memory.At(base + 0x1800 + i) == 0x6B); // main: clobbered
         EXPECT(c.device_memory.At(base + 0x1ff) == GpuByte(base + 0x1ff));
         EXPECT(c.device_memory.At(base + 0x204) == GpuByte(base + 0x204));
+        for (u64 i = 0; i < 4; ++i) EXPECT(c.device_memory.At(base + 0x300 + i) == GpuByte(base + 0x300 + i));
+        EXPECT(c.runtime.early_waits == 0 && c.runtime.pending.empty());
         EXPECT(c.device_memory.At(base + 0x17ff) == GpuByte(base + 0x17ff));
         EXPECT(c.device_memory.At(base + 0x1808) == GpuByte(base + 0x1808));
         EXPECT(c.device_memory.At(base + 0x40ff) == GpuByte(base + 0x40ff));
@@ -469,6 +527,22 @@ int main() {
         r.FlushRegion(base, 0x6000, CacheType::BufferCache);
         EXPECT(c.device_memory.At(base + 0x100) == GpuByte(base + 0x100));
         EXPECT(c.device_memory.At(base + 0x4000) == GpuByte(base + 0x4000));
+        EXPECT(!StillGpuModified(r, base, 0x6000));
+    }
+    { // Recording throws (allocation, CopyBuffer): no read download stays active.
+        Vulkan::RasterizerVulkan r; Setup(r); auto& c = r.buffer_cache;
+        c.runtime.throw_in_copy = true;
+        bool threw = false;
+        try { r.FlushRegion(base, 0x6000, CacheType::BufferCache); } catch (const std::bad_alloc&) { threw = true; }
+        EXPECT(threw);
+        EXPECT(c.mutex.depth == 0);
+        EXPECT(c.device_memory.At(base + 0x100) == 0x11);
+        EXPECT(StillGpuModified(r, base + 0x100, 0x2000) && StillGpuModified(r, base + 0x3f00, 0x200));
+        c.runtime.throw_in_copy = false;
+        r.FlushRegion(base, 0x6000, CacheType::BufferCache); // still a read download, not DownloadMemory
+        EXPECT(c.runtime.locked_waits == 0);
+        EXPECT(c.device_memory.At(base + 0x100) == GpuByte(base + 0x100));
+        EXPECT(c.device_memory.At(base + 0x40ff) == GpuByte(base + 0x40ff));
         EXPECT(!StillGpuModified(r, base, 0x6000));
     }
     return fails ? 3 : 0;

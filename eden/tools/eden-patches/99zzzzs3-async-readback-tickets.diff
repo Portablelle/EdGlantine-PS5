@@ -4,37 +4,30 @@ DownloadBufferMemory waited in runtime.Finish() under buffer_cache.mutex, so eve
 touched a cached page (OnCPUWrite, GetFlushArea, invalidations) spun for the host GPU round trip of
 each reactive flush. FlushRegion now asks DownloadMemoryForRead (lock held) to record the copies of
 every buffer in the range into one staging buffer and return the tick; ClearDownload drops pending
-fence copies of those bytes as before, but the ranges stay GPU-modified. WaitReadDownload waits for
-the tick through BufferCacheRuntime::Wait without the lock (no new scheduler Wait/Finish site in
-vk_buffer_cache.cpp). FinishReadDownload (lock held) writes only bytes still GPU-modified that no CPU
-write reached since the record: OnCPUWrite / OnCPUWriteAhead note their range while a read download
-waits (core/memory.cpp calls them before it writes the bytes), WriteMemory takes its bytes out of
-gpu_modified_ranges. It then clears the GPU-modified state as the precise PS5 path did. An exception
-in the wait cancels it: nothing written, ranges still GPU-modified. Only one read download at a time;
-another, parameter readbacks (window cache) and non-PS5 builds keep DownloadMemory.
+fence copies of those bytes as before, but the ranges stay GPU-modified. A throw while recording
+cancels it. WaitReadDownload waits for the tick through BufferCacheRuntime::Wait without the lock
+(no new scheduler Wait/Finish site in vk_buffer_cache.cpp; runtimes without Wait, OpenGL, never get
+a tick and keep DownloadMemory). FinishReadDownload (lock held) writes the copied bytes that are
+still GPU-modified (WriteMemory takes invalidated bytes out) and clears the GPU-modified state as
+the precise PS5 path did. RasterizerVulkan::OnCPUWrite makes a CPU write into the copies wait until
+they land (before the block prepare-vulkan-port.py adapts): core/memory.cpp stores after it returns,
+and an exclusive store may fail, so the write goes after the landing as it did when the download
+held the lock. Other writes go on; while none is pending the check is one atomic load. A download
+recorded between that check and BufferCache::OnCPUWrite is the race main has between OnCPUWrite and
+the store. An exception
+in the wait cancels the read download: nothing written, ranges still GPU-modified. Only one read
+download at a time; another, parameter readbacks (window cache) and non-PS5 builds keep
+DownloadMemory.
 Not ported: the reading guest thread still waits for the GPU thread (RequestSyncOperation), which
 waits for the host GPU itself; upstream lets the GPU thread go on, and that needs every GPU-side
 writer of guest memory (memory manager writes, query results, DMA, fence downloads) to land pending
 read downloads first. The GPU thread runs nothing else during the wait, so none of them can.
 --- a/src/video_core/buffer_cache/buffer_cache.h
 +++ b/src/video_core/buffer_cache/buffer_cache.h
-@@ -230,6 +230,7 @@
- 
- template <class P>
- bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
-+    NoteReadDownloadWrite(device_addr, size);
-     DropPendingFenceCopies(device_addr, size, pending_downloads, async_downloads);
-     if (!IsRegionRegistered(device_addr, size)) return false;
-     if (memory_tracker.IsRegionGpuModified(device_addr, size)) return true;
-@@ -239,6 +240,7 @@
- 
- template <class P>
- bool BufferCache<P>::OnCPUWriteAhead(DAddr device_addr, u64 size) {
-+    NoteReadDownloadWrite(device_addr, size);
-     const bool is_dirty = IsRegionRegistered(device_addr, size);
-     if (!is_dirty) {
-         return false;
-@@ -286,6 +288,125 @@
+@@ -283,12 +283,133 @@
+     ForEachBufferInRange(device_addr, size, [&](BufferId, Buffer& buffer) {
+         DownloadBufferMemory(buffer, device_addr, size);
+     });
  }
  
  template <class P>
@@ -44,6 +37,12 @@ read downloads first. The GPU thread runs nothing else during the wait, so none 
 +        // One read download at a time; parameter readbacks keep their window cache.
 +        if (!read_download.active && !IsParameterReadback(device_addr, size)) {
 +            read_download.active = true;
++            bool recorded = false;
++            SCOPE_EXIT {
++                if (!recorded) {
++                    CancelReadDownload();
++                }
++            };
 +            boost::container::small_vector<std::pair<BufferId, BufferCopy>, 4> copies;
 +            u64 total_size_bytes = 0;
 +            // The ranges DownloadBufferMemory's precise path copies, cleared the same way except
@@ -74,6 +73,7 @@ read downloads first. The GPU thread runs nothing else during the wait, so none 
 +                    });
 +            });
 +            if (total_size_bytes == 0) {
++                recorded = true;
 +                FinishReadDownload();
 +                return 0;
 +            }
@@ -95,6 +95,7 @@ read downloads first. The GPU thread runs nothing else during the wait, so none 
 +                                   std::span<const BufferCopy>(buffer_copies.data(), buffer_copies.size()),
 +                                   true);
 +            }
++            recorded = true;
 +            return runtime.CurrentTick();
 +        }
 +    }
@@ -117,14 +118,9 @@ read downloads first. The GPU thread runs nothing else during the wait, so none 
 +        return;
 +    }
 +    for (const auto& copy : read_download.copies) {
-+        // Bytes a CPU write reached, or that stopped being GPU-modified (WriteMemory), since the
-+        // copy was recorded hold newer values than the copy.
-+        Common::RangeSet<DAddr> land;
-+        gpu_modified_ranges.ForEachInRange(copy.device_addr, copy.size,
-+                                           [&](DAddr start, DAddr end) { land.Add(start, end - start); });
-+        read_download.cpu_written.ForEachInRange(
-+            copy.device_addr, copy.size, [&](DAddr start, DAddr end) { land.Subtract(start, end - start); });
-+        land.ForEach([&](DAddr start, DAddr end) {
++        // Bytes that stopped being GPU-modified since the copy was recorded (WriteMemory) hold
++        // newer values. CPU writes into the copies wait for this (RasterizerVulkan::OnCPUWrite).
++        gpu_modified_ranges.ForEachInRange(copy.device_addr, copy.size, [&](DAddr start, DAddr end) {
 +            device_memory.WriteBlockUnsafe(
 +                start, read_download.staging + copy.staging_offset + (start - copy.device_addr),
 +                end - start);
@@ -151,7 +147,6 @@ read downloads first. The GPU thread runs nothing else during the wait, so none 
 +    read_download.copies.clear();
 +    read_download.downloaded.clear();
 +    read_download.requests.clear();
-+    read_download.cpu_written.Clear();
 +    read_download.staging = nullptr;
 +    read_download.active = false;
 +}
@@ -160,9 +155,15 @@ read downloads first. The GPU thread runs nothing else during the wait, so none 
  void BufferCache<P>::SynchronizeStoragePointer(GPUVAddr pointer_address) {
      if (const auto device_addr = gpu_memory->GpuToCpuAddress(pointer_address);
          device_addr && IsRegionGpuModified(*device_addr, sizeof(u64))) {
+         DownloadMemory(*device_addr, sizeof(u64));
+     }
+ }
 --- a/src/video_core/buffer_cache/buffer_cache_base.h
 +++ b/src/video_core/buffer_cache/buffer_cache_base.h
-@@ -267,6 +267,22 @@
+@@ -264,12 +264,43 @@
+ 
+     /// Speculative adjacent-page probe; a GPU-dirty page is left untouched.
+     bool OnCPUWriteAhead(DAddr device_addr, u64 size);
  
      void DownloadMemory(DAddr device_addr, u64 size);
  
@@ -182,10 +183,31 @@ read downloads first. The GPU thread runs nothing else during the wait, so none 
 +    /// Drops a read download without writing it: its ranges stay GPU-modified (hold mutex).
 +    void CancelReadDownload();
 +
++    /// Whether a read download is recorded and not landed yet (any thread, without the mutex).
++    [[nodiscard]] bool ReadDownloadPending() const {
++        return read_download.active.load(std::memory_order_acquire);
++    }
++
++    /// Whether a read download waiting for the host GPU copies any of these bytes: a CPU write
++    /// to them must wait until it has landed (hold mutex).
++    [[nodiscard]] bool ReadDownloadOverlaps(DAddr device_addr, u64 size) const {
++        return read_download.active &&
++               std::ranges::any_of(read_download.copies, [&](const auto& copy) {
++                   return device_addr < copy.device_addr + copy.size &&
++                          copy.device_addr < device_addr + size;
++               });
++    }
++
      /// Makes a storage buffer pointer in guest memory current before it is read: GPU-driven
      /// dispatches have their pointer arguments written by earlier GPU work, which only the
      /// cached buffer holds until it is downloaded.
-@@ -683,6 +699,29 @@
+     void SynchronizeStoragePointer(GPUVAddr pointer_address);
+ 
+     void SynchronizeStoragePointers(std::span<const GPUVAddr> pointer_addresses);
+@@ -680,12 +711,27 @@
+     }
+ #ifdef EDEN_NX2_PS5_PROTO
+     ReadbackRangeSet<DAddr> gpu_modified_ranges;
  #else
      Common::RangeSet<DAddr> gpu_modified_ranges;
  #endif
@@ -200,24 +222,36 @@ read downloads first. The GPU thread runs nothing else during the wait, so none 
 +        std::vector<Copy> copies;
 +        std::vector<std::pair<DAddr, u64>> downloaded; ///< Leave gpu_modified_ranges when written
 +        std::vector<std::pair<DAddr, u64>> requests;   ///< Per buffer, the bytes asked for
-+        Common::RangeSet<DAddr> cpu_written;           ///< Newer than the copies: not written
 +        const u8* staging{};
-+        bool active{};
++        std::atomic<bool> active{}; ///< Written with the mutex held
 +    };
 +    ReadDownload read_download;
-+
-+    /// A CPU write reached these bytes: a read download waiting for the host GPU leaves them.
-+    void NoteReadDownloadWrite(DAddr device_addr, u64 size) {
-+        if (read_download.active) {
-+            read_download.cpu_written.Add(device_addr, size);
-+        }
-+    }
      std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
  
      // Async Buffers
+     DownloadSelectionEpochs download_selection_epochs;
+     std::deque<u64> pending_download_epochs;
+     Common::OverlapRangeSet<DAddr> async_downloads;
 --- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
 +++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
-@@ -1575,8 +1575,26 @@
+@@ -15,12 +15,13 @@
+ #include <algorithm>
+ #include <array>
+ #include <memory>
+ #include <cstdlib>
+ #include <fstream>
+ #include <filesystem>
++#include <thread>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <tuple>
+ #include <set>
+ #include <fstream>
+ #include <mutex>
+@@ -1572,14 +1573,32 @@
+     }
+     if (True(which & VideoCommon::CacheType::TextureCache)) {
+         std::scoped_lock lock{texture_cache.mutex};
          texture_cache.DownloadMemory(addr, size);
      }
      if ((True(which & VideoCommon::CacheType::BufferCache))) {
@@ -246,3 +280,31 @@ read downloads first. The GPU thread runs nothing else during the wait, so none 
      }
      if ((True(which & VideoCommon::CacheType::QueryCache))) {
          query_cache.FlushRegion(addr, size);
+     }
+ }
+ 
+@@ -1744,12 +1763,24 @@
+ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
+ #ifdef EDEN_NX2_PS5_PROTO
+     if (gpu_memory) Core::NativeDmaWriteTrace::Record(&gpu_memory->GetDeviceMemory(), addr,
+         size, nullptr, "CPU cache notification", 0, true);
+ #endif
+     WatchCpuWrite(gpu_memory, "write", addr, size);
++    // The caller stores after this returns, and an exclusive store may fail: a write into a read
++    // download waiting for the host GPU goes after it lands (FlushRegion), as when the download
++    // held the lock.
++    while (buffer_cache.ReadDownloadPending()) {
++        {
++            std::scoped_lock lock{buffer_cache.mutex};
++            if (!buffer_cache.ReadDownloadOverlaps(addr, size)) {
++                break;
++            }
++        }
++        std::this_thread::yield();
++    }
+     DEBUG_ASSERT(addr != 0 || size != 0);
+     {
+         std::scoped_lock lock{buffer_cache.mutex};
+         if (buffer_cache.OnCPUWrite(addr, size)) {
+             return true;
+         }
