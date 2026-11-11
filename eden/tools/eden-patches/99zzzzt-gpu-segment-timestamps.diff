@@ -1,0 +1,417 @@
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -102,6 +102,8 @@
+     native_root_table.h
+     native_semaphore.h
+     gpu_timestamp.h
++    gpu_segment_clock.h
++    renderer_vulkan/vk_guest_timestamp.inc
+     gpu_split.cpp
+     gpu_split.h
+     gpu_thread.cpp
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -13,6 +13,7 @@
+ #include <utility>
+ 
+ #include "common/assert.h"
++#include "common/cpu_features.h"
+ #include "common/settings.h"
+ #include "common/settings_enums.h"
+ #include "core/core.h"
+@@ -158,6 +159,10 @@
+         }
+     }
+ 
++    u64 GetTimestampNs() const {
++        return static_cast<u64>(system.CoreTiming().GetGlobalTimeNs().count());
++    }
++
+     [[nodiscard]] u64 GetTicks() const {
+         return ReadGpuTimestamp(system.CoreTiming(), g_nx2_ampere.load(std::memory_order_relaxed),
+                                 Settings::values.gpu_clock.GetValue());
+@@ -487,6 +492,22 @@
+     return impl->GetAppletCaptureBuffer();
+ }
+ 
++u64 GPU::GetTimestampNs() const {
++    return impl->GetTimestampNs();
++}
++
++u64 GPU::TimestampFromNs(u64 ns) const {
++    struct Sample {
++        u64 ns;
++        u64 GetGPUTicks() const { return Common::WallClock::NSToGPUTick(ns); }
++        std::chrono::nanoseconds GetGlobalTimeNs() const {
++            return std::chrono::nanoseconds{static_cast<s64>(ns)};
++        }
++    };
++    return ReadGpuTimestamp(Sample{ns}, g_nx2_ampere.load(std::memory_order_relaxed),
++                            Settings::values.gpu_clock.GetValue());
++}
++
+ u64 GPU::GetTicks() const {
+     return impl->GetTicks();
+ }
+--- a/src/video_core/gpu.h
++++ b/src/video_core/gpu.h
+@@ -214,6 +214,8 @@
+     [[nodiscard]] const VideoCore::ShaderNotify& ShaderNotify() const;
+ 
+     [[nodiscard]] u64 GetTicks() const;
++    [[nodiscard]] u64 GetTimestampNs() const;
++    [[nodiscard]] u64 TimestampFromNs(u64 ns) const;
+ 
+     [[nodiscard]] bool IsAsync() const;
+ 
+--- /dev/null
++++ b/src/video_core/gpu_segment_clock.h
+@@ -0,0 +1,76 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <functional>
++#include <vector>
++#include "common/common_types.h"
++
++namespace Tegra {
++
++// Guest nanoseconds throughout. Zero means unavailable, never a reason to wait.
++struct SegmentClock {
++    struct Segment { u64 start{}, end{}; };
++    struct Stamp { u64 ns{}, epoch{}; };
++    std::vector<Segment> segments;
++    std::vector<size_t> commits;
++    u64 begin{}, epoch{}, published{};
++
++    u64 IdleBefore(u64 ns, u64 c0) const {
++        u64 idle = 0;
++        for (size_t i = 0; i < commits.size(); ++i) {
++            const u64 e = segments[commits[i]].end;
++            const u64 s = i + 1 < commits.size() ? segments[commits[i + 1]].start : c0;
++            if (e && s > e && ns >= e + (s - e) / 2) idle += s - e;
++        }
++        return idle;
++    }
++
++    template <typename Convert>
++    u64 ReportTicks(size_t segment, bool top, Stamp stamp, u64 c0, u64 c1,
++                    u64 fallback, Convert convert) {
++        u64 ns = stamp.epoch == epoch ? stamp.ns : 0;
++        if (ns && begin > ns && begin - ns > 500000) ns = 0;
++        if (!ns && segment < segments.size())
++            ns = top ? segments[segment].start : segments[segment].end;
++        if (!ns) ns = top ? c0 : c1;
++        if (ns) {
++            const u64 idle = IdleBefore(ns, c0);
++            if (idle < ns) ns -= idle;
++        }
++        const u64 ticks = ns ? convert(ns) : fallback;
++        published = std::max(published, ticks);
++        return published;
++    }
++
++    // Modular subtraction before scaling: valid-bit wrap must not become a huge duration.
++    // More than half a counter cycle is ambiguous and falls back rather than guessing.
++    static u64 DeltaNs(u64 ticks, u64 origin, u32 bits, double period) {
++        if (!bits || bits > 64 || period <= 0) return 0;
++        const u64 mask = bits == 64 ? ~u64{0} : (u64{1} << bits) - 1;
++        const u64 delta = (ticks - origin) & mask;
++        if (delta > (mask >> 1)) return 0;
++        const double ns = double(delta) * period;
++        return ns < double(~u64{0}) ? static_cast<u64>(ns) : 0;
++    }
++};
++
++using TimestampConvert = std::function<u64(u64)>;
++using ReportTimestamp = std::function<u64(u64, const TimestampConvert&)>;
++
++template <typename Runtime, typename GPU>
++ReportTimestamp CaptureReportTimestamp(Runtime& runtime, GPU& gpu, bool enabled) {
++    if constexpr (requires { runtime.CaptureTimestamp(gpu.GetTimestampNs()); }) {
++        if (enabled) return runtime.CaptureTimestamp(gpu.GetTimestampNs());
++    }
++    return {};
++}
++
++template <typename GPU>
++u64 PublishReportTimestamp(const ReportTimestamp& ticket, GPU& gpu) {
++    const u64 fallback = gpu.GetTicks();
++    return ticket ? ticket(fallback, [&](u64 ns) { return gpu.TimestampFromNs(ns); }) : fallback;
++}
++
++} // namespace Tegra
+--- a/src/video_core/query_cache/query_cache.h
++++ b/src/video_core/query_cache/query_cache.h
+@@ -22,6 +22,7 @@
+ #include "core/hle/dlss_trace.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/gpu.h"
++#include "video_core/gpu_segment_clock.h"
+ #include "video_core/native_query_trace.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+ #include "video_core/memory_manager.h"
+@@ -263,6 +264,7 @@
+     const bool native_trace = gpu_memory->UsesNativeTiling();
+     const u64 trace_asid = gpu_memory->GetID();
+     if (native_trace) TraceNativeQuery(0, trace_asid, addr, cpu_addr, static_cast<u32>(counter_type), payload, static_cast<u32>(flags));
++    const auto timestamp_ticket = Tegra::CaptureReportTimestamp(impl->runtime, impl->gpu, has_timestamp);
+     const size_t new_query_id = streamer->WriteCounter(cpu_addr, has_timestamp, payload, subreport);
+     auto* query = streamer->GetQuery(new_query_id);
+     if (is_fence) {
+@@ -279,7 +281,7 @@
+     u8* pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
+     bool is_synced = (Settings::IsGPUFenceBehaviorDefault() ? !Settings::IsGPULevelHigh() : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate()) && is_fence;
+     std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
+-                                     pointer, pointer_timestamp, native_trace, trace_asid, addr, cpu_addr, counter_type] {
++                                     pointer, pointer_timestamp, timestamp_ticket, native_trace, trace_asid, addr, cpu_addr, counter_type] {
+         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
+             if (native_trace) TraceNativeQuery(2, trace_asid, addr, cpu_addr, static_cast<u32>(counter_type), query_base->value, static_cast<u32>(query_base->flags));
+             if (!is_synced) [[likely]] {
+@@ -299,7 +301,7 @@
+         query_base->value += streamer->GetAmendValue();
+         streamer->SetAccumulationValue(query_base->value);
+         if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
+-            u64 timestamp = impl->gpu.GetTicks();
++            u64 timestamp = Tegra::PublishReportTimestamp(timestamp_ticket, impl->gpu);
+             Core::HLE::DlssTrace::WriteWatch("QueryCache guest write", pointer_timestamp, sizeof(timestamp));
+             std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
+             Core::HLE::DlssTrace::WriteWatch("QueryCache guest write", pointer, sizeof(query_base->value));
+@@ -319,7 +321,7 @@
+     } else {
+         if (!Settings::IsGPULevelHigh() && counter_type == QueryType::Payload) {
+             if (has_timestamp) {
+-                u64 timestamp = impl->gpu.GetTicks();
++                u64 timestamp = Tegra::PublishReportTimestamp(timestamp_ticket, impl->gpu);
+                 u64 value = static_cast<u64>(payload);
+                 Core::HLE::DlssTrace::WriteWatch("QueryCache guest write", pointer_timestamp, sizeof(timestamp));
+                 std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/vk_guest_timestamp.inc
+@@ -0,0 +1,118 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Scheduler-owned guest query pools, independent of the opt-in profiling pools.
++struct Scheduler::GuestTimestampState {
++    static constexpr u32 Capacity = 4096;
++    struct Buffer {
++        vk::QueryPool pool;
++        Tegra::SegmentClock clock;
++        u64 tick{}, anchor_ns{};
++        u32 count = 2;
++        std::vector<u64> results;
++        bool collected{};
++    };
++    struct Ticket {
++        std::shared_ptr<Buffer> buffer;
++        u32 slot{};
++        u64 epoch{};
++    };
++    std::mutex mutex;
++    std::deque<std::shared_ptr<Buffer>> pending;
++    std::shared_ptr<Buffer> current;
++    PFN_vkCmdWriteTimestamp write{};
++    double period{};
++    u32 bits{};
++    u64 epoch{};
++    std::shared_ptr<u64> published = std::make_shared<u64>(0);
++};
++
++void Scheduler::BeginGuestTimestamps() {
++    auto& s = *guest_timestamps;
++    std::scoped_lock lock{s.mutex};
++    s.current.reset();
++    // A ticket owns its epoch's pool until publication. Never recycle live or pending queries.
++    vk::QueryPool recycled;
++    std::erase_if(s.pending, [this, &recycled](const auto& b) {
++        if (b.use_count() != 1 || !b->tick || !IsFree(b->tick)) return false;
++        if (!recycled) recycled = std::move(b->pool);
++        return true;
++    });
++    if (s.pending.size() >= 64) return; // bounded pressure fallback, no fence wait
++    if (!s.write) {
++        s.write = reinterpret_cast<PFN_vkCmdWriteTimestamp>(device.GetDispatchLoader().vkGetDeviceProcAddr(
++            *device.GetLogical(), "vkCmdWriteTimestamp"));
++        s.period = device.GetPhysical().GetProperties().limits.timestampPeriod;
++        s.bits = device.GetPhysical().GetQueueFamilyProperties()[device.GetGraphicsFamily()].timestampValidBits;
++    }
++    if (!s.write || !s.bits || s.period <= 0) return;
++    auto b = std::make_shared<GuestTimestampState::Buffer>();
++    b->pool = recycled ? std::move(recycled) : device.GetLogical().CreateQueryPool({
++        .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
++        .pNext = nullptr, .flags = 0, .queryType = VK_QUERY_TYPE_TIMESTAMP,
++        .queryCount = GuestTimestampState::Capacity, .pipelineStatistics = 0,
++    });
++    b->clock.epoch = ++s.epoch;
++    b->clock.segments.resize(1);
++    current_cmdbuf.ResetQueryPool(*b->pool, 0, GuestTimestampState::Capacity);
++    s.write(*current_cmdbuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, *b->pool, 0);
++    s.pending.push_back(b);
++    s.current = std::move(b);
++}
++
++void Scheduler::EndGuestTimestamps(vk::CommandBuffer cmdbuf, u64 tick) {
++    auto& s = *guest_timestamps;
++    std::scoped_lock lock{s.mutex};
++    if (!s.current) return;
++    s.write(*cmdbuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *s.current->pool, 1);
++    s.current->tick = tick;
++    s.current->clock.commits.push_back(0); // this scheduler submission commits one CB
++}
++
++Tegra::ReportTimestamp Scheduler::CaptureGuestTimestamp(u64 guest_ns) {
++    auto ticket = std::make_shared<GuestTimestampState::Ticket>();
++    std::shared_ptr<u64> published;
++    {
++        std::scoped_lock lock{guest_timestamps->mutex};
++        published = guest_timestamps->published;
++    }
++    Record([this, ticket, guest_ns](vk::CommandBuffer cmdbuf) {
++        auto& s = *guest_timestamps;
++        std::scoped_lock lock{s.mutex};
++        auto b = s.current;
++        if (!b) return;
++        ticket->buffer = b;
++        ticket->epoch = b->clock.epoch;
++        if (b->count == GuestTimestampState::Capacity) return;
++        ticket->slot = b->count++;
++        if (!b->anchor_ns) b->anchor_ns = guest_ns;
++        // Timestamp writes are allowed inside a render pass. Pool reset is at CB begin only.
++        s.write(*cmdbuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *b->pool, ticket->slot);
++    });
++    return [this, ticket, published](u64 fallback, const Tegra::TimestampConvert& convert) {
++        auto& s = *guest_timestamps;
++        std::scoped_lock lock{s.mutex};
++        const auto monotonic = [&](u64 ns) {
++            *published = std::max(*published, ns);
++            return *published;
++        };
++        auto b = ticket->buffer;
++        if (!b || ticket->epoch != b->clock.epoch || !b->tick || !IsFree(b->tick)) return monotonic(fallback);
++        if (!b->collected) {
++            b->results.resize(b->count);
++            if (device.GetLogical().GetQueryResults(*b->pool, 0, b->count,
++                    b->results.size() * sizeof(u64), b->results.data(), sizeof(u64),
++                    VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return monotonic(fallback);
++            // Pair the first encoded report's guest sample with its GPU stamp. This is an
++            // offset mapping, not a publish-time CPU sample; all report spans use GPU time.
++            const u64 age = Tegra::SegmentClock::DeltaNs(b->results[2], b->results[0], s.bits, s.period);
++            b->clock.begin = b->anchor_ns > age ? b->anchor_ns - age : 1;
++            b->clock.segments[0].start = b->clock.begin;
++            b->clock.segments[0].end = b->clock.begin + Tegra::SegmentClock::DeltaNs(
++                b->results[1], b->results[0], s.bits, s.period);
++            b->collected = true;
++        }
++        const u64 ns = ticket->slot ? b->clock.begin + Tegra::SegmentClock::DeltaNs(
++            b->results[ticket->slot], b->results[0], s.bits, s.period) : 0;
++        return monotonic(b->clock.ReportTicks(0, false, {ns, ticket->epoch},
++                b->clock.segments[0].start, b->clock.segments[0].end, fallback, convert));
++    };
++}
+--- a/src/video_core/renderer_vulkan/vk_query_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+@@ -1373,6 +1373,10 @@
+         staging_pool_, compute_pass_descriptor_queue, descriptor_pool, texture_cache_);
+ }
+ 
++Tegra::ReportTimestamp QueryCacheRuntime::CaptureTimestamp(u64 guest_ns) {
++    return impl->scheduler.CaptureGuestTimestamp(guest_ns);
++}
++
+ void QueryCacheRuntime::Bind3DEngine(Maxwell3D* maxwell3d) {
+     impl->maxwell3d = maxwell3d;
+ }
+--- a/src/video_core/renderer_vulkan/vk_query_cache.h
++++ b/src/video_core/renderer_vulkan/vk_query_cache.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <memory>
++#include "video_core/gpu_segment_clock.h"
+ 
+ #include "video_core/query_cache/query_cache_base.h"
+ #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+@@ -39,6 +40,8 @@
+ 
+     template <typename SyncValuesType>
+     void SyncValues(std::span<SyncValuesType> values, VkBuffer base_src_buffer = VkBuffer{});
++
++    Tegra::ReportTimestamp CaptureTimestamp(u64 guest_ns);
+ 
+     void Barriers(bool is_prebarrier);
+ 
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -32,6 +32,8 @@
+ 
+ namespace Vulkan {
+ 
++#include "video_core/renderer_vulkan/vk_guest_timestamp.inc"
++
+ void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf,
+                                          vk::CommandBuffer upload_cmdbuf) {
+     auto command = first;
+@@ -52,6 +54,7 @@
+       master_semaphore{std::make_unique<MasterSemaphore>(device)},
+       command_pool{std::make_unique<CommandPool>(*master_semaphore, device)} {
+ 
++    guest_timestamps = std::make_unique<GuestTimestampState>();
+     AcquireNewChunk();
+     AllocateWorkerCommandBuffer();
+     worker_thread = std::jthread([this](std::stop_token token) { WorkerThread(token); });
+@@ -478,6 +481,7 @@
+         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+         .pInheritanceInfo = nullptr,
+     });
++    BeginGuestTimestamps();
+ }
+ 
+ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
+@@ -487,9 +491,15 @@
+     EndPendingOperations();
+     InvalidateState();
+ 
++    {
++        std::scoped_lock lock{guest_timestamps->mutex};
++        guest_timestamps->published = std::make_shared<u64>(0);
++    }
++
+     const u64 signal_value = master_semaphore->NextTick();
+     RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
+                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
++        EndGuestTimestamps(cmdbuf, signal_value);
+         static constexpr VkMemoryBarrier WRITE_BARRIER{
+             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+             .pNext = nullptr,
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -23,6 +23,7 @@
+ #include "common/polyfill_thread.h"
+ #include "common/settings.h"
+ #include "video_core/gpu_split.h"
++#include "video_core/gpu_segment_clock.h"
+ #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ 
+@@ -49,6 +50,8 @@
+     ~Scheduler();
+ 
+     /// Sends the current execution context to the GPU.
++    Tegra::ReportTimestamp CaptureGuestTimestamp(u64 guest_ns);
++
+     u64 Flush(VkSemaphore signal_semaphore = {}, VkSemaphore wait_semaphore = {});
+ 
+     /// Sends the current execution context to the GPU and waits for it to complete.
+@@ -353,6 +356,11 @@
+ 
+     void WorkerThread(std::stop_token stop_token);
+ 
++    struct GuestTimestampState;
++    std::unique_ptr<GuestTimestampState> guest_timestamps;
++    void BeginGuestTimestamps();
++    void EndGuestTimestamps(vk::CommandBuffer cmdbuf, u64 tick);
++
+     void AllocateWorkerCommandBuffer();
+ 
+     u64 SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore);
