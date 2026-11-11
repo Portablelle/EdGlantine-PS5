@@ -3,7 +3,12 @@ import subprocess,tempfile
 r=Path(__file__).resolve().parents[1];c=Path((r/'.local/headless-cache').read_text().strip())
 t=(c/'native-local/headless/gpu.cpp').read_text()
 def method(start,end): return t[t.index(start):t.index(end,t.index(start))]
-methods=method('    template <typename Func>','    [[nodiscard]] u64 GetTicks()')+method('    void NotifyShutdown()', '    /// Obtain the CPU Context')
+# End at TickWork's class-level closing brace, not at an unrelated clock helper.
+# This retains the sync methods even when new timestamp methods follow TickWork.
+sync_start=t.index('    template <typename Func>')
+tick_work_start=t.index('    void TickWork()',sync_start)
+sync_end=t.index('\n    }\n',tick_work_start)+len('\n    }\n')
+methods=t[sync_start:sync_end]+method('    void NotifyShutdown()', '    /// Obtain the CPU Context')
 code=r'''
 #include <atomic>
 #include <cassert>
