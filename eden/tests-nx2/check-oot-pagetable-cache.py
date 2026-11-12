@@ -529,7 +529,7 @@ check(t.fills == 3 and t.is_used(POOL + 1 * MiB, 64 << 10),
       'after Reset the sub-range is tracked again (covered range cleared)')
 
 if failures:
-    print('\n'.join(failures[:20]))
+    print('\n'.join(failures))
     print(f'FAIL: {len(failures)} check(s)')
     sys.exit(1)
 print('check-oot-pagetable-cache: OK')
