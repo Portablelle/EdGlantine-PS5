@@ -1,0 +1,301 @@
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_memory.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_memory.cpp
+@@ -240,8 +240,21 @@
+     return LoadStorage32(ctx, binding, offset);
+ }
+ 
++// Offsets are relative to a binding aligned only to the device's storage buffer alignment (4 bytes
++// on AMD), so the vector view (offset >> 3 or 4) is exact only for offsets known to be multiples of
++// the access size; otherwise it reads the vector before the access.
++static bool VectorViewIsExact(EmitContext& ctx, const IR::Value& offset, u32 size) {
++    if (!ctx.profile.support_descriptor_aliasing) {
++        return false;
++    }
++    if (offset.IsImmediate()) {
++        return offset.U32() % size == 0;
++    }
++    return ctx.profile.min_ssbo_alignment >= size;
++}
++
+ Id EmitLoadStorage64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset) {
+-    if (ctx.profile.support_descriptor_aliasing) {
++    if (VectorViewIsExact(ctx, offset, sizeof(u32[2]))) {
+         return LoadStorage(ctx, binding, offset, ctx.U32[2], ctx.storage_types.U32x2,
+                            sizeof(u32[2]), &StorageDefinitions::U32x2);
+     } else {
+@@ -251,7 +264,7 @@
+ }
+ 
+ Id EmitLoadStorage128(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset) {
+-    if (ctx.profile.support_descriptor_aliasing) {
++    if (VectorViewIsExact(ctx, offset, sizeof(u32[4]))) {
+         return LoadStorage(ctx, binding, offset, ctx.U32[4], ctx.storage_types.U32x4,
+                            sizeof(u32[4]), &StorageDefinitions::U32x4);
+     } else {
+@@ -313,7 +326,7 @@
+ 
+ void EmitWriteStorage64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
+                         Id value) {
+-    if (ctx.profile.support_descriptor_aliasing) {
++    if (VectorViewIsExact(ctx, offset, sizeof(u32[2]))) {
+         WriteStorage(ctx, binding, offset, value, ctx.storage_types.U32x2, sizeof(u32[2]),
+                      &StorageDefinitions::U32x2);
+     } else {
+@@ -326,7 +339,7 @@
+ 
+ void EmitWriteStorage128(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
+                          Id value) {
+-    if (ctx.profile.support_descriptor_aliasing) {
++    if (VectorViewIsExact(ctx, offset, sizeof(u32[4]))) {
+         WriteStorage(ctx, binding, offset, value, ctx.storage_types.U32x4, sizeof(u32[4]),
+                      &StorageDefinitions::U32x4);
+     } else {
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -983,16 +983,42 @@
+             const Id ssbo_offset{OpUConvert(U32[1], OpISub(U64, addr, ssbo_addr))};
+             const Id ssbo_index{OpShiftRightLogical(U32[1], ssbo_offset, Const(shift))};
+             const Id ssbo_pointer{OpAccessChain(element_pointer, ssbo_id, zero, ssbo_index)};
+-            callback(ssbo_pointer);
++            callback(ssbo_pointer, ssbo_id, ssbo_index);
+             AddLabel(else_label);
+         }
+     }};
++    // Vector globals whose start the binding alignment does not guarantee; without descriptor
++    // aliasing the existing path is kept.
++    const auto split_vectors{[&](u32 shift) {
++        return profile.support_descriptor_aliasing && shift > 2 &&
++               profile.min_ssbo_alignment < (1U << shift);
++    }};
+     const auto define_load{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift) {
+         const Id function_type{TypeFunction(type, U64)};
+         const Id func_id{OpFunction(type, spv::FunctionControlMask::MaskNone, function_type)};
+         const Id addr{OpFunctionParameter(U64)};
+-        define_body(ssbo_member, addr, element_pointer, shift,
+-                    [&](Id ssbo_pointer) { OpReturnValue(OpLoad(type, ssbo_pointer)); });
++        // Buffers are bound at the device's storage buffer alignment (4 bytes on AMD), so an
++        // aligned 8 or 16 byte guest access can start at any word of the binding and the vector
++        // view (offset >> shift) would read the vector before it. Those accesses read the words
++        // of the buffer found for the address.
++        if (split_vectors(shift)) {
++            define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
++                        [&](Id, Id ssbo_id, Id word_index) {
++                            std::array<Id, 4> words;
++                            const u32 count{1U << (shift - 2)};
++                            for (u32 i = 0; i < count; ++i) {
++                                const Id index{i == 0 ? word_index
++                                                      : OpIAdd(U32[1], word_index, Const(i))};
++                                words[i] = OpLoad(U32[1], OpAccessChain(storage_types.U32.element,
++                                                                         ssbo_id, zero, index));
++                            }
++                            OpReturnValue(
++                                OpCompositeConstruct(type, std::span<const Id>{words.data(), count}));
++                        });
++        } else {
++            define_body(ssbo_member, addr, element_pointer, shift,
++                        [&](Id ssbo_pointer, Id, Id) { OpReturnValue(OpLoad(type, ssbo_pointer)); });
++        }
+         OpReturnValue(ConstantNull(type));
+         OpFunctionEnd();
+         return func_id;
+@@ -1002,10 +1028,24 @@
+         const Id func_id{OpFunction(void_id, spv::FunctionControlMask::MaskNone, function_type)};
+         const Id addr{OpFunctionParameter(U64)};
+         const Id data{OpFunctionParameter(type)};
+-        define_body(ssbo_member, addr, element_pointer, shift, [&](Id ssbo_pointer) {
+-            OpStore(ssbo_pointer, data);
+-            OpReturn();
+-        });
++        if (split_vectors(shift)) {
++            define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
++                        [&](Id, Id ssbo_id, Id word_index) {
++                            const u32 count{1U << (shift - 2)};
++                            for (u32 i = 0; i < count; ++i) {
++                                const Id index{i == 0 ? word_index
++                                                      : OpIAdd(U32[1], word_index, Const(i))};
++                                OpStore(OpAccessChain(storage_types.U32.element, ssbo_id, zero, index),
++                                        OpCompositeExtract(U32[1], data, i));
++                            }
++                            OpReturn();
++                        });
++        } else {
++            define_body(ssbo_member, addr, element_pointer, shift, [&](Id ssbo_pointer, Id, Id) {
++                OpStore(ssbo_pointer, data);
++                OpReturn();
++            });
++        }
+         OpReturn();
+         OpFunctionEnd();
+         return func_id;
+@@ -1041,7 +1081,7 @@
+                 OpFunction(U32[1], spv::FunctionControlMask::MaskNone, function_type);
+             const Id addr{OpFunctionParameter(U64)};
+             const Id data{OpFunctionParameter(U32[1])};
+-            define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2, [&](Id ssbo_pointer) {
++            define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2, [&](Id ssbo_pointer, Id, Id) {
+                 if (kind < operations.size()) {
+                     OpReturnValue((this->*operations[kind])(U32[1], ssbo_pointer, scope, u32_zero_value, data));
+                     return;
+@@ -1076,7 +1116,7 @@
+         const Id comparator{OpFunctionParameter(U32[1])};
+         const Id value{OpFunctionParameter(U32[1])};
+         const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
+-        define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2, [&](Id ssbo_pointer) {
++        define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2, [&](Id ssbo_pointer, Id, Id) {
+             OpReturnValue(OpAtomicCompareExchange(U32[1], ssbo_pointer, scope, u32_zero_value,
+                                                   u32_zero_value, value, comparator));
+         });
+@@ -1093,7 +1133,7 @@
+         const Id value{OpFunctionParameter(U32[1])};
+         const Id bit_offset{OpFunctionParameter(U32[1])};
+         const Id bit_count{OpFunctionParameter(U32[1])};
+-        define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2, [&](Id ssbo_pointer) {
++        define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2, [&](Id ssbo_pointer, Id, Id) {
+             const Id begin_label{OpLabel()};
+             const Id body_label{OpLabel()};
+             const Id continue_label{OpLabel()};
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -259,8 +259,7 @@
+                      descriptor_buffer_ring, render_pass_cache, buffer_cache, texture_cache,
+                      gpu.ShaderNotify()),
+       accelerate_dma(buffer_cache, texture_cache, scheduler),
+-      fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
+-      wfi_event(device.GetLogical().CreateEvent()) {
++      fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler) {
+     native_capture_session = std::make_unique<NativeDrawCaptureSession>();
+     scheduler.SetQueryCache(query_cache);
+     VideoCommon::GpuSplit::Get().SetSubmitHook(
+@@ -1482,6 +1481,23 @@
+             LOG_WARNING(HW_GPU, "{}", line);
+         }
+     }
++    // Earlier writes must be visible to the dispatch, its indirect arguments included, and what it
++    // writes to the next render pass.
++    const auto record_read_barrier = [this] {
++        static constexpr VkMemoryBarrier READ_BARRIER{
++            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
++        };
++        scheduler.Record([](vk::CommandBuffer cmdbuf) {
++            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
++                                   VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT |
++                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                                   0, READ_BARRIER);
++        });
++        scheduler.NoteComputeWrites();
++    };
+     if (indirect_address) {
+         // DispatchIndirect
+         static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
+@@ -1489,6 +1505,7 @@
+         const auto [buffer, offset] =
+             buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
+         scheduler.RequestOutsideRenderPassOperationContext();
++        record_read_barrier();
+         scheduler.Record([pipeline, indirect_buffer = buffer->Handle(),
+                           indirect_offset = offset](vk::CommandBuffer cmdbuf) {
+             if (!pipeline->IsBound()) {
+@@ -1505,14 +1522,7 @@
+         return;
+     }
+     scheduler.RequestOutsideRenderPassOperationContext();
+-    static constexpr VkMemoryBarrier READ_BARRIER{
+-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+-        .pNext = nullptr,
+-        .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+-        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+-    };
+-    scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+-                               0, READ_BARRIER); });
++    record_read_barrier();
+     scheduler.Record([pipeline, dim](vk::CommandBuffer cmdbuf) {
+         if (!pipeline->IsBound()) {
+             return;
+@@ -1912,9 +1922,15 @@
+     query_cache.NotifyWFI();
+ 
+     scheduler.RequestOutsideRenderPassOperationContext();
+-    scheduler.Record([event = *wfi_event, flags](vk::CommandBuffer cmdbuf) {
+-        cmdbuf.SetEvent(event, flags);
+-        cmdbuf.WaitEvents(event, flags, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, {}, {}, {});
++    scheduler.Record([flags](vk::CommandBuffer cmdbuf) {
++        // Later work waits for the earlier work and sees its writes.
++        static constexpr VkMemoryBarrier WFI_BARRIER{
++            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++        };
++        cmdbuf.PipelineBarrier(flags, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WFI_BARRIER);
+     });
+     fence_manager.SignalOrdering();
+ }
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -236,8 +236,6 @@
+     AccelerateDMA accelerate_dma;
+     FenceManager fence_manager;
+ 
+-    vk::Event wfi_event;
+-
+     boost::container::static_vector<u32, MAX_IMAGE_VIEWS> image_view_indices;
+     std::array<VideoCommon::ImageViewId, MAX_IMAGE_VIEWS> image_view_ids;
+     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -224,8 +224,9 @@
+     for (u32 i = 0; i < clear_value_count && i < values.size(); ++i) {
+         values[i] = clear_values[i];
+     }
+-    Record([renderpass, framebuffer_handle, render_area, values, clear_value_count](
+-               vk::CommandBuffer cmdbuf) {
++    const bool after_compute = std::exchange(compute_writes_pending, false);
++    Record([renderpass, framebuffer_handle, render_area, values, clear_value_count,
++            after_compute](vk::CommandBuffer cmdbuf) {
+         const VkRenderPassBeginInfo renderpass_bi{
+             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+             .pNext = nullptr,
+@@ -239,6 +240,18 @@
+             .clearValueCount = clear_value_count,
+             .pClearValues = clear_value_count != 0 ? values.data() : nullptr,
+         };
++        if (after_compute) {
++            // Draws read compute output as indirect arguments, vertices and resources; nothing
++            // else orders those reads after the dispatch.
++            static constexpr VkMemoryBarrier COMPUTE_TO_GRAPHICS{
++                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                .pNext = nullptr,
++                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++            };
++            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                                   VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, COMPUTE_TO_GRAPHICS);
++        }
+         cmdbuf.BeginRenderPass(renderpass_bi, VK_SUBPASS_CONTENTS_INLINE);
+     });
+     num_renderpass_images = framebuffer->NumImages();
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -107,6 +107,11 @@
+     void FlushNativeSnapshots();
+ #endif
+ 
++    /// A dispatch was recorded: the next render pass must see what it wrote.
++    void NoteComputeWrites() {
++        compute_writes_pending = true;
++    }
++
+     /// Returns true when a render pass is currently active in the scheduler state.
+     VkExtent2D ProfilingRenderArea() const { return state.render_area; }
+ 
+@@ -403,6 +408,7 @@
+ 
+     State state;
+     u64 recording_epoch = 0;
++    bool compute_writes_pending{};
+ #ifdef EDEN_NX2_PS5_PROTO
+     Tegra::NativeSnapshotBatch<VkBuffer> native_snapshots;
+ #endif

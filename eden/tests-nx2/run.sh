@@ -47,6 +47,8 @@ python3 tests-nx2/check-readback-refusal.py
 python3 tests-nx2/check-async-readback-tickets.py
 python3 tests-nx2/check-gpu-segment-timestamps.py
 python3 tests-nx2/check-tld4-ptp-square-gather.py
+python3 tests-nx2/check-ssbo-misaligned-access.py
+python3 tests-nx2/check-fragment-output-mask.py
 python3 tests-nx2/check-memory-breakdown.py
 python3 tests-nx2/check-native-spill-lut.py
 python3 tests-nx2/check-native.py
