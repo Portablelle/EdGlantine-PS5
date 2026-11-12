@@ -1,0 +1,148 @@
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_image.cpp
+@@ -4,6 +4,9 @@
+ // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
++#include <array>
++
+ #include <boost/container/static_vector.hpp>
+ 
+ #include "common/settings.h"
+@@ -91,7 +94,8 @@
+         }
+     }
+ 
+-    explicit ImageOperands(EmitContext& ctx, const IR::Value& offset, const IR::Value& offset2) {
++    explicit ImageOperands(EmitContext& ctx, IR::Inst* inst, const IR::Value& offset,
++                           const IR::Value& offset2) {
+         if (offset2.IsEmpty()) {
+             AddOffset(ctx, offset, ImageGatherOffsetAllowed);
+             return;
+@@ -107,6 +111,17 @@
+         }
+         auto read{[&](unsigned int a, unsigned int b) { return static_cast<s32>(values[a]->Arg(b).U32()); }};
+ 
++        // UB-158: four constant offsets forming a 2x2 square read the four texels of one
++        // gather at the square's corner. RADV splits a ConstOffsets gather into four
++        // image_gather4 (nir_lower_tex lower_tg4_offsets); one ConstOffset gather and a
++        // shuffle is one. Sparse gathers keep ConstOffsets: their residency differs.
++        const std::array<s32, 8> ptp{read(0, 0), read(0, 1), read(0, 2), read(0, 3),
++                                     read(1, 0), read(1, 1), read(1, 2), read(1, 3)};
++        if (CanGatherSquare(inst) && FindGatherSquare(ptp)) {
++            Add(spv::ImageOperandsMask::ConstOffset, ctx.SConst(square_x, square_y));
++            return;
++        }
++
+         const Id offsets{ctx.ConstantComposite(
+             ctx.TypeArray(ctx.S32[2], ctx.Const(4U)), ctx.SConst(read(0, 0), read(0, 1)),
+             ctx.SConst(read(0, 2), read(0, 3)), ctx.SConst(read(1, 0), read(1, 1)),
+@@ -183,7 +198,55 @@
+         return mask;
+     }
+ 
++    /// Puts a 2x2 square's gather back in the PTP offsets' order (no-op otherwise).
++    Id GatherSquareResult(EmitContext& ctx, Id result_type, Id color) const {
++        if (!square) {
++            return color;
++        }
++        return ctx.OpVectorShuffle(result_type, color, color, square_swizzle[0],
++                                   square_swizzle[1], square_swizzle[2], square_swizzle[3]);
++    }
++
+ private:
++    /// A gather's component for the texel at (dx, dy) from its (i0, j0) texel, indexed by
++    /// dx + 2 * dy: x = (i0, j1), y = (i1, j1), z = (i1, j0), w = (i0, j0).
++    static constexpr std::array<u32, 4> GATHER_SQUARE_COMPONENT{3, 2, 0, 1};
++
++    static bool CanGatherSquare(IR::Inst* inst) {
++        if (inst->GetAssociatedPseudoOperation(IR::Opcode::GetSparseFromOp)) {
++            return false;
++        }
++        const auto type{inst->Flags<IR::TextureInstInfo>().type.Value()};
++        return type == TextureType::Color2D || type == TextureType::ColorArray2D;
++    }
++
++    /// Whether the PTP offsets are (c, c+(1,0), c+(0,1), c+(1,1)) in any order, with c the
++    /// smallest x and y; records c and each offset's component of the gather at c.
++    bool FindGatherSquare(const std::array<s32, 8>& ptp) {
++        const s32 x{std::min({ptp[0], ptp[2], ptp[4], ptp[6]})};
++        const s32 y{std::min({ptp[1], ptp[3], ptp[5], ptp[7]})};
++        u32 seen{};
++        std::array<u32, 4> swizzle{};
++        for (size_t i = 0; i < 4; ++i) {
++            const s32 dx{ptp[2 * i] - x};
++            const s32 dy{ptp[2 * i + 1] - y};
++            if (dx < 0 || dx > 1 || dy < 0 || dy > 1) {
++                return false;
++            }
++            const u32 cell{static_cast<u32>(dx + 2 * dy)};
++            if ((seen & (1U << cell)) != 0) {
++                return false;
++            }
++            seen |= 1U << cell;
++            swizzle[i] = GATHER_SQUARE_COMPONENT[cell];
++        }
++        square = true;
++        square_x = x;
++        square_y = y;
++        square_swizzle = swizzle;
++        return true;
++    }
++
+     void AddOffset(EmitContext& ctx, const IR::Value& offset, bool runtime_offset_allowed) {
+         if (offset.IsEmpty()) {
+             return;
+@@ -237,6 +300,10 @@
+ 
+     boost::container::static_vector<Id, 4> operands;
+     spv::ImageOperandsMask mask{};
++    bool square{};
++    s32 square_x{};
++    s32 square_y{};
++    std::array<u32, 4> square_swizzle{};
+ };
+ 
+ Id Texture(EmitContext& ctx, IR::TextureInstInfo info, [[maybe_unused]] const IR::Value& index) {
+@@ -633,14 +700,15 @@
+     const auto info{inst->Flags<IR::TextureInstInfo>()};
+     const bool is_integer{IsTextureInteger(ctx, info)};
+     const Id result_type{is_integer ? ctx.U32[4] : ctx.F32[4]};
+-    const ImageOperands operands(ctx, offset, offset2);
++    const ImageOperands operands(ctx, inst, offset, offset2);
+     if (ctx.profile.need_gather_subpixel_offset) {
+         coords = ImageGatherSubpixelOffset(ctx, info, TextureImage(ctx, info, index), coords);
+     }
+-    const Id color{Emit(&EmitContext::OpImageSparseGather, &EmitContext::OpImageGather, ctx, inst,
+-                        result_type, Texture(ctx, info, index), coords,
+-                        ctx.Const(info.gather_component), operands.MaskOptional(),
+-                        operands.Span())};
++    const Id color{operands.GatherSquareResult(
++        ctx, result_type,
++        Emit(&EmitContext::OpImageSparseGather, &EmitContext::OpImageGather, ctx, inst,
++             result_type, Texture(ctx, info, index), coords, ctx.Const(info.gather_component),
++             operands.MaskOptional(), operands.Span()))};
+     return is_integer ? ctx.OpBitcast(ctx.F32[4], color) : color;
+ }
+ 
+@@ -649,13 +717,15 @@
+     const auto info{inst->Flags<IR::TextureInstInfo>()};
+     const bool is_integer{IsTextureInteger(ctx, info)};
+     const Id result_type{is_integer ? ctx.U32[4] : ctx.F32[4]};
+-    const ImageOperands operands(ctx, offset, offset2);
++    const ImageOperands operands(ctx, inst, offset, offset2);
+     if (ctx.profile.need_gather_subpixel_offset) {
+         coords = ImageGatherSubpixelOffset(ctx, info, TextureImage(ctx, info, index), coords);
+     }
+-    const Id color{Emit(&EmitContext::OpImageSparseDrefGather, &EmitContext::OpImageDrefGather,
+-                        ctx, inst, result_type, Texture(ctx, info, index), coords, dref,
+-                        operands.MaskOptional(), operands.Span())};
++    const Id color{operands.GatherSquareResult(
++        ctx, result_type,
++        Emit(&EmitContext::OpImageSparseDrefGather, &EmitContext::OpImageDrefGather, ctx, inst,
++             result_type, Texture(ctx, info, index), coords, dref, operands.MaskOptional(),
++             operands.Span()))};
+     return is_integer ? ctx.OpBitcast(ctx.F32[4], color) : color;
+ }
+ 
