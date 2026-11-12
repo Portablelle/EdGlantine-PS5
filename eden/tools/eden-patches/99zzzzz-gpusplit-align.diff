@@ -1,0 +1,24 @@
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -290,8 +290,10 @@
+     bool front_macros{};
+     std::unique_ptr<u64[]> ring;
+ 
+-    // Front side.
+-    u64 write_position{};
++    // Front side. x86 prefetchers pull 64-byte lines in pairs, so each side's hot cursor gets its
++    // own 128-byte block: the back writes back_engine on every engine switch, and next to the
++    // front's ring cursor it made the front miss the cache on almost every ring write.
++    alignas(128) u64 write_position{};
+     u64 published_local{};
+     u64 consumed_cache{};
+     /// Words between publishes: small right after a drain, while the back has nothing to do.
+@@ -301,7 +303,7 @@
+     void* front_after_context{};
+ 
+     // Back side.
+-    Tegra::Engines::EngineInterface* back_engine{};
++    alignas(128) Tegra::Engines::EngineInterface* back_engine{};
+     void (*after_method)(void*){};
+     void* after_method_context{};
+ 
