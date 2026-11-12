@@ -25,6 +25,7 @@ struct MemoryManager {
  Rasterizer* rasterizer=&cache;
  u64 unique_identifier=1;
  std::atomic<u64> map_serial{};  // bumped by both page table operations (memory_manager.h)
+ void NoteMapChange(GPUVAddr,size_t) { map_serial.fetch_add(1); }  // UB-178 change log
  std::map<std::pair<u64,bool>,EntryType> entries;
  EntryType GetEntry(u64 address,bool big) { return entries[{address,big}]; }
  void SetEntry(u64 address,EntryType type,bool big) { entries[{address,big}]=type; }
