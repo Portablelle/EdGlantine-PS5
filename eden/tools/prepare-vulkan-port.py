@@ -38,9 +38,11 @@ adapt('src/video_core/renderer_vulkan/vk_rasterizer.cpp', 'vulkan_rasterizer.cpp
     }
     SCOPE_EXIT { if (compute_sample) scheduler.Record([compute_sample](vk::CommandBuffer command) { NativeGpuProfile::End(command, *compute_sample); }); };
     const auto& qmd{kepler_compute->launch_description};'''),
-    # Compute synchronization (dev_vulkan.h compute_barriers): indirect
-    # dispatches returned before the pre-dispatch barrier, and no barrier made a dispatch's
-    # writes visible to later indirect arguments, vertex/index fetch, shaders or copies.
+    # Compute synchronization (dev_vulkan.h compute_barriers): UB-083 already
+    # records a pre-dispatch read barrier (and NoteComputeWrites) on both the
+    # indirect and direct paths. The optional post-dispatch write barrier still
+    # makes a dispatch's writes visible immediately to later indirect arguments,
+    # vertex/index fetch, shaders or copies, when the flag is on.
     ('void RasterizerVulkan::DispatchCompute() {',
      """namespace {
 constexpr VkMemoryBarrier COMPUTE_WRITE_BARRIER{
@@ -52,12 +54,6 @@ constexpr VkMemoryBarrier COMPUTE_WRITE_BARRIER{
                      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
                      VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
 };
-constexpr VkMemoryBarrier COMPUTE_INPUT_BARRIER{
-    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-    .pNext = nullptr,
-    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
-};
 constexpr VkPipelineStageFlags COMPUTE_CONSUMER_STAGES =
     VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
     VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
@@ -65,16 +61,6 @@ constexpr VkPipelineStageFlags COMPUTE_CONSUMER_STAGES =
 } // namespace
 
 void RasterizerVulkan::DispatchCompute() {"""),
-    ('        scheduler.RequestOutsideRenderPassOperationContext();\n        scheduler.Record([pipeline, indirect_buffer = buffer->Handle(),',
-     """        scheduler.RequestOutsideRenderPassOperationContext();
-        if (::Eden::DevVulkan::compute_barriers) {
-            scheduler.Record([](vk::CommandBuffer cmdbuf) {
-                cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
-                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
-                                       0, COMPUTE_INPUT_BARRIER);
-            });
-        }
-        scheduler.Record([pipeline, indirect_buffer = buffer->Handle(),"""),
     ('            cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);\n',
      """            cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
             if (::Eden::DevVulkan::compute_barriers)
