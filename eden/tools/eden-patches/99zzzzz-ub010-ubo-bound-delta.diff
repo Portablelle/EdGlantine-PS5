@@ -1,0 +1,814 @@
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -19,6 +19,7 @@ add_library(video_core STATIC
+     buffer_cache/buffer_cache.cpp
+     buffer_cache/buffer_cache.h
+     buffer_cache/memory_tracker_base.h
++    buffer_cache/uniform_keep.h
+     buffer_cache/usage_tracker.h
+     buffer_cache/virtual_range_cache.h
+     buffer_cache/word_manager.h
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -491,6 +491,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
+     if (!cpu_src_address || !cpu_dest_address) {
+         return false;
+     }
++    NoteUniformWrite(*cpu_dest_address, amount);
+     const bool source_dirty = IsRegionRegistered(*cpu_src_address, amount);
+     const bool dest_dirty = IsRegionRegistered(*cpu_dest_address, amount);
+     if (!source_dirty && !dest_dirty) {
+@@ -558,6 +559,7 @@ bool BufferCache<P>::DMAClear(GPUVAddr dst_address, u64 amount, u32 value) {
+     if (!cpu_dst_address) {
+         return false;
+     }
++    NoteUniformWrite(*cpu_dst_address, amount * sizeof(u32));
+     const bool dest_dirty = IsRegionRegistered(*cpu_dst_address, amount);
+     if (!dest_dirty) {
+         return false;
+@@ -644,6 +646,7 @@ void BufferCache<P>::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
+ 
+ template <class P>
+ void BufferCache<P>::UpdateGraphicsBuffers(bool is_indexed) {
++    BeginGraphicsUniforms();
+     do {
+         channel_state->has_deleted_buffers = false;
+         DoUpdateGraphicsBuffers(is_indexed);
+@@ -1436,6 +1439,13 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+     Buffer& buffer = slot_buffers[binding.buffer_id];
+     TouchBuffer(buffer, binding.buffer_id);
+     const bool has_host_buffer = binding.buffer_id != NULL_BUFFER_ID;
++    // Indirectly read native banks (below) and buffers past the stream size are never kept.
++    const bool native_bank = has_host_buffer &&
++                             (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
++                             size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling();
++    if (!native_bank && RebindKeptUniform(stage, index, binding_index, device_addr, size)) {
++        return;
++    }
+     const u32 offset = has_host_buffer ? buffer.Offset(device_addr) : 0;
+     const bool needs_alignment_stream = [&]() {
+         if constexpr (IS_OPENGL) {
+@@ -1495,10 +1505,13 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+         }
+         channel_state->fast_bound_uniform_buffers[stage] |= 1u << binding_index;
+         channel_state->uniform_buffer_binding_sizes[stage][binding_index] = size;
++        // A later draw may bind this allocation again (uniform keeps), unless read back first.
++        bool keep_stream = !native_bank && size != 0;
+         // Alignment alone may force streaming even when this range is GPU-written.
+         // Finish the exact readback before allocating the mapped upload: a download
+         // can submit/wait and retire staging allocations.
+         if (needs_alignment_stream && memory_tracker.IsRegionGpuModified(device_addr, size)) {
++            keep_stream = false;
+             SynchronizeBuffer(buffer, device_addr, size);
+             DownloadBufferMemory(buffer, device_addr, size);
+         #ifdef EDEN_NX2_PS5_PROTO
+@@ -1512,6 +1525,9 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+         // Stream buffer path to avoid stalling on non-Nvidia drivers or Vulkan
+         const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
+         device_memory.ReadBlockUnsafe(device_addr, span.data(), size);
++        if (keep_stream) {
++            KeepStreamedUniform(stage, index, device_addr, size);
++        }
+         return;
+     }
+     // Classic cached path
+@@ -2548,6 +2564,7 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
+ template <class P>
+ bool BufferCache<P>::InlineMemory(DAddr dest_address, size_t copy_size,
+                                   std::span<const u8> inlined_buffer) {
++    NoteUniformWrite(dest_address, copy_size);
+     const bool is_dirty = IsRegionRegistered(dest_address, copy_size);
+     if (!is_dirty) {
+         return false;
+@@ -2764,6 +2781,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
+ 
+ template <class P>
+ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
++    ++buffer_deletions;
+     // The synchronized-range tables hold Buffer pointers and ids that this frees.
+     nx2_synced_ranges.fill({});
+     nx2_synced_vertex_buffers.fill({});
+@@ -2990,6 +3008,72 @@ std::span<u8> BufferCache<P>::ImmediateBuffer(size_t wanted_capacity) {
+     return std::span<u8>(immediate_buffer_alloc.data(), wanted_capacity);
+ }
+ 
++template <class P>
++void BufferCache<P>::BeginGraphicsUniforms() {
++    static_assert(NUM_STAGES == UniformKeeps::Delta::NumStages);
++    UniformKeep& keep = uniform_keep;
++    UniformKeeps::TakeDelta(keep.delta);
++    const UniformKeeps::Delta& delta = keep.delta;
++    const u64 sync_serial = UniformKeeps::SyncSerial();
++    const u64 map_serial = gpu_memory != nullptr ? gpu_memory->MapSerial() : 0;
++    const bool unchanged = !delta.overflow && keep.sync_serial == sync_serial &&
++                           keep.gpu_memory == gpu_memory && keep.map_serial == map_serial &&
++                           keep.deletions == buffer_deletions;
++    keep.sync_serial = sync_serial;
++    keep.gpu_memory = gpu_memory;
++    keep.map_serial = map_serial;
++    keep.deletions = buffer_deletions;
++    if (!unchanged) {
++        UniformKeeps::ForgetAll();
++        return;
++    }
++    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
++        for (u32 mask = delta.binds[stage]; mask != 0; mask &= mask - 1) {
++            UniformKeeps::Forget(stage, static_cast<u32>(std::countr_zero(mask)));
++        }
++    }
++    for (u32 write = 0; write < delta.num_device_writes; ++write) {
++        NoteUniformWrite(delta.device_begin[write],
++                         delta.device_end[write] - delta.device_begin[write]);
++    }
++}
++
++template <class P>
++void BufferCache<P>::NoteUniformWrite(DAddr device_addr, u64 size) noexcept {
++    UniformKeeps::NoteWrite(device_addr, size);
++}
++
++template <class P>
++bool BufferCache<P>::RebindKeptUniform(size_t stage, u32 index, u32 binding_index,
++                                       DAddr device_addr, u32 size) {
++    if constexpr (UniformKeeps::StreamUniformRebindable<Runtime>) {
++        UniformKeep& keep = uniform_keep;
++        // As the stream path: never over GPU-modified pages (their guest bytes may be stale, and
++        // cached writes there skip the CPU-modified mark that ends keeps).
++        if (UniformKeeps::IsClean(stage, index, device_addr, device_addr + size) &&
++            keep.ticks[stage][index] == static_cast<u64>(runtime.CurrentTick()) &&
++            !memory_tracker.IsRegionGpuModified(device_addr, size)) {
++            runtime.RebindStreamUniform(keep.refs[stage][index], size);
++            channel_state->fast_bound_uniform_buffers[stage] |= 1u << binding_index;
++            channel_state->uniform_buffer_binding_sizes[stage][binding_index] = size;
++            return true;
++        }
++        UniformKeeps::Forget(stage, index);
++    }
++    return false;
++}
++
++template <class P>
++void BufferCache<P>::KeepStreamedUniform(size_t stage, u32 index, DAddr device_addr, u32 size) {
++    if constexpr (UniformKeeps::StreamUniformRebindable<Runtime>) {
++        UniformKeep& keep = uniform_keep;
++        UniformKeeps::Keep(stage, index, device_addr, device_addr + size);
++        keep.refs[stage][index] = runtime.LastStreamUniformRef();
++        // After the allocation: the stream region is tagged with the tick current now.
++        keep.ticks[stage][index] = static_cast<u64>(runtime.CurrentTick());
++    }
++}
++
+ template <class P>
+ bool BufferCache<P>::HasFastUniformBufferBound(size_t stage, u32 binding_index) const noexcept {
+     return ((channel_state->fast_bound_uniform_buffers[stage] >> binding_index) & 1u) != 0;
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -33,6 +33,7 @@
+ #include "common/range_sets.h"
+ #include "video_core/buffer_cache/pending_fence_copies.h"
+ #include "video_core/buffer_cache/readback_cache.h"
++#include "video_core/buffer_cache/uniform_keep.h"
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
+ #include "common/slot_vector.h"
+@@ -636,6 +637,36 @@ private:
+     void InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
+                                     std::span<const u8> inlined_buffer);
+ 
++    /// Called once per graphics draw before it binds its buffers: takes the constant buffer
++    /// delta and ends the uniform keeps whose bytes may have changed (uniform_keep.h).
++    void BeginGraphicsUniforms();
++
++    /// Ends the uniform keeps over [device_addr, device_addr + size): the bytes may differ now.
++    /// Writes reaching WriteMemory or a download end them in the memory tracker already.
++    void NoteUniformWrite(DAddr device_addr, u64 size) noexcept;
++
++    /// Binds the slot's last stream allocation again when its keep holds. False: bind normally.
++    [[nodiscard]] bool RebindKeptUniform(size_t stage, u32 index, u32 binding_index,
++                                         DAddr device_addr, u32 size);
++
++    /// The slot streamed [device_addr, device_addr + size) to the runtime's latest allocation.
++    void KeepStreamedUniform(size_t stage, u32 index, DAddr device_addr, u32 size);
++
++    using UniformKeepRef = typename UniformKeeps::StreamRef<Runtime>::type;
++    /// Which slots are clean, and for what range: UniformKeeps::g_clean.
++    struct UniformKeep {
++        std::array<std::array<UniformKeepRef, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES> refs{};
++        std::array<std::array<u64, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES> ticks{};
++        /// What the last BeginGraphicsUniforms took and saw.
++        UniformKeeps::Delta delta;
++        u64 sync_serial{};
++        u64 map_serial{};
++        /// Another address space's MapSerial can be the same number.
++        const Tegra::MemoryManager* gpu_memory{};
++        u64 deletions{};
++    } uniform_keep;
++    u64 buffer_deletions{};
++
+     Tegra::MaxwellDeviceMemoryManager& device_memory;
+ 
+     Common::SlotVector<Buffer> slot_buffers;
+diff --git a/src/video_core/buffer_cache/memory_tracker_base.h b/src/video_core/buffer_cache/memory_tracker_base.h
+--- a/src/video_core/buffer_cache/memory_tracker_base.h
++++ b/src/video_core/buffer_cache/memory_tracker_base.h
+@@ -16,6 +16,7 @@
+ 
+ #include "common/alignment.h"
+ #include "common/common_types.h"
++#include "video_core/buffer_cache/uniform_keep.h"
+ #include "video_core/buffer_cache/word_manager.h"
+ #include "video_core/gpu_written_pages.h"
+ 
+@@ -95,6 +96,8 @@ public:
+ 
+     /// Mark region as CPU modified, notifying the device_tracker about this change
+     void MarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size) {
++        // Every write the buffer cache hears of lands here (WriteMemory): uniform keeps end.
++        UniformKeeps::NoteWrite(dirty_cpu_addr, query_size);
+         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
+             manager->ChangeRegionState(Type::CPU, true, manager->cpu_addr + offset, size);
+         });
+@@ -124,6 +127,9 @@ public:
+ 
+     /// Unmark region as modified from the host GPU
+     void UnmarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
++        // Downloads put the GPU's bytes in guest memory: uniform keeps over them end. (Keeps are
++        // never bound over GPU-modified pages, so GPU writes end them through this.)
++        UniformKeeps::NoteWrite(dirty_cpu_addr, query_size);
+         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
+             manager->ChangeRegionState(Type::GPU, false, manager->cpu_addr + offset, size);
+         });
+diff --git a/src/video_core/buffer_cache/uniform_keep.h b/src/video_core/buffer_cache/uniform_keep.h
+new file mode 100644
+--- /dev/null
++++ b/src/video_core/buffer_cache/uniform_keep.h
+@@ -0,0 +1,178 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <bit>
++#include <concepts>
++#include <cstddef>
++#include <type_traits>
++#include <utility>
++
++#include "common/common_types.h"
++
++// Uniform keeps (Lichii #1441, #1521): a graphics draw binds a small streamed uniform buffer from
++// the stream allocation an earlier draw of the same command buffer made for its slot and range,
++// without reading guest memory again, while nothing that could have changed those bytes happened
++// in between. What ends a keep:
++//  - a write the caches hear of over the range: everything reaching BufferCache::WriteMemory
++//    (CPU writes, InnerInvalidation of constant buffer data, ...) and downloads of GPU data end it
++//    in the memory tracker; DMA copies and clears and inline uploads end it even when they take
++//    the fallback path (BufferCache::NoteUniformWrite); GPU-modified pages are never kept;
++//  - constant buffer data or a rebind of the slot since the previous draw (Delta);
++//  - a point where the guest CPU may have synchronised with the GPU (NoteSync): fences, syncpoints,
++//    semaphores and reports, acquires, frames and each submitted command list. Streamed uniform
++//    pages are not write-protected, so CPU writes after one go unseen;
++//  - another GPU address space or a page table change (even at an equal map serial), a buffer
++//    deletion, a new command buffer, or a delta that lost writes (overflow).
++namespace VideoCommon::UniformKeeps {
++
++inline std::atomic<u64> g_sync_serial{1};
++
++/// The guest CPU may have synchronised with the GPU: keeps made before end.
++inline void NoteSync() {
++    g_sync_serial.fetch_add(1, std::memory_order_release);
++}
++
++[[nodiscard]] inline u64 SyncSerial() {
++    return g_sync_serial.load(std::memory_order_acquire);
++}
++
++/// Constant buffer binds and data (device ranges) since the previous graphics draw. Written and
++/// taken on the thread that runs the 3D engine and the rasterizer.
++struct Delta {
++    static constexpr u32 MaxWrites = 16;
++    static constexpr size_t NumStages = 5;
++
++    std::array<u32, NumStages> binds{};
++    std::array<DAddr, MaxWrites> device_begin{};
++    std::array<DAddr, MaxWrites> device_end{};
++    u32 num_device_writes{};
++    /// A write did not fit: the list misses some, so the draw keeps nothing.
++    bool overflow{};
++};
++
++inline Delta g_delta;
++
++/// Graphics uniform slots whose last stream allocation still holds guest memory at their range.
++/// The buffer cache sets them; its memory tracker ends them where guest memory changes (CPU
++/// writes it is told of, downloads of GPU data). Both under the buffer cache lock.
++struct CleanSlots {
++    static constexpr u32 NumSlots = 32;
++    std::array<u32, Delta::NumStages> mask{};
++    std::array<std::array<std::pair<DAddr, DAddr>, NumSlots>, Delta::NumStages> ranges{};
++    DAddr low = ~DAddr{0}; ///< Bounds of the ranges kept since the last ForgetAll
++    DAddr high{};
++};
++
++inline CleanSlots g_clean;
++
++inline void Keep(size_t stage, u32 index, DAddr begin, DAddr end) noexcept {
++    CleanSlots& clean = g_clean;
++    clean.mask[stage] |= 1u << index;
++    clean.ranges[stage][index] = {begin, end};
++    clean.low = (std::min)(clean.low, begin);
++    clean.high = (std::max)(clean.high, end);
++}
++
++inline void Forget(size_t stage, u32 index) noexcept {
++    g_clean.mask[stage] &= ~(1u << index);
++}
++
++inline void ForgetAll() noexcept {
++    g_clean.mask = {};
++    g_clean.low = ~DAddr{0};
++    g_clean.high = 0;
++}
++
++[[nodiscard]] inline bool IsClean(size_t stage, u32 index, DAddr begin, DAddr end) noexcept {
++    const CleanSlots& clean = g_clean;
++    return ((clean.mask[stage] >> index) & 1) != 0 &&
++           clean.ranges[stage][index] == std::pair<DAddr, DAddr>{begin, end};
++}
++
++/// Guest memory over [address, address + size) may differ from what was streamed: ends the
++/// keeps over it.
++inline void NoteWrite(DAddr address, u64 size) noexcept {
++    CleanSlots& clean = g_clean;
++    const DAddr end = address + size;
++    if (end <= clean.low || clean.high <= address) {
++        return;
++    }
++    for (size_t stage = 0; stage < Delta::NumStages; ++stage) {
++        for (u32 mask = clean.mask[stage]; mask != 0; mask &= mask - 1) {
++            const u32 index = static_cast<u32>(std::countr_zero(mask));
++            const auto [begin, range_end] = clean.ranges[stage][index];
++            if (address < range_end && begin < end) {
++                clean.mask[stage] &= ~(1u << index);
++            }
++        }
++    }
++}
++
++inline void NoteBind(size_t stage, u32 index) {
++    if (stage < Delta::NumStages && index < 32) {
++        g_delta.binds[stage] |= 1u << index;
++    }
++}
++
++/// Adds [begin, end) to g_delta, merged with a range it touches.
++inline void NoteDeviceData(DAddr begin, DAddr end) {
++    Delta& delta = g_delta;
++    for (u32 i = 0; i < delta.num_device_writes; ++i) {
++        if (begin <= delta.device_end[i] && delta.device_begin[i] <= end) {
++            delta.device_begin[i] = (std::min)(delta.device_begin[i], begin);
++            delta.device_end[i] = (std::max)(delta.device_end[i], end);
++            return;
++        }
++    }
++    if (delta.num_device_writes == Delta::MaxWrites) {
++        delta.overflow = true;
++        return;
++    }
++    delta.device_begin[delta.num_device_writes] = begin;
++    delta.device_end[delta.num_device_writes] = end;
++    ++delta.num_device_writes;
++}
++
++/// Moves g_delta into `out` and clears it, copying only the bind masks and the write ranges in
++/// use (not the whole Delta, which every draw takes).
++inline void TakeDelta(Delta& out) {
++    Delta& delta = g_delta;
++    out.binds = delta.binds;
++    out.num_device_writes = delta.num_device_writes;
++    std::copy_n(delta.device_begin.begin(), delta.num_device_writes, out.device_begin.begin());
++    std::copy_n(delta.device_end.begin(), delta.num_device_writes, out.device_end.begin());
++    out.overflow = delta.overflow;
++    delta.binds = {};
++    delta.num_device_writes = 0;
++    delta.overflow = false;
++}
++
++/// A buffer cache runtime whose streamed uniform allocations can be bound again in the same
++/// command buffer: StreamUniformRef describes one, LastStreamUniformRef is the latest
++/// BindMappedUniformBuffer's, RebindStreamUniform adds it to the descriptors as that call did.
++template <class R>
++concept StreamUniformRebindable = requires(R& runtime, u32 size) {
++    typename R::StreamUniformRef;
++    requires std::is_trivially_copyable_v<typename R::StreamUniformRef>;
++    { runtime.LastStreamUniformRef() } -> std::same_as<typename R::StreamUniformRef>;
++    runtime.RebindStreamUniform(runtime.LastStreamUniformRef(), size);
++    { runtime.CurrentTick() } -> std::convertible_to<u64>;
++};
++
++template <class R>
++struct StreamRef {
++    using type = u64; // Unused: the runtime can't rebind, so nothing is kept
++};
++
++template <class R>
++    requires StreamUniformRebindable<R>
++struct StreamRef<R> {
++    using type = typename R::StreamUniformRef;
++};
++
++} // namespace VideoCommon::UniformKeeps
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -17,6 +17,7 @@
+ #include "common/settings.h"
+ #include "core/core.h"
+ #include "core/core_timing.h"
++#include "video_core/buffer_cache/uniform_keep.h"
+ #include "video_core/dirty_flags.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/native_draw_indirect.h"
+@@ -792,6 +793,8 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
+     if (bind_data.shader_slot >= Regs::MaxConstBuffers) {
+         return; // slot field is 5 bits; the state array holds 18
+     }
++    // The next draw streams the slot again (uniform keeps).
++    VideoCommon::UniformKeeps::NoteBind(stage_index, bind_data.shader_slot);
+     auto& buffer = state.shader_stages[stage_index].const_buffers[bind_data.shader_slot];
+     buffer.enabled = bind_data.valid.Value() != 0;
+     buffer.address = regs.const_buffer.Address();
+@@ -817,7 +820,10 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
+ 
+     const GPUVAddr address{buffer_address + regs.const_buffer.offset};
+     const size_t copy_size = amount * sizeof(u32);
+-    memory_manager.WriteBlockCached(address, start_base, copy_size);
++    if (!WriteBoundConstantBuffer(regs.const_buffer.offset, start_base,
++                                  static_cast<u32>(copy_size))) {
++        memory_manager.WriteBlockCached(address, start_base, copy_size);
++    }
+ 
+     // Increment the current buffer position.
+     regs.const_buffer.offset += static_cast<u32>(copy_size);
+@@ -827,6 +833,92 @@ void Maxwell3D::ProcessCBData(u32 value) {
+     ProcessCBMultiData(&value, 1);
+ }
+ 
++void Maxwell3D::HeaderSpans::Update(const MemoryManager& memory, GPUVAddr address_, u64 size_,
++                                    u64 map_serial_) {
++    if (known && address == address_ && size == size_ && map_serial == map_serial_) {
++        return;
++    }
++    address = address_;
++    size = size_;
++    map_serial = map_serial_;
++    known = true;
++    opaque = false;
++    count = 0;
++    // Each piece is one range of device memory.
++    for (const auto& [piece, piece_size] : memory.GetSubmappedRange(address, size)) {
++        const std::optional<DAddr> device = memory.GpuToCpuAddress(piece);
++        if (!device) {
++            continue;
++        }
++        if (count == MaxRanges) {
++            opaque = true;
++            return;
++        }
++        ranges[count++] = {*device, *device + piece_size};
++    }
++}
++
++bool Maxwell3D::HeaderSpans::Intersects(DAddr begin, DAddr end) const {
++    if (opaque) {
++        return true;
++    }
++    for (u32 i = 0; i < count; ++i) {
++        if (begin < ranges[i].second && ranges[i].first < end) {
++            return true;
++        }
++    }
++    return false;
++}
++
++bool Maxwell3D::WriteBoundConstantBuffer(u32 offset, const void* data, u32 bytes) {
++    // Texture and sampler headers: 32 bytes each, the sampler table sized as
++    // TextureCache::SynchronizeDescriptors sizes it.
++    constexpr u64 HeaderEntrySize = 0x20;
++    const GPUVAddr address = regs.const_buffer.Address();
++    const u32 size = regs.const_buffer.size;
++    if (u64{offset} + bytes > size) {
++        return false;
++    }
++    const u64 map_serial = memory_manager.MapSerial();
++    const GPUVAddr tic = regs.tex_header.Address();
++    const u64 tic_size = (u64{regs.tex_header.limit} + 1) * HeaderEntrySize;
++    const GPUVAddr tsc = regs.tex_sampler.Address();
++    const u64 tsc_size = (u64{regs.sampler_binding == Regs::SamplerBinding::ViaHeaderBinding
++                                  ? regs.tex_header.limit
++                                  : regs.tex_sampler.limit} +
++                          1) *
++                         HeaderEntrySize;
++    BoundConstantBuffer& bound = bound_constant_buffer;
++    if (bound.address != address || bound.size != size || bound.map_serial != map_serial ||
++        bound.tic != tic || bound.tic_size != tic_size || bound.tsc != tsc ||
++        bound.tsc_size != tsc_size) {
++        bound = {address, size, map_serial, tic, tic_size, tsc, tsc_size, 0};
++        const GPUVAddr end = address + size;
++        const std::optional<DAddr> device =
++            address != 0 && size != 0 && memory_manager.IsContinuousRange(address, size)
++                ? memory_manager.GpuToCpuAddress(address)
++                : std::nullopt;
++        // Data anywhere in a buffer over the headers, at their GPU addresses or through another
++        // mapping of their device memory, takes the general path.
++        if (device && *device != 0 && !(address < tic + tic_size && tic < end) &&
++            !(address < tsc + tsc_size && tsc < end)) {
++            bound_header_spans.Update(memory_manager, tic, tic_size, map_serial);
++            bound_sampler_spans.Update(memory_manager, tsc, tsc_size, map_serial);
++            if (!bound_header_spans.Intersects(*device, *device + size) &&
++                !bound_sampler_spans.Intersects(*device, *device + size)) {
++                bound.device = *device;
++            }
++        }
++    }
++    if (bound.device == 0) {
++        return false;
++    }
++    const DAddr device = bound.device + offset;
++    VideoCommon::UniformKeeps::NoteDeviceData(device, device + bytes);
++    memory_manager.WriteConstantBufferData(device, data, bytes);
++    return true;
++}
++
+ void Maxwell3D::ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount) {
+     if (amount == 0) {
+         return;
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -17,6 +17,7 @@
+ #include <optional>
+ #include <span>
+ #include <type_traits>
++#include <utility>
+ #include <vector>
+ 
+ #include "common/assert.h"
+@@ -3248,6 +3249,12 @@ public:
+     /// Handles a write to the CB_DATA[i] register.
+     void ProcessCBData(u32 value);
+     void ProcessCBMultiData(const u32* start_base, u32 amount);
++    /// Writes constant buffer data at `offset` (`bytes` within the buffer) through the buffer
++    /// CB_ADDRESS and CB_SIZE select, translated once per selection and memory map. False, having
++    /// done nothing, where the general path has to: the buffer isn't one mapped device range
++    /// (unmapped or sparse pages), it can reach the texture or sampler headers, or the write
++    /// runs past its end.
++    bool WriteBoundConstantBuffer(u32 offset, const void* data, u32 bytes);
+ 
+     void ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount);
+ 
+@@ -3323,6 +3330,35 @@ private:
+ 
+     MemoryManager& memory_manager;
+ 
++    /// The device ranges a GPU range of texture or sampler headers maps, per memory map.
++    struct HeaderSpans {
++        static constexpr u32 MaxRanges = 4;
++        GPUVAddr address{};
++        u64 size{};
++        u64 map_serial{};
++        bool known{};
++        bool opaque{}; ///< More pieces than `ranges` holds: anything may reach them
++        u32 count{};
++        std::array<std::pair<DAddr, DAddr>, MaxRanges> ranges{};
++
++        void Update(const MemoryManager& memory, GPUVAddr address, u64 size, u64 map_serial);
++        [[nodiscard]] bool Intersects(DAddr begin, DAddr end) const;
++    };
++    HeaderSpans bound_header_spans;
++    HeaderSpans bound_sampler_spans;
++
++    /// The constant buffer WriteBoundConstantBuffer last translated, and the state it read.
++    struct BoundConstantBuffer {
++        GPUVAddr address{};
++        u32 size{};
++        u64 map_serial{};
++        GPUVAddr tic{};
++        u64 tic_size{};
++        GPUVAddr tsc{};
++        u64 tsc_size{};
++        DAddr device{}; ///< 0: the general path writes its data
++    } bound_constant_buffer;
++
+     VideoCore::RasterizerInterface* rasterizer = nullptr;
+ 
+     /// Start offsets of each macro in macro_memory
+diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -12,6 +12,7 @@
+ #include "common/logging.h"
+ #include "common/settings.h"
+ #include "core/core.h"
++#include "video_core/buffer_cache/uniform_keep.h"
+ #include "video_core/control/channel_state.h"
+ #include "video_core/dma_pusher.h"
+ #include "video_core/engines/fermi_2d.h"
+@@ -151,7 +152,10 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
+     case Puller::FenceOperation::Acquire:
+         // UNIMPLEMENTED_MSG("Channel Scheduling pending.");
+         // WaitFence(regs.fence_action.syncpoint_id, regs.fence_value);
+-        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
++        OnBack([rasterizer = dma_pusher.rasterizer] {
++            VideoCommon::UniformKeeps::NoteSync();
++            rasterizer->ReleaseFences();
++        });
+         break;
+     case Puller::FenceOperation::Increment:
+         if (dma_pusher.channel_state.native_abi) {
+@@ -254,6 +258,10 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
+         });
+     } else {
++        // Satisfied or not, the CPU may have rewritten what the next draws read before it
++        // released: end uniform keeps between the draws before and after the acquire, in order on
++        // the back (with the split the front may get here before the back ran the earlier ones).
++        OnBack([] { VideoCommon::UniformKeeps::NoteSync(); });
+         // An acquire reads what earlier work released: let the split's back thread finish it.
+         // A GEQUAL acquire that guest memory already meets needs no wait: the counters only
+         // grow, so whatever the back still writes meets it too. Each wait stops the front until
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -21,6 +21,7 @@
+ #include "video_core/native_semaphore_observation.h"
+ #endif
+ #include "video_core/gpu_thread.h"
++#include "video_core/buffer_cache/uniform_keep.h"
+ #include "video_core/nx2_profile.h"
+ #include "video_core/host1x/host1x.h"
+ #include "video_core/renderer_base.h"
+@@ -114,6 +115,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+                 // in order, and so does the signal that the command ran.
+                 split.TraceFront(6);
+                 auto* const rasterizer_ptr = renderer.ReadRasterizer();
++                // A submitted list (or a request from another thread) is ordered after guest CPU
++                // writes the caches may not see: uniform keeps end here, in order on the back.
++                split.Defer([] { VideoCommon::UniformKeeps::NoteSync(); });
+                 if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                     Profile::Scope scope{Profile::Zone::Push};
+                     split.TraceFront(7, static_cast<u64>(submit_list->channel));
+@@ -142,6 +146,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+                 split.Publish();
+                 continue;
+             }
++            VideoCommon::UniformKeeps::NoteSync();
+             if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
+                 Profile::Scope scope{Profile::Zone::Push};
+                 scheduler.Push(system.GPU(), submit_list->channel, std::move(submit_list->entries));
+diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
+--- a/src/video_core/memory_manager.cpp
++++ b/src/video_core/memory_manager.cpp
+@@ -547,6 +547,22 @@ void MemoryManager::WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buf
+     accumulator.Add(gpu_dest_addr, size);
+ }
+ 
++void MemoryManager::WriteConstantBufferData(DAddr device_addr, const void* data,
++                                            std::size_t size) {
++    VideoCommon::GpuWrittenPages::Mark(device_addr, size);
++    memory.WriteBlockUnsafe(device_addr, data, size);
++    if (!constant_buffer_writes.empty()) {
++        auto& [last, last_size] = constant_buffer_writes.back();
++        if (device_addr <= last + last_size && last <= device_addr + size) {
++            const DAddr end = (std::max)(last + last_size, device_addr + size);
++            last = (std::min)(last, device_addr);
++            last_size = end - last;
++            return;
++        }
++    }
++    constant_buffer_writes.emplace_back(device_addr, size);
++}
++
+ void MemoryManager::FlushRegion(GPUVAddr gpu_addr, size_t size,
+                                 VideoCommon::CacheType which) const {
+     auto do_nothing = [&]([[maybe_unused]] std::size_t page_index,
+@@ -892,6 +908,10 @@ void MemoryManager::FlushCaching() {
+     })) {
+         rasterizer->InnerInvalidation(VideoCommon::FixSmallVectorADL(page_stash_local));
+     }
++    if (!constant_buffer_writes.empty()) {
++        rasterizer->InnerInvalidation(VideoCommon::FixSmallVectorADL(constant_buffer_writes));
++        constant_buffer_writes.clear();
++    }
+ }
+ 
+ const u8* MemoryManager::GetSpan(const GPUVAddr src_addr, const std::size_t size) const {
+diff --git a/src/video_core/memory_manager.h b/src/video_core/memory_manager.h
+--- a/src/video_core/memory_manager.h
++++ b/src/video_core/memory_manager.h
+@@ -117,6 +117,10 @@ public:
+     void ReadBlockUnsafe(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size) const;
+     void WriteBlockUnsafe(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size);
+     void WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size);
++    /// Constant buffer data to device memory the caller translated (one mapped range, not sparse
++    /// memory). FlushCaching hands the written ranges, merged, to the rasterizer's
++    /// InnerInvalidation, as WriteBlockCached's accumulated ones.
++    void WriteConstantBufferData(DAddr device_addr, const void* data, std::size_t size);
+ 
+     /**
+      * Checks if a gpu region can be simply read with a pointer.
+@@ -269,6 +273,7 @@ private:
+ 
+     const size_t unique_identifier;
+     VideoCommon::InvalidationAccumulator accumulator;
++    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> constant_buffer_writes;
+ 
+     static std::atomic<size_t> unique_identifier_generator;
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.h b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.h
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+@@ -170,9 +170,26 @@ public:
+         const StagingBufferRef ref = staging_pool.Request(size, MemoryUsage::Upload);
+         guest_descriptor_queue.AddBuffer(ref.buffer, ref.device_address,
+                                          static_cast<u32>(ref.offset), size);
++        last_stream_uniform = {ref.buffer, ref.device_address, static_cast<u32>(ref.offset)};
+         return ref.mapped_span;
+     }
+ 
++    /// A BindMappedUniformBuffer allocation, valid until its tick completes (uniform keeps).
++    struct StreamUniformRef {
++        VkBuffer buffer;
++        VkDeviceAddress device_address;
++        u32 offset;
++    };
++
++    [[nodiscard]] StreamUniformRef LastStreamUniformRef() const noexcept {
++        return last_stream_uniform;
++    }
++
++    /// Adds `ref` to the descriptors as BindMappedUniformBuffer added it, without a copy.
++    void RebindStreamUniform(const StreamUniformRef& ref, u32 size) {
++        guest_descriptor_queue.AddBuffer(ref.buffer, ref.device_address, ref.offset, size);
++    }
++
+     [[nodiscard]] VkDeviceSize SparseAlignmentFor(bool sparse_compatible) const noexcept {
+         if (!sparse_compatible || !multi_range_buffers.use_sparse) {
+             return 0;
+@@ -272,6 +289,7 @@ private:
+     Scheduler& scheduler;
+     StagingBufferPool& staging_pool;
+     GuestDescriptorQueue& guest_descriptor_queue;
++    StreamUniformRef last_stream_uniform{};
+ 
+     std::shared_ptr<QuadArrayIndexBuffer> quad_array_index_buffer;
+     std::shared_ptr<QuadStripIndexBuffer> quad_strip_index_buffer;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1557,6 +1557,8 @@ void RasterizerVulkan::ResetCounter(VideoCommon::QueryType type) {
+ 
+ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
+                              VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
++    // Reports and semaphore releases reach guest memory the CPU may wait on.
++    VideoCommon::UniformKeeps::NoteSync();
+     if (const auto device_addr = gpu_memory->GpuToCpuAddress(gpu_addr)) {
+         VideoCommon::GpuWrittenPages::Mark(*device_addr, 16);
+     }
+@@ -1845,18 +1847,22 @@ void RasterizerVulkan::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {
+ }
+ 
+ void RasterizerVulkan::SignalFence(std::function<void()>&& func) {
++    VideoCommon::UniformKeeps::NoteSync();
+     fence_manager.SignalFence(std::move(func));
+ }
+ 
+ void RasterizerVulkan::SyncOperation(std::function<void()>&& func) {
++    VideoCommon::UniformKeeps::NoteSync();
+     fence_manager.SyncOperation(std::move(func));
+ }
+ 
+ void RasterizerVulkan::SignalSyncPoint(u32 value) {
++    VideoCommon::UniformKeeps::NoteSync();
+     fence_manager.SignalSyncPoint(value);
+ }
+ 
+ void RasterizerVulkan::SignalReference() {
++    VideoCommon::UniformKeeps::NoteSync();
+     fence_manager.SignalReference();
+ }
+ 
+@@ -1957,6 +1963,7 @@ void RasterizerVulkan::FlushCommands() {
+ }
+ 
+ void RasterizerVulkan::TickFrame() {
++    VideoCommon::UniformKeeps::NoteSync();
+     draw_counter = 0;
+     VideoCommon::NativeDrawTrace::frame.fetch_add(1, std::memory_order_relaxed);
+     guest_descriptor_queue.TickFrame();
