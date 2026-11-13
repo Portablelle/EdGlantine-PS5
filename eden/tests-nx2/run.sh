@@ -51,6 +51,7 @@ python3 tests-nx2/check-ssbo-misaligned-access.py
 python3 tests-nx2/check-fragment-output-mask.py
 python3 tests-nx2/check-oot-pagetable-cache.py
 python3 tests-nx2/check-gpusplit-align.py
+python3 tests-nx2/check-splitfront-blocks.py
 python3 tests-nx2/check-memory-breakdown.py
 python3 tests-nx2/check-native-spill-lut.py
 python3 tests-nx2/check-native.py

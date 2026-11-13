@@ -1,0 +1,440 @@
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -7,6 +7,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <bit>
+ #include <array>
+ #include <cstring>
+ #include <limits>
+@@ -327,22 +328,6 @@
+     return std::min<size_t>(memory_manager.GetMemoryLayoutSize(start_address, byte_size * max_size) / byte_size, lower_cap);
+ }
+ 
+-u32 Maxwell3D::ProcessShadowRam(u32 method, u32 argument) {
+-    // Keep track of the register value in shadow_state when requested.
+-    auto const c = shadow_state.shadow_ram_control;
+-#ifdef EDEN_NX2_PS5_PROTO
+-    if (c == Regs::ShadowRamControl::Replay && native_draw_shadow.NeedsRead(method, true))
+-        ResolveNativeDrawShadow();
+-    if (c == Regs::ShadowRamControl::Track || c == Regs::ShadowRamControl::TrackWithFilter)
+-        NativeDrawShadowWrite(method, argument, true);
+-#endif
+-    if (c == Regs::ShadowRamControl::Track || c == Regs::ShadowRamControl::TrackWithFilter)
+-        return shadow_state.reg_array[method] = argument;
+-    else if (c == Regs::ShadowRamControl::Replay)
+-        return shadow_state.reg_array[method];
+-    return argument;
+-}
+-
+ void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
+     // Before the sunk writes reach the shadow RAM: the handback must not overwrite them.
+     if (front_macros && !VideoCommon::GpuSplit::OnBackThread()) {
+@@ -383,19 +368,6 @@
+     method_sink.clear();
+ }
+ 
+-void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
+-#ifdef EDEN_NX2_PS5_PROTO
+-    NativeDrawShadowWrite(method, argument, false);
+-#endif
+-    ApplyRegisterValue(method, argument);
+-}
+-
+-void Maxwell3D::ApplyRegisterValue(u32 method, u32 argument) {
+-    regs.reg_array[method] = argument;
+-    for (auto const& table : dirty.tables)
+-        dirty.flags[table[method]] = true;
+-}
+-
+ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
+     if (GetNativeMacroEngine().native_turing && method == MAXWELL3D_REG_INDEX(clear_surface)) {
+         LOG_DEBUG(HW_GPU, "Native GPU surface clear: value={:#x}", argument);
+@@ -510,10 +482,23 @@
+     }
+ }
+ 
++bool Maxwell3D::FastStateWrites() const {
++    return !record_write_history && !g_trace_first_method_writes &&
++           !VideoCommon::Nx2Profile::Enabled();
++}
++
+ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
+     if (front_macros && !VideoCommon::GpuSplit::OnBackThread()) {
+         ReleaseFront();
+     }
++    // Most 3D writes are state registers: the shadow RAM step, the same-value check, the store
++    // and its dirty flags (WriteStateRegister), in one call. A register not in execution_mask is
++    // neither SET_SHADOW_RAM_CONTROL nor a macro call; a macro collecting parameters, the write
++    // history, the first-write trace and the profile take the longer path below.
++    if (executing_macro == 0 && method < MacroRegistersStart && !execution_mask[method] &&
++        FastStateWrites()) {
++        return WriteStateRegister(method, method_argument);
++    }
+     // It is an error to write to a register other than the current macro's ARG register before
+     // it has finished execution.
+     if (executing_macro != 0 && method != executing_macro + 1) {
+@@ -566,6 +551,51 @@
+     ProcessMethodCall(method, argument, method_argument, is_last_call);
+ }
+ 
++void Maxwell3D::WriteStateRegisters(Core::System& system, std::span<const u64, 4> flags,
++                                    std::span<const u64> writes) {
++    ConsumeSink(system);
++    // The front sends only writes that change its copy of the register, which is the back's but
++    // for registers the back changes itself: each normally changes the register here too, and
++    // is then all CallMethod would do for it. Otherwise (a write that keeps its register's
++    // value, the shadow RAM replaying, a native draw shadow to resolve) and where CallMethod
++    // takes another path, the writes go one by one.
++    bool changes = executing_macro == 0 && FastStateWrites() && SkipSameValueWrites() &&
++                   shadow_state.shadow_ram_control != Regs::ShadowRamControl::Replay;
++#ifdef EDEN_NX2_PS5_PROTO
++    changes = changes && native_draw_shadow.Empty();
++#endif
++    for (size_t i = 0; changes && i < writes.size(); ++i) {
++        changes = regs.reg_array[static_cast<u32>(writes[i])] != static_cast<u32>(writes[i] >> 32);
++    }
++    if (!changes) {
++        for (const u64 write : writes) {
++            CallMethod(system, static_cast<u32>(write), static_cast<u32>(write >> 32), true);
++        }
++        return;
++    }
++    StoreStateRegisters(flags, writes);
++}
++
++void Maxwell3D::StoreStateRegisters(std::span<const u64, 4> flags, std::span<const u64> writes) {
++    const auto control = shadow_state.shadow_ram_control;
++    const bool tracked =
++        control == Regs::ShadowRamControl::Track || control == Regs::ShadowRamControl::TrackWithFilter;
++    // In order: a register written twice keeps the last value, as one by one.
++    for (const u64 write : writes) {
++        const u32 method = static_cast<u32>(write);
++        const u32 value = static_cast<u32>(write >> 32);
++        if (tracked) {
++            shadow_state.reg_array[method] = value;
++        }
++        regs.reg_array[method] = value;
++    }
++    for (size_t word = 0; word < flags.size(); ++word) {
++        for (u64 bits = flags[word]; bits != 0; bits &= bits - 1) {
++            dirty.flags[word * 64 + static_cast<size_t>(std::countr_zero(bits))] = true;
++        }
++    }
++}
++
+ void Maxwell3D::DumpRecentWrites(u32 method) {
+     static u32 dumps{};
+     if (dumps++ >= 4) {
+@@ -939,6 +969,9 @@
+     /// then can it have a deferred instanced draw to issue at the end of a macro.
+     bool draw_pending{true};
+     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
++    /// State writes go to the back in blocks (GpuSplit::StateWrite): skip_same and
++    /// FastStateWrites(), read once.
++    bool state_blocks{};
+     /// The back's draw manager is in an instance loop (DrawMode::Instance): draw.end does nothing.
+     bool instance_loop{};
+ };
+@@ -1007,6 +1040,7 @@
+         std::memcpy(front->shadow.data(), shadow_state.reg_array.data(), sizeof(front->shadow));
+         front->control = shadow_state.shadow_ram_control;
+         front->skip_same = SkipSameValueWrites() && FrontSkipSame();
++        front->state_blocks = front->skip_same && FastStateWrites();
+         front->executing_macro = executing_macro;
+         front->parameters = std::move(macro_params);
+         macro_params.clear();
+@@ -1065,6 +1099,12 @@
+             return;
+         }
+         fs.regs[method] = value;
++        // Sent with the state writes around it, shadow RAM applied. Replays, which store the
++        // shadow RAM's entry, keep their own entries.
++        if (fs.state_blocks && fs.control != Regs::ShadowRamControl::Replay) {
++            split.StateWrite(this, method, value, {dirty.tables[0][method], dirty.tables[1][method]});
++            return;
++        }
+     } else {
+         fs.regs[method] = value;
+         constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3188,6 +3188,16 @@
+     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
+                               const u32* base_start, u32 amount, u32 methods_pending);
+ 
++    /// GpuSplit's back: state register writes the front sent as one entry (GpuSplit::StateWrite),
++    /// each `method | value << 32`, in order. `flags`: the dirty flags they set, a bit each. As a
++    /// CallMethod of each when every write changes its register: the stores (and the shadow RAM
++    /// when tracking), then the flags. Otherwise the writes go through CallMethod one by one.
++    void WriteStateRegisters(Core::System& system, std::span<const u64, 4> flags,
++                             std::span<const u64> writes);
++    /// Whether CallMethod writes a state register straight away (WriteStateRegister): no write
++    /// history, first-write trace or profile counts it.
++    [[nodiscard]] bool FastStateWrites() const;
++
+     bool ShouldExecute() const {
+         return execute_on;
+     }
+@@ -3256,11 +3266,58 @@
+ 
+     void ProcessMacro(Core::System& system, u32 method, const u32* base_start, u32 amount, bool is_last_call);
+ 
+-    u32 ProcessShadowRam(u32 method, u32 argument);
++    /// The value a write leaves in the register, as the shadow RAM mode has it: the argument
++    /// (tracked in shadow_state when tracking), or the shadow copy when replaying. Defined here,
++    /// as the hot method paths call it for nearly every write.
++    u32 ProcessShadowRam(u32 method, u32 argument) {
++        const auto control = shadow_state.shadow_ram_control;
++#ifdef EDEN_NX2_PS5_PROTO
++        if (control == Regs::ShadowRamControl::Replay && native_draw_shadow.NeedsRead(method, true))
++            ResolveNativeDrawShadow();
++        if (control == Regs::ShadowRamControl::Track ||
++            control == Regs::ShadowRamControl::TrackWithFilter)
++            NativeDrawShadowWrite(method, argument, true);
++#endif
++        if (control == Regs::ShadowRamControl::Track ||
++            control == Regs::ShadowRamControl::TrackWithFilter) {
++            return shadow_state.reg_array[method] = argument;
++        }
++        if (control == Regs::ShadowRamControl::Replay) {
++            return shadow_state.reg_array[method];
++        }
++        return argument;
++    }
+ 
+-    void ProcessDirtyRegisters(u32 method, u32 argument);
++    /// Stores a register's value and sets its dirty flags. Defined here for the same reason.
++    void ProcessDirtyRegisters(u32 method, u32 argument) {
++#ifdef EDEN_NX2_PS5_PROTO
++        NativeDrawShadowWrite(method, argument, false);
++#endif
++        ApplyRegisterValue(method, argument);
++    }
+     // Resolved state applies directly, without observing it as a new incoming write.
+-    void ApplyRegisterValue(u32 method, u32 argument);
++    void ApplyRegisterValue(u32 method, u32 argument) {
++        regs.reg_array[method] = argument;
++        for (const auto& table : dirty.tables) {
++            dirty.flags[table[method]] = true;
++        }
++    }
++
++    /// CallMethod for a state register (not in execution_mask): the shadow RAM step, then the
++    /// store and its dirty flags unless the write keeps the register's value (EDEN_NX2_SKIP_SAME=0
++    /// keeps it; a native draw shadow that must still be resolved keeps it too).
++    void WriteStateRegister(u32 method, u32 method_argument) {
++        const u32 argument = ProcessShadowRam(method, method_argument);
++        if (!SkipSameValueWrites() || regs.reg_array[method] != argument
++#ifdef EDEN_NX2_PS5_PROTO
++            || native_draw_shadow.NeedsRead(method, false)
++#endif
++        ) {
++            ProcessDirtyRegisters(method, argument);
++        }
++    }
++    /// WriteStateRegisters' stores and flags.
++    void StoreStateRegisters(std::span<const u64, 4> flags, std::span<const u64> writes);
+ #ifdef EDEN_NX2_PS5_PROTO
+     void NativeDrawShadowWrite(u32 method, u32 value, bool shadow);
+     NativeDrawShadow native_draw_shadow;
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -5,6 +5,9 @@
+ #include <cstdlib>
+ #include <chrono>
+ #include <thread>
++#include <cstring>
++#include <utility>
++#include <span>
+ #include <stdexcept>
+ #include <system_error>
+ 
+@@ -32,6 +35,7 @@
+ #include "common/thread.h"
+ #include "core/core.h"
+ #include "video_core/engines/engine_interface.h"
++#include "video_core/engines/maxwell_3d.h"
+ #include "video_core/gpu_split.h"
+ #include "video_core/nx2.h"
+ #include "video_core/nx2_profile.h"
+@@ -141,6 +145,8 @@
+     check_owner = true;
+ #endif
+     write_position = published_local = consumed_cache = 0;
++    state_engine = nullptr;
++    state_count = 0;
+     published.store(0); consumed.store(0);
+     front_engine = back_engine = nullptr;
+     front_after_method = after_method = nullptr;
+@@ -153,6 +159,7 @@
+     trace_stage.store(0); trace_reports.store(0);
+ #endif
+     ring = std::make_unique<u64[]>(RingWords);
++    state_words = std::make_unique<u64[]>(StateFlagWords + MaxStateWrites);
+ #ifdef EDEN_NX2_PS5_PROTO
+     StartBackThread();
+     // Optional observation must never decide whether the renderer can run.
+@@ -448,6 +455,8 @@
+ #endif
+     active = false;
+     front_macros = false;
++    state_engine = nullptr;
++    state_count = 0;
+ }
+ 
+ u64* GpuSplit::ReserveSlow(size_t words) {
+@@ -497,6 +506,7 @@
+ }
+ 
+ void GpuSplit::Publish() {
++    FlushState();
+     CheckFailure();
+     if (published_local == write_position) {
+         return;
+@@ -517,6 +527,7 @@
+ }
+ 
+ void GpuSplit::Drain() {
++    FlushState();
+     TraceFront(20, write_position);
+     CheckFailure();
+     consumed_cache = consumed.load(std::memory_order_acquire);
+@@ -564,6 +575,18 @@
+     }
+ }
+ 
++void GpuSplit::FlushStateSlow() {
++    // Cleared first: the entry's own SelectEngine and Reserve flush again.
++    const u32 count = std::exchange(state_count, 0);
++    SelectEngine(state_engine);
++    const size_t size = 1 + StateFlagWords + count;
++    u64* const entry = Reserve(size);
++    entry[0] = static_cast<u64>(Kind::State) | (u64{count} << 32);
++    std::memcpy(entry + 1, state_words.get(), (StateFlagWords + count) * sizeof(u64));
++    std::fill_n(state_words.get(), StateFlagWords, u64{0});
++    Commit(size);
++}
++
+ void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
+     front_engine = engine;
+     u64* const entry = Reserve(2);
+@@ -658,6 +681,14 @@
+         }
+         return data + (amount + 1) / 2;
+     }
++    case Kind::State: {
++        // Only Maxwell3D::FrontWrite sends state blocks.
++        const u32 count = static_cast<u32>(head >> 32);
++        static_cast<Tegra::Engines::Maxwell3D*>(back_engine)
++            ->WriteStateRegisters(*system, std::span<const u64, StateFlagWords>{entry + 1, StateFlagWords},
++                                  std::span<const u64>{entry + 1 + StateFlagWords, count});
++        return 1 + StateFlagWords + count;
++    }
+     case Kind::Call: {
+         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
+         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -4,6 +4,7 @@
+ #pragma once
+ #include <cstdio>
+ 
++#include <array>
+ #include <atomic>
+ #include <cstring>
+ #include <functional>
+@@ -159,6 +160,23 @@
+         Commit(1);
+     }
+ 
++    /// A Maxwell3D state register write (not in execution_mask) from the front, shadow RAM
++    /// applied (not in replay) and changing the front's copy of the register. Writes in a row go
++    /// to the back as one entry, in order, once another entry follows or the front publishes or
++    /// drains; the back stores them and sets their dirty flags at once
++    /// (Maxwell3D::WriteStateRegisters). `flags`: the dirty flags the register sets.
++    void StateWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 value,
++                    std::array<u8, 2> flags) {
++        if (engine != state_engine || state_count == MaxStateWrites) {
++            FlushState();
++            state_engine = engine;
++        }
++        state_words[StateFlagWords + state_count++] = u64{method} | (u64{value} << 32);
++        for (const u8 flag : flags) {
++            state_words[flag / 64] |= u64{1} << (flag % 64);
++        }
++    }
++
+     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
+     template <typename Func>
+     void Defer(const Func& func) {
+@@ -206,7 +224,7 @@
+ 
+     /// Whether the back has run everything sent so far (front only; nothing is published).
+     [[nodiscard]] bool BackCaughtUp() const {
+-        return consumed.load(std::memory_order_acquire) == write_position;
++        return state_count == 0 && consumed.load(std::memory_order_acquire) == write_position;
+     }
+ 
+     /// Makes what was sent visible to the back.
+@@ -221,10 +239,14 @@
+         Method, ///< Bits 8-23 method, 32-63 argument; flags IsLast, HasSegment (word 1)
+         Multi,  ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
+         Call,   ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
++        State,  ///< Bits 32-63 count; words 1-4 dirty flags; then (method | value << 32) per
++                ///< write, in order (StateWrite)
+     };
+     static constexpr u64 IsLast = 1 << 4;
+     static constexpr u64 HasSegment = 1 << 5;
+     static constexpr u64 Direct = 1 << 6; ///< Method: call it even if not executable (macros)
++    static constexpr size_t StateFlagWords = 4;
++    static constexpr u32 MaxStateWrites = 128;
+ 
+     static constexpr size_t RingWords = size_t{1} << 20; // 8 MiB
+     static constexpr size_t RingMask = RingWords - 1;
+@@ -236,8 +258,17 @@
+         (*reinterpret_cast<const Func*>(payload))();
+     }
+ 
++    /// Sends the state writes gathered so far (before any other entry, publish or drain).
++    void FlushState() {
++        if (state_count != 0) [[unlikely]] {
++            FlushStateSlow();
++        }
++    }
++    void FlushStateSlow();
++
+     /// Room for an entry of `words` at the write position (never across the ring's end).
+     u64* Reserve(size_t words) {
++        FlushState();
+         const size_t index = write_position & RingMask;
+         if (index + words <= RingWords && write_position + words - consumed_cache <= RingWords)
+             [[likely]] {
+@@ -254,6 +285,7 @@
+     }
+     void WaitForSpace(size_t words);
+     void SelectEngine(Tegra::Engines::EngineInterface* engine) {
++        FlushState();
+         if (engine != front_engine) [[unlikely]] {
+             SwitchEngine(engine);
+         }
+@@ -289,6 +321,8 @@
+     bool active{};
+     bool front_macros{};
+     std::unique_ptr<u64[]> ring;
++    /// The state writes being gathered (StateWrite): the dirty flag words, then the writes.
++    std::unique_ptr<u64[]> state_words;
+ 
+     // Front side. x86 prefetchers pull 64-byte lines in pairs, so each side's hot cursor gets its
+     // own 128-byte block: the back writes back_engine on every engine switch, and next to the
+@@ -301,6 +335,9 @@
+     Tegra::Engines::EngineInterface* front_engine{};
+     void (*front_after_method)(void*){};
+     void* front_after_context{};
++    /// The engine and count of the state writes being gathered (state_words).
++    Tegra::Engines::EngineInterface* state_engine{};
++    u32 state_count{};
+ 
+     // Back side.
+     alignas(128) Tegra::Engines::EngineInterface* back_engine{};
