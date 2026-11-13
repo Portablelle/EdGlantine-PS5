@@ -1,0 +1,101 @@
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <charconv>
++#include <cstdlib>
+ #include <cstring>
+ #include <span>
+ #include <vector>
+@@ -90,6 +92,15 @@
+     }
+     return memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal);
+ }
++#ifdef EDEN_NX2_PS5_PROTO
++// Heuristic: submit a run of copies with no draw/dispatch before it overflows one PS5 GPU
++// submission. Upstream reported a Mihawk/RADV winsys cap of about 1M AGC words: ~27k small
++// copies with two barriers each in Bananza exceeded it and returned VK_ERROR_DEVICE_LOST.
++// That cap is unverified on the Mesa/winsys revision pinned here.
++// EDEN_NX2_COPIES_PER_SUBMISSION overrides the default with a positive decimal count.
++// A single CopyBuffer exceeding the threshold is still recorded before this check.
++constexpr size_t COPIES_PER_SUBMISSION = 8192;
++#endif
+ } // Anonymous namespace
+ 
+ Buffer::Buffer(BufferCacheRuntime& runtime, VideoCommon::NullBufferParams null_params)
+@@ -517,6 +528,9 @@
+                                              vk::CommandBuffer, vk::CommandBuffer upload_cmdbuf) {
+             upload_cmdbuf.CopyBuffer(src_buffer, dst_buffer, VideoCommon::FixSmallVectorADL(vk_copies));
+         });
++#ifdef EDEN_NX2_PS5_PROTO
++        SubmitLongCopyRuns(vk_copies.size());
++#endif
+         return;
+     }
+ 
+@@ -525,6 +539,9 @@
+         // Only in-order stream uploads share barriers; other staging keeps its own contract.
+         scheduler.RecordUpload(src_buffer, dst_buffer,
+                                std::span<const VkBufferCopy>{vk_copies.data(), vk_copies.size()});
++#ifdef EDEN_NX2_PS5_PROTO
++        SubmitLongCopyRuns(vk_copies.size());
++#endif
+         return;
+     }
+     scheduler.Record([src_buffer, dst_buffer, vk_copies, barrier](vk::CommandBuffer cmdbuf) {
+@@ -538,7 +555,37 @@
+                                    vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0, WRITE_BARRIER);
+         }
+     });
+-}
++#ifdef EDEN_NX2_PS5_PROTO
++    SubmitLongCopyRuns(vk_copies.size());
++#endif
++}
++
++#ifdef EDEN_NX2_PS5_PROTO
++void BufferCacheRuntime::SubmitLongCopyRuns(size_t regions) {
++    static const size_t limit = [] {
++        const char* value = std::getenv("EDEN_NX2_COPIES_PER_SUBMISSION");
++        size_t parsed{};
++        if (value) {
++            const char* end = value + std::strlen(value);
++            const auto result = std::from_chars(value, end, parsed);
++            if (result.ec == std::errc{} && result.ptr == end && parsed > 0) {
++                return parsed;
++            }
++        }
++        return COPIES_PER_SUBMISSION;
++    }();
++    if (scheduler.CurrentTick() != copy_submission_tick) {
++        copy_submission_tick = scheduler.CurrentTick();
++        copy_submission_count = 0;
++    }
++    copy_submission_count += 1 + regions;
++    if (copy_submission_count >= limit) {
++        scheduler.Flush();
++        copy_submission_tick = scheduler.CurrentTick();
++        copy_submission_count = 0;
++    }
++}
++#endif
+ 
+ void BufferCacheRuntime::PreCopyBarrier() {
+     static constexpr VkMemoryBarrier READ_BARRIER{
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.h
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+@@ -263,6 +263,12 @@
+     }
+ 
+     VkFormat TexelBufferFormat(VideoCore::Surface::PixelFormat format) const;
++
++#ifdef EDEN_NX2_PS5_PROTO
++    void SubmitLongCopyRuns(size_t regions);
++    u64 copy_submission_tick{};
++    size_t copy_submission_count{};
++#endif
+ 
+     void ReserveNullBuffer();
+     vk::Buffer CreateNullBuffer();
