@@ -50,7 +50,7 @@ def verify():
             'scrub(channel_storage[channel_id]);}',
             'every other active channel must be scrubbed exactly once')
     require('scrub(*channel_state);' in code, 'current channel is not scrubbed')
-    require(code.startswith('nx2_synced_ranges.fill({});nx2_synced_vertex_buffers.fill({});'
+    require(code.startswith('++buffer_deletions;nx2_synced_ranges.fill({});nx2_synced_vertex_buffers.fill({});'
                             'if(buffer_id==inline_buffer_id){inline_buffer_id=NULL_BUFFER_ID;}'),
             'synced-range / inline-buffer preface changed')
     require('#ifdefEDEN_NX2_PS5_PROTOgpu_modified_ranges.ReadbackCache().Clear();#endif' in code,
