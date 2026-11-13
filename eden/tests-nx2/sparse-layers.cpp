@@ -64,6 +64,10 @@ int main() {
  r.imageMipTailStride=2<<20;ci.arrayLayers=2;ci.extent.width=UINT32_MAX;ci.extent.height=UINT32_MAX;
  assert(!MakePlan(ci,memory,std::span{&r,1}));
  ci.extent={257,129,1};r.formatProperties.imageGranularity.width=0;assert(!MakePlan(ci,memory,std::span{&r,1}));
+ // A driver block that is not one 64 KiB page (AMD reported 65549x339860304) is rejected.
+ r.formatProperties.imageGranularity={65549,339860304,1};assert(!MakePlan(ci,memory,std::span{&r,1}));
+ r.formatProperties.imageGranularity={127,128,1};assert(!MakePlan(ci,memory,std::span{&r,1}));
+ r.formatProperties.imageGranularity={128,128,1};assert(MakePlan(ci,memory,std::span{&r,1}));
  assert(!MakePlan(ci,memory,{}));
  // Global budget rejects admission before allocations. Existing commitments stay charged.
  committed=GlobalBudget;
