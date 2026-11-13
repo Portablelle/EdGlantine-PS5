@@ -161,15 +161,27 @@ if state_write_fn:
           'StateWrite: a full block or another engine must flush first')
     check(re.search(r'state_words\[StateFlagWords \+ state_count\+\+\] = u64\{method\} \| \(u64\{value\} << 32\);', sw),
           'StateWrite: writes must be appended in order')
-    check(re.search(r'for \(const u8 flag : flags\) \{\s*state_words\[flag / 64\] \|= u64\{1\} << \(flag % 64\);', sw),
+    check(re.search(r'for \(const (?:u8|std::uint8_t) flag : flags\) \{\s*state_words\[flag / 64\] \|= u64\{1\} << \(flag % 64\);', sw),
           'StateWrite: dirty flags must be ORed')
     check(flush_points == {'Reserve', 'SelectEngine', 'Publish', 'Drain'},
           f'GpuSplit: the gathered writes must be sent before any entry, publish or drain (flushes in {sorted(flush_points)})')
     bc = function(split_h, '[[nodiscard]] bool BackCaughtUp() const {')
     check(bc and 'state_count == 0' in bc, 'BackCaughtUp must not report caught up with writes gathered')
+    # Kind::State reaches Maxwell3D::WriteStateRegisters: through EngineInterface's virtual,
+    # which Maxwell3D overrides (or a cast to Maxwell3D).
     ex = function(split_cpp, 'size_t GpuSplit::Execute(')
-    check(ex and re.search(r'case Kind::State:.*?WriteStateRegisters\(', ex, re.S),
-          'GpuSplit::Execute: Kind::State must reach Maxwell3D::WriteStateRegisters')
+    state_case = re.search(r'case Kind::State: \{(.*?)\n    \}', strip_comments(ex or ''), re.S)
+    state_case = state_case.group(1) if state_case else ''
+    via_cast = 'static_cast<Tegra::Engines::Maxwell3D*>(back_engine)' in state_case
+    via_virtual = re.search(r'back_engine->WriteStateRegisters\(', state_case) is not None
+    iface = (src / 'engines/engine_interface.h').read_text()
+    check(re.search(r'WriteStateRegisters\(\s*\*system,\s*std::span<const u64, StateFlagWords>\{entry \+ 1, StateFlagWords\},'
+                    r'\s*std::span<const u64>\{entry \+ 1 \+ StateFlagWords, count\}\)', state_case) and
+          (via_cast or (via_virtual and
+                        re.search(r'virtual void WriteStateRegisters\(Core::System& system, std::span<const u64, 4> flags,', iface) and
+                        re.search(r'void WriteStateRegisters\(Core::System& system, std::span<const u64, 4> flags,\s*'
+                                  r'std::span<const u64> writes\) override;', hdr))),
+          'GpuSplit::Execute: Kind::State must reach Maxwell3D::WriteStateRegisters with the flags and writes')
 
 wsr = function(cpp, 'void Maxwell3D::WriteStateRegisters(')
 block_guard = block_each = None

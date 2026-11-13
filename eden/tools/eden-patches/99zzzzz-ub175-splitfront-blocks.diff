@@ -1,3 +1,32 @@
+--- a/src/video_core/engines/engine_interface.h
++++ b/src/video_core/engines/engine_interface.h
+@@ -8,6 +8,7 @@
+ 
+ #include <bitset>
+ #include <limits>
++#include <span>
+ #include <vector>
+ 
+ #include "common/common_types.h"
+@@ -37,6 +38,18 @@
+     /// Write multiple values to the register identified by method.
+     virtual void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) = 0;
+ 
++    /// GpuSplit's back: state register writes the front sent as one entry (Kind::State), each
++    /// `method | value << 32`, in order, and the dirty flags they set. Only Maxwell3D's front
++    /// sends them (Maxwell3D overrides this); the default writes them one by one.
++    virtual void WriteStateRegisters(Core::System& system, std::span<const u64, 4> flags,
++                                     std::span<const u64> writes) {
++        (void)flags;
++        ConsumeSink(system);
++        for (const u64 write : writes) {
++            CallMethod(system, static_cast<u32>(write), static_cast<u32>(write >> 32), true);
++        }
++    }
++
+     void ConsumeSink(Core::System& system) {
+         if (!method_sink.empty()) {
+             ConsumeSinkImpl(system);
 --- a/src/video_core/engines/maxwell_3d.cpp
 +++ b/src/video_core/engines/maxwell_3d.cpp
 @@ -7,6 +7,7 @@
@@ -169,7 +198,7 @@
 +    /// CallMethod of each when every write changes its register: the stores (and the shadow RAM
 +    /// when tracking), then the flags. Otherwise the writes go through CallMethod one by one.
 +    void WriteStateRegisters(Core::System& system, std::span<const u64, 4> flags,
-+                             std::span<const u64> writes);
++                             std::span<const u64> writes) override;
 +    /// Whether CallMethod writes a state register straight away (WriteStateRegister): no write
 +    /// history, first-write trace or profile counts it.
 +    [[nodiscard]] bool FastStateWrites() const;
@@ -251,15 +280,7 @@
  #include <stdexcept>
  #include <system_error>
  
-@@ -32,6 +35,7 @@
- #include "common/thread.h"
- #include "core/core.h"
- #include "video_core/engines/engine_interface.h"
-+#include "video_core/engines/maxwell_3d.h"
- #include "video_core/gpu_split.h"
- #include "video_core/nx2.h"
- #include "video_core/nx2_profile.h"
-@@ -141,6 +145,8 @@
+@@ -141,6 +144,8 @@
      check_owner = true;
  #endif
      write_position = published_local = consumed_cache = 0;
@@ -268,7 +289,7 @@
      published.store(0); consumed.store(0);
      front_engine = back_engine = nullptr;
      front_after_method = after_method = nullptr;
-@@ -153,6 +159,7 @@
+@@ -153,6 +158,7 @@
      trace_stage.store(0); trace_reports.store(0);
  #endif
      ring = std::make_unique<u64[]>(RingWords);
@@ -276,7 +297,7 @@
  #ifdef EDEN_NX2_PS5_PROTO
      StartBackThread();
      // Optional observation must never decide whether the renderer can run.
-@@ -448,6 +455,8 @@
+@@ -448,6 +454,8 @@
  #endif
      active = false;
      front_macros = false;
@@ -285,7 +306,7 @@
  }
  
  u64* GpuSplit::ReserveSlow(size_t words) {
-@@ -497,6 +506,7 @@
+@@ -497,6 +505,7 @@
  }
  
  void GpuSplit::Publish() {
@@ -293,7 +314,7 @@
      CheckFailure();
      if (published_local == write_position) {
          return;
-@@ -517,6 +527,7 @@
+@@ -517,6 +526,7 @@
  }
  
  void GpuSplit::Drain() {
@@ -301,7 +322,7 @@
      TraceFront(20, write_position);
      CheckFailure();
      consumed_cache = consumed.load(std::memory_order_acquire);
-@@ -564,6 +575,18 @@
+@@ -564,6 +574,18 @@
      }
  }
  
@@ -320,16 +341,16 @@
  void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
      front_engine = engine;
      u64* const entry = Reserve(2);
-@@ -658,6 +681,14 @@
+@@ -658,6 +680,14 @@
          }
          return data + (amount + 1) / 2;
      }
 +    case Kind::State: {
-+        // Only Maxwell3D::FrontWrite sends state blocks.
++        // Only Maxwell3D::FrontWrite sends state blocks (Maxwell3D::WriteStateRegisters).
 +        const u32 count = static_cast<u32>(head >> 32);
-+        static_cast<Tegra::Engines::Maxwell3D*>(back_engine)
-+            ->WriteStateRegisters(*system, std::span<const u64, StateFlagWords>{entry + 1, StateFlagWords},
-+                                  std::span<const u64>{entry + 1 + StateFlagWords, count});
++        back_engine->WriteStateRegisters(
++            *system, std::span<const u64, StateFlagWords>{entry + 1, StateFlagWords},
++            std::span<const u64>{entry + 1 + StateFlagWords, count});
 +        return 1 + StateFlagWords + count;
 +    }
      case Kind::Call: {
@@ -337,15 +358,17 @@
          reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
 --- a/src/video_core/gpu_split.h
 +++ b/src/video_core/gpu_split.h
-@@ -4,6 +4,7 @@
+@@ -4,7 +4,9 @@
  #pragma once
  #include <cstdio>
  
 +#include <array>
  #include <atomic>
++#include <cstdint>
  #include <cstring>
  #include <functional>
-@@ -159,6 +160,23 @@
+ #include <exception>
+@@ -159,6 +161,23 @@
          Commit(1);
      }
  
@@ -355,13 +378,13 @@
 +    /// drains; the back stores them and sets their dirty flags at once
 +    /// (Maxwell3D::WriteStateRegisters). `flags`: the dirty flags the register sets.
 +    void StateWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 value,
-+                    std::array<u8, 2> flags) {
++                    std::array<std::uint8_t, 2> flags) {
 +        if (engine != state_engine || state_count == MaxStateWrites) {
 +            FlushState();
 +            state_engine = engine;
 +        }
 +        state_words[StateFlagWords + state_count++] = u64{method} | (u64{value} << 32);
-+        for (const u8 flag : flags) {
++        for (const std::uint8_t flag : flags) {
 +            state_words[flag / 64] |= u64{1} << (flag % 64);
 +        }
 +    }
@@ -369,7 +392,7 @@
      /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
      template <typename Func>
      void Defer(const Func& func) {
-@@ -206,7 +224,7 @@
+@@ -206,7 +225,7 @@
  
      /// Whether the back has run everything sent so far (front only; nothing is published).
      [[nodiscard]] bool BackCaughtUp() const {
@@ -378,7 +401,7 @@
      }
  
      /// Makes what was sent visible to the back.
-@@ -221,10 +239,14 @@
+@@ -221,10 +240,14 @@
          Method, ///< Bits 8-23 method, 32-63 argument; flags IsLast, HasSegment (word 1)
          Multi,  ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
          Call,   ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
@@ -393,7 +416,7 @@
  
      static constexpr size_t RingWords = size_t{1} << 20; // 8 MiB
      static constexpr size_t RingMask = RingWords - 1;
-@@ -236,8 +258,17 @@
+@@ -236,8 +259,17 @@
          (*reinterpret_cast<const Func*>(payload))();
      }
  
@@ -411,7 +434,7 @@
          const size_t index = write_position & RingMask;
          if (index + words <= RingWords && write_position + words - consumed_cache <= RingWords)
              [[likely]] {
-@@ -254,6 +285,7 @@
+@@ -254,6 +286,7 @@
      }
      void WaitForSpace(size_t words);
      void SelectEngine(Tegra::Engines::EngineInterface* engine) {
@@ -419,7 +442,7 @@
          if (engine != front_engine) [[unlikely]] {
              SwitchEngine(engine);
          }
-@@ -289,6 +321,8 @@
+@@ -289,6 +322,8 @@
      bool active{};
      bool front_macros{};
      std::unique_ptr<u64[]> ring;
@@ -428,7 +451,7 @@
  
      // Front side. x86 prefetchers pull 64-byte lines in pairs, so each side's hot cursor gets its
      // own 128-byte block: the back writes back_engine on every engine switch, and next to the
-@@ -301,6 +335,9 @@
+@@ -301,6 +336,9 @@
      Tegra::Engines::EngineInterface* front_engine{};
      void (*front_after_method)(void*){};
      void* front_after_context{};
